@@ -1,0 +1,11 @@
+vkbottle>=4.3.0
+openai>=1.14.0
+SQLAlchemy>=2.0.28
+aiosqlite>=0.20.0
+python-dotenv>=1.0.1
+pydantic>=2.6.4
+pydantic-settings>=2.2.1
+apscheduler>=3.10.4
+psycopg2-binary>=2.9.9
+asyncpg>=0.29.0
+alembic>=1.13.1
