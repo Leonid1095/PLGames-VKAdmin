@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 def _get_client() -> AsyncOpenAI:
     return AsyncOpenAI(
-        base_url="https://openrouter.ai/api/v1",
+        base_url=settings.OPENROUTER_BASE_URL,
         api_key=settings.OPENROUTER_API_KEY,
     )
 

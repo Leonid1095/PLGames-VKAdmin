@@ -30,9 +30,9 @@ from handlers.admin import bp as admin_bp
 from handlers.messages import bp as messages_bp
 from handlers.comments import bp as comments_bp
 
-bot.labeler.load(admin_bp)       # /помощь, /пост, /настройка — checked first
-bot.labeler.load(messages_bp)    # !профиль, !гороскоп, !кто я, then catch-all <text>
-bot.labeler.load(comments_bp)    # Wall comment moderation (raw events)
+bot.labeler.load(admin_bp.labeler)       # /помощь, /пост, /настройка — checked first
+bot.labeler.load(messages_bp.labeler)    # !профиль, !гороскоп, !кто я, then catch-all <text>
+bot.labeler.load(comments_bp.labeler)    # Wall comment moderation (raw events)
 
 
 # ── Startup ──────────────────────────────────────────────────────────────────

@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     VK_GROUP_ID: str = "0"
     OWNER_VK_ID: str = "0"
     OPENROUTER_API_KEY: str = "placeholder_openrouter_key"
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
     DEFAULT_MODEL: str = "openai/gpt-4o-mini"
     DATABASE_URL: str = "sqlite+aiosqlite:///./vkbot.db"
 
