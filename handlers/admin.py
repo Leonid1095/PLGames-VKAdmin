@@ -1,116 +1,102 @@
 import logging
-from vkbottle.bot import Blueprint, Message
+from vkbottle import API
 from core.ai_brain import generate_post
-from database.service import get_setting, set_setting, clear_user_history
-from core.config import settings as app_settings
+from core.group_context import GroupContext
+from database.service import get_setting, set_setting, clear_user_history, grant_vip
 
 logger = logging.getLogger(__name__)
 
-bp = Blueprint("admin")
+
+def is_owner(ctx: GroupContext, user_id: int) -> bool:
+    """Check if the user is the group admin."""
+    return user_id == ctx.admin_vk_id
 
 
-def is_owner(user_id: int) -> bool:
-    """Check if the user is the bot owner."""
-    return str(user_id) == str(app_settings.OWNER_VK_ID)
+async def handle_admin_command(ctx: GroupContext, from_id: int, text: str, peer_id: int) -> str | None:
+    """
+    Process admin commands. Returns reply text or None if not an admin command.
+    """
+    if not text.startswith("/"):
+        return None
 
+    if not is_owner(ctx, from_id):
+        return None
 
-# ── /помощь ──────────────────────────────────────────────────────────────────
-@bp.on.message(text="/помощь")
-async def cmd_help(message: Message):
-    if not is_owner(message.from_id):
-        return
-    help_text = (
-        "🤖 Команды администратора:\n\n"
-        "/пост — сгенерировать и опубликовать пост\n"
-        "/пост <тема> — пост на конкретную тему\n"
-        "/настройка <ключ> <значение> — изменить настройку\n"
-        "/посмотреть <ключ> — посмотреть текущую настройку\n"
-        "/очистить <vk_id> — очистить память диалога с пользователем\n"
-        "/vip <vk_id> <days> — выдать VIP-статус пользователю\n"
-        "/помощь — показать это сообщение\n\n"
-        "📋 Доступные ключи настроек:\n"
-        "• active_model — модель ИИ (напр: openai/gpt-4o-mini)\n"
-        "• system_prompt — системный промпт бота\n"
-        "• moderation_aggressiveness — low / medium / high\n"
-        "• reply_to_comments — true / false\n"
-        "• autopost_enabled — true / false\n"
-        "• autopost_interval_hours — число часов\n"
-        "• autopost_topics — темы для постов через запятую"
-    )
-    await message.answer(help_text)
+    parts = text.split(maxsplit=2)
+    cmd = parts[0].lower()
 
+    # ── /помощь ──
+    if cmd == "/помощь":
+        return (
+            "Команды администратора:\n\n"
+            "/пост — сгенерировать и опубликовать пост\n"
+            "/пост <тема> — пост на конкретную тему\n"
+            "/настройка <ключ> <значение> — изменить настройку\n"
+            "/посмотреть <ключ> — посмотреть текущую настройку\n"
+            "/очистить <vk_id> — очистить память диалога с пользователем\n"
+            "/vip <vk_id> <days> — выдать VIP-статус пользователю\n"
+            "/помощь — показать это сообщение\n\n"
+            "Доступные ключи настроек:\n"
+            "active_model — модель ИИ\n"
+            "system_prompt — системный промпт бота\n"
+            "moderation_aggressiveness — low / medium / high\n"
+            "reply_to_comments — true / false\n"
+            "autopost_enabled — true / false\n"
+            "autopost_interval_hours — число часов\n"
+            "autopost_topics — темы для постов через запятую"
+        )
 
-# ── /пост ────────────────────────────────────────────────────────────────────
-@bp.on.message(text="/пост <topic>")
-async def cmd_post_topic(message: Message, topic: str):
-    if not is_owner(message.from_id):
-        return
-    await message.answer("⏳ Генерирую пост...")
-    post_text = await generate_post(topic=topic)
-    owner_id = -(int(app_settings.VK_GROUP_ID))
-    try:
-        await bp.api.wall.post(owner_id=owner_id, message=post_text)
-        await message.answer(f"✅ Пост опубликован!\n\n{post_text}")
-    except Exception as e:
-        logger.error(f"Failed to publish post: {e}")
-        await message.answer(f"❌ Ошибка публикации: {e}")
+    # ── /пост ──
+    if cmd == "/пост":
+        topic = parts[1] if len(parts) > 1 else ""
+        post_text = await generate_post(group_id=ctx.group_id, topic=topic)
+        owner_id = -ctx.group_id
+        try:
+            await ctx.api.wall.post(owner_id=owner_id, message=post_text)
+            return f"Пост опубликован!\n\n{post_text}"
+        except Exception as e:
+            logger.error(f"Failed to publish post: {e}")
+            return f"Ошибка публикации: {e}"
 
+    # ── /настройка ──
+    if cmd == "/настройка":
+        if len(parts) < 3:
+            return "Формат: /настройка <ключ> <значение>"
+        key = parts[1].strip()
+        value = parts[2].strip()
+        await set_setting(ctx.group_id, key, value)
+        return f"Настройка обновлена:\n{key} = {value}"
 
-@bp.on.message(text="/пост")
-async def cmd_post(message: Message):
-    if not is_owner(message.from_id):
-        return
-    await message.answer("⏳ Генерирую пост на случайную тему из настроек...")
-    post_text = await generate_post()
-    owner_id = -(int(app_settings.VK_GROUP_ID))
-    try:
-        await bp.api.wall.post(owner_id=owner_id, message=post_text)
-        await message.answer(f"✅ Пост опубликован!\n\n{post_text}")
-    except Exception as e:
-        logger.error(f"Failed to publish post: {e}")
-        await message.answer(f"❌ Ошибка публикации: {e}")
+    # ── /посмотреть ──
+    if cmd == "/посмотреть":
+        if len(parts) < 2:
+            return "Формат: /посмотреть <ключ>"
+        key = parts[1].strip()
+        value = await get_setting(ctx.group_id, key, default="(не задано)")
+        return f"{key} = {value}"
 
+    # ── /очистить ──
+    if cmd == "/очистить":
+        if len(parts) < 2:
+            return "Формат: /очистить <vk_id>"
+        try:
+            uid = int(parts[1].strip())
+            await clear_user_history(ctx.group_id, uid)
+            return f"Память диалога с пользователем {uid} очищена."
+        except ValueError:
+            return "Укажите корректный числовой VK ID."
 
-# ── /настройка ───────────────────────────────────────────────────────────────
-@bp.on.message(text="/настройка <key> <value>")
-async def cmd_set_setting(message: Message, key: str, value: str):
-    if not is_owner(message.from_id):
-        return
-    await set_setting(key.strip(), value.strip())
-    await message.answer(f"✅ Настройка обновлена:\n{key} = {value}")
+    # ── /vip ──
+    if cmd == "/vip":
+        if len(parts) < 3:
+            return "Формат: /vip <vk_id> <days>"
+        try:
+            sub_parts = parts[1].split()
+            uid = int(sub_parts[0].strip())
+            d = int(parts[2].strip()) if len(parts) > 2 else int(sub_parts[1].strip())
+            await grant_vip(ctx.group_id, uid, d)
+            return f"Пользователю {uid} выдан VIP на {d} дней."
+        except (ValueError, IndexError):
+            return "Ошибка формата. Укажите: /vip <vk_id> <days>"
 
-
-# ── /посмотреть ──────────────────────────────────────────────────────────────
-@bp.on.message(text="/посмотреть <key>")
-async def cmd_get_setting(message: Message, key: str):
-    if not is_owner(message.from_id):
-        return
-    value = await get_setting(key.strip(), default="(не задано)")
-    await message.answer(f"📋 {key} = {value}")
-
-
-# ── /очистить ────────────────────────────────────────────────────────────────
-@bp.on.message(text="/очистить <vk_id>")
-async def cmd_clear_memory(message: Message, vk_id: str):
-    if not is_owner(message.from_id):
-        return
-    try:
-        uid = int(vk_id.strip())
-        await clear_user_history(uid)
-        await message.answer(f"✅ Память диалога с пользователем {uid} очищена.")
-    except ValueError:
-        await message.answer("❌ Укажите корректный числовой VK ID.")
-
-# ── /vip ─────────────────────────────────────────────────────────────────────
-@bp.on.message(text="/vip <vk_id> <days>")
-async def cmd_grant_vip(message: Message, vk_id: str, days: str):
-    if not is_owner(message.from_id):
-        return
-    try:
-        uid = int(vk_id.strip())
-        d = int(days.strip())
-        from database.service import grant_vip
-        await grant_vip(uid, d)
-        await message.answer(f"✅ Пользователю {uid} выдан VIP на {d} дней.")
-    except ValueError:
-        await message.answer("❌ Ошибка форматов. Укажите числовой VK ID и количество дней.")
+    return None

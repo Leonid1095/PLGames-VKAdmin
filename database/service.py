@@ -4,11 +4,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from sqlalchemy import select
 from database.engine import async_session
-from database.models import UserContext, Settings, UserStats
+from database.models import Group, UserContext, GroupSettings, UserStats
 
 logger = logging.getLogger(__name__)
 
-# ─── Default settings seeded into DB on first run ───────────────────────────
+# ─── Default settings seeded per group ───────────────────────────────────────
 
 DEFAULT_SETTINGS = {
     "active_model": ("openai/gpt-4o-mini", "Активная AI-модель через OpenRouter"),
@@ -24,45 +24,130 @@ DEFAULT_SETTINGS = {
     "reply_to_comments": ("true", "Отвечать ли ИИ на комментарии: true / false"),
 }
 
+# ─── Group CRUD ──────────────────────────────────────────────────────────────
+
+async def create_group(
+    group_id: int,
+    group_name: str,
+    access_token: str,
+    admin_vk_id: int,
+    confirmation_code: str = "",
+    secret_key: str = "",
+) -> Group:
+    """Register a new group (or reactivate existing)."""
+    async with async_session() as session:
+        result = await session.execute(select(Group).where(Group.group_id == group_id))
+        group = result.scalar_one_or_none()
+        if group:
+            group.access_token = access_token
+            group.admin_vk_id = admin_vk_id
+            group.group_name = group_name
+            group.confirmation_code = confirmation_code
+            group.secret_key = secret_key
+            group.is_active = True
+        else:
+            group = Group(
+                group_id=group_id,
+                group_name=group_name,
+                access_token=access_token,
+                admin_vk_id=admin_vk_id,
+                confirmation_code=confirmation_code,
+                secret_key=secret_key,
+            )
+            session.add(group)
+        await session.commit()
+        await session.refresh(group)
+        return group
+
+
+async def get_group(group_id: int) -> Group | None:
+    """Get a group record by VK group ID."""
+    async with async_session() as session:
+        result = await session.execute(
+            select(Group).where(Group.group_id == group_id, Group.is_active == True)
+        )
+        return result.scalar_one_or_none()
+
+
+async def get_all_active_groups() -> list[Group]:
+    """Return all active groups."""
+    async with async_session() as session:
+        result = await session.execute(select(Group).where(Group.is_active == True))
+        return list(result.scalars().all())
+
+
+async def deactivate_group(group_id: int) -> None:
+    """Soft-delete a group."""
+    async with async_session() as session:
+        result = await session.execute(select(Group).where(Group.group_id == group_id))
+        group = result.scalar_one_or_none()
+        if group:
+            group.is_active = False
+            await session.commit()
+
+
 # ─── Settings helpers ────────────────────────────────────────────────────────
 
-async def get_setting(key: str, default: str = "") -> str:
-    """Get a setting value from DB, or return default."""
+async def get_setting(group_id: int, key: str, default: str = "") -> str:
+    """Get a setting value for a specific group."""
     async with async_session() as session:
-        result = await session.execute(select(Settings).where(Settings.key == key))
+        result = await session.execute(
+            select(GroupSettings).where(
+                GroupSettings.group_id == group_id,
+                GroupSettings.key == key,
+            )
+        )
         row = result.scalar_one_or_none()
         return row.value if row else default
 
-async def set_setting(key: str, value: str) -> None:
-    """Create or update a setting in DB."""
+
+async def set_setting(group_id: int, key: str, value: str) -> None:
+    """Create or update a setting for a specific group."""
     async with async_session() as session:
-        result = await session.execute(select(Settings).where(Settings.key == key))
+        result = await session.execute(
+            select(GroupSettings).where(
+                GroupSettings.group_id == group_id,
+                GroupSettings.key == key,
+            )
+        )
         row = result.scalar_one_or_none()
         if row:
             row.value = value
         else:
-            session.add(Settings(key=key, value=value))
+            session.add(GroupSettings(group_id=group_id, key=key, value=value))
         await session.commit()
 
-async def seed_default_settings() -> None:
-    """Insert default settings if they don't exist yet."""
+
+async def seed_default_settings(group_id: int) -> None:
+    """Insert default settings for a group if they don't exist yet."""
     async with async_session() as session:
         for key, (value, description) in DEFAULT_SETTINGS.items():
-            result = await session.execute(select(Settings).where(Settings.key == key))
+            result = await session.execute(
+                select(GroupSettings).where(
+                    GroupSettings.group_id == group_id,
+                    GroupSettings.key == key,
+                )
+            )
             if not result.scalar_one_or_none():
-                session.add(Settings(key=key, value=value, description=description))
+                session.add(GroupSettings(
+                    group_id=group_id, key=key, value=value, description=description
+                ))
         await session.commit()
-    logger.info("Default settings seeded.")
+    logger.info(f"Default settings seeded for group {group_id}.")
+
 
 # ─── Memory helpers ──────────────────────────────────────────────────────────
 
-MAX_MEMORY_MESSAGES = 10  # how many message-pairs to keep in memory
+MAX_MEMORY_MESSAGES = 10
 
-async def get_user_history(vk_id: int) -> list[dict]:
-    """Return the conversation history for a given VK user as a list of dicts."""
+async def get_user_history(group_id: int, vk_id: int) -> list[dict]:
+    """Return conversation history for a user in a specific group."""
     async with async_session() as session:
         result = await session.execute(
-            select(UserContext).where(UserContext.vk_id == vk_id)
+            select(UserContext).where(
+                UserContext.group_id == group_id,
+                UserContext.vk_id == vk_id,
+            )
         )
         row = result.scalar_one_or_none()
         if row and row.context_data:
@@ -72,13 +157,16 @@ async def get_user_history(vk_id: int) -> list[dict]:
                 return []
         return []
 
-async def save_user_history(vk_id: int, history: list[dict]) -> None:
-    """Persist the conversation history for a VK user."""
-    # Keep only the last N pairs so the context window doesn't blow up
+
+async def save_user_history(group_id: int, vk_id: int, history: list[dict]) -> None:
+    """Persist conversation history for a user in a specific group."""
     history = history[-(MAX_MEMORY_MESSAGES * 2):]
     async with async_session() as session:
         result = await session.execute(
-            select(UserContext).where(UserContext.vk_id == vk_id)
+            select(UserContext).where(
+                UserContext.group_id == group_id,
+                UserContext.vk_id == vk_id,
+            )
         )
         row = result.scalar_one_or_none()
         if row:
@@ -86,21 +174,25 @@ async def save_user_history(vk_id: int, history: list[dict]) -> None:
             row.last_interaction = datetime.now(timezone.utc)
         else:
             session.add(UserContext(
+                group_id=group_id,
                 vk_id=vk_id,
                 context_data=json.dumps(history, ensure_ascii=False),
                 last_interaction=datetime.now(timezone.utc),
             ))
         await session.commit()
 
-async def clear_user_history(vk_id: int) -> None:
-    """Clear conversation memory for a given user."""
-    await save_user_history(vk_id, [])
+
+async def clear_user_history(group_id: int, vk_id: int) -> None:
+    """Clear conversation memory for a user in a specific group."""
+    await save_user_history(group_id, vk_id, [])
+
 
 # ─── Gamification & Stats helpers ────────────────────────────────────────────
 
 @dataclass
 class UserStatsDTO:
-    """A detached data transfer object for user stats (safe to use outside session)."""
+    """Detached data transfer object for user stats."""
+    group_id: int
     vk_id: int
     xp: int
     level: int
@@ -113,17 +205,24 @@ class UserStatsDTO:
     daily_requests: int
     last_request_date: datetime | None
 
-async def get_user_stats(vk_id: int) -> UserStatsDTO:
-    """Get (or create) user stats. Returns a detached DTO safe to use anywhere."""
+
+async def get_user_stats(group_id: int, vk_id: int) -> UserStatsDTO:
+    """Get (or create) user stats for a specific group."""
     async with async_session() as session:
-        result = await session.execute(select(UserStats).where(UserStats.vk_id == vk_id))
+        result = await session.execute(
+            select(UserStats).where(
+                UserStats.group_id == group_id,
+                UserStats.vk_id == vk_id,
+            )
+        )
         stats = result.scalar_one_or_none()
         if not stats:
-            stats = UserStats(vk_id=vk_id)
+            stats = UserStats(group_id=group_id, vk_id=vk_id)
             session.add(stats)
             await session.commit()
             await session.refresh(stats)
         return UserStatsDTO(
+            group_id=stats.group_id,
             vk_id=stats.vk_id,
             xp=stats.xp,
             level=stats.level,
@@ -137,81 +236,97 @@ async def get_user_stats(vk_id: int) -> UserStatsDTO:
             last_request_date=stats.last_request_date,
         )
 
-async def check_and_increment_limit(vk_id: int) -> bool:
-    """
-    Check if user has available AI requests for today. If yes, increment the counter.
-    Automatically resets the daily counter if it's a new day.
-    Returns: True if request is allowed, False if limit reached.
-    """
+
+async def check_and_increment_limit(group_id: int, vk_id: int) -> bool:
+    """Check daily AI request limit. Returns True if allowed."""
     async with async_session() as session:
-        result = await session.execute(select(UserStats).where(UserStats.vk_id == vk_id))
+        result = await session.execute(
+            select(UserStats).where(
+                UserStats.group_id == group_id,
+                UserStats.vk_id == vk_id,
+            )
+        )
         stats = result.scalar_one_or_none()
         if not stats:
-            stats = UserStats(vk_id=vk_id)
+            stats = UserStats(group_id=group_id, vk_id=vk_id)
             session.add(stats)
-            
+
         now = datetime.now(timezone.utc)
-        
-        # Reset counter if it's a new day
         if not stats.last_request_date or stats.last_request_date.date() < now.date():
             stats.daily_requests = 0
-            
-        # Check limits
-        max_daily = 1000000 if stats.is_vip else 10  # 10 reqs for free, unlimited for VIP
+
+        max_daily = 1000000 if stats.is_vip else 10
         if stats.daily_requests >= max_daily:
             return False
-            
+
         stats.daily_requests += 1
         stats.last_request_date = now
         await session.commit()
         return True
 
-async def grant_vip(vk_id: int, days: int) -> None:
+
+async def grant_vip(group_id: int, vk_id: int, days: int) -> None:
     """Grant VIP status for N days."""
     from datetime import timedelta
     async with async_session() as session:
-        result = await session.execute(select(UserStats).where(UserStats.vk_id == vk_id))
+        result = await session.execute(
+            select(UserStats).where(
+                UserStats.group_id == group_id,
+                UserStats.vk_id == vk_id,
+            )
+        )
         stats = result.scalar_one_or_none()
         if not stats:
-            stats = UserStats(vk_id=vk_id)
+            stats = UserStats(group_id=group_id, vk_id=vk_id)
             session.add(stats)
-            
+
         stats.is_vip = True
         now = datetime.now(timezone.utc)
         if stats.vip_expires and stats.vip_expires > now:
             stats.vip_expires += timedelta(days=days)
         else:
             stats.vip_expires = now + timedelta(days=days)
-            
+
         await session.commit()
 
-async def modify_balance(vk_id: int, amount: float) -> float:
-    """Add or subtract balance (coins/rubles)."""
+
+async def modify_balance(group_id: int, vk_id: int, amount: float) -> float:
+    """Add or subtract balance."""
     async with async_session() as session:
-        result = await session.execute(select(UserStats).where(UserStats.vk_id == vk_id))
+        result = await session.execute(
+            select(UserStats).where(
+                UserStats.group_id == group_id,
+                UserStats.vk_id == vk_id,
+            )
+        )
         stats = result.scalar_one_or_none()
         if not stats:
-            stats = UserStats(vk_id=vk_id)
+            stats = UserStats(group_id=group_id, vk_id=vk_id)
             session.add(stats)
-            
+
         stats.balance += amount
         await session.commit()
         return stats.balance
 
-async def add_xp(vk_id: int, xp_amount: int) -> tuple[int, bool]:
-    """Adds XP to user. Returns (new_level, leveled_up)."""
+
+async def add_xp(group_id: int, vk_id: int, xp_amount: int) -> tuple[int, bool]:
+    """Add XP to user. Returns (new_level, leveled_up)."""
     async with async_session() as session:
-        result = await session.execute(select(UserStats).where(UserStats.vk_id == vk_id))
+        result = await session.execute(
+            select(UserStats).where(
+                UserStats.group_id == group_id,
+                UserStats.vk_id == vk_id,
+            )
+        )
         stats = result.scalar_one_or_none()
         if not stats:
-            stats = UserStats(vk_id=vk_id)
+            stats = UserStats(group_id=group_id, vk_id=vk_id)
             session.add(stats)
 
         stats.messages_count += 1
         stats.xp += xp_amount
 
         old_level = stats.level
-        # Level formula: level = sqrt(xp / 10) + 1
         new_level = int((stats.xp / 10) ** 0.5) + 1
         leveled_up = new_level > old_level
 
@@ -221,36 +336,54 @@ async def add_xp(vk_id: int, xp_amount: int) -> tuple[int, bool]:
         await session.commit()
         return stats.level, leveled_up
 
-async def modify_reputation(vk_id: int, amount: int) -> int:
-    """Adds or subtracts reputation. Returns the new reputation value."""
+
+async def modify_reputation(group_id: int, vk_id: int, amount: int) -> int:
+    """Add or subtract reputation. Returns new value."""
     async with async_session() as session:
-        result = await session.execute(select(UserStats).where(UserStats.vk_id == vk_id))
+        result = await session.execute(
+            select(UserStats).where(
+                UserStats.group_id == group_id,
+                UserStats.vk_id == vk_id,
+            )
+        )
         stats = result.scalar_one_or_none()
         if not stats:
-            stats = UserStats(vk_id=vk_id)
+            stats = UserStats(group_id=group_id, vk_id=vk_id)
             session.add(stats)
 
         stats.reputation += amount
         await session.commit()
         return stats.reputation
 
-async def add_warning(vk_id: int) -> int:
-    """Adds a warning (strike) and returns the new total."""
+
+async def add_warning(group_id: int, vk_id: int) -> int:
+    """Add a warning (strike). Returns new total."""
     async with async_session() as session:
-        result = await session.execute(select(UserStats).where(UserStats.vk_id == vk_id))
+        result = await session.execute(
+            select(UserStats).where(
+                UserStats.group_id == group_id,
+                UserStats.vk_id == vk_id,
+            )
+        )
         stats = result.scalar_one_or_none()
         if not stats:
-            stats = UserStats(vk_id=vk_id)
+            stats = UserStats(group_id=group_id, vk_id=vk_id)
             session.add(stats)
 
         stats.warnings += 1
         await session.commit()
         return stats.warnings
 
-async def clear_warnings(vk_id: int) -> None:
-    """Reset warning counter for a user."""
+
+async def clear_warnings(group_id: int, vk_id: int) -> None:
+    """Reset warning counter for a user in a group."""
     async with async_session() as session:
-        result = await session.execute(select(UserStats).where(UserStats.vk_id == vk_id))
+        result = await session.execute(
+            select(UserStats).where(
+                UserStats.group_id == group_id,
+                UserStats.vk_id == vk_id,
+            )
+        )
         stats = result.scalar_one_or_none()
         if stats:
             stats.warnings = 0

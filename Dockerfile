@@ -21,5 +21,7 @@ RUN pip install --upgrade pip && \
 # Copy project
 COPY . /app/
 
-# Command to run the bot
-CMD ["python", "main.py"]
+EXPOSE 8000
+
+# Command to run the web server
+CMD ["uvicorn", "web.app:app", "--host", "0.0.0.0", "--port", "8000"]
