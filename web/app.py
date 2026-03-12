@@ -11,6 +11,7 @@ from tasks.scheduler import start_scheduler
 from web.vk_callback import router as callback_router
 from web.oauth import router as oauth_router
 from web.dashboard.routes import router as dashboard_router
+from web.api_public import router as api_router
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,7 @@ app = FastAPI(
 app.include_router(callback_router)
 app.include_router(oauth_router)
 app.include_router(dashboard_router)
+app.include_router(api_router)
 
 
 @app.get("/")

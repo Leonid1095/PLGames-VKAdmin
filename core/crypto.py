@@ -11,12 +11,10 @@ def _get_fernet() -> Fernet:
     if _fernet is None:
         key = settings.ENCRYPTION_KEY
         if not key:
-            # Auto-generate and warn (should be set in .env for production)
-            key = Fernet.generate_key().decode()
-            import logging
-            logging.getLogger(__name__).warning(
-                "ENCRYPTION_KEY not set! Generated a temporary key. "
-                "Set ENCRYPTION_KEY in .env for production use."
+            raise RuntimeError(
+                "ENCRYPTION_KEY не задан! Сгенерируйте:\n"
+                "python3 -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\"\n"
+                "и добавьте в .env"
             )
         _fernet = Fernet(key.encode() if isinstance(key, str) else key)
     return _fernet

@@ -160,14 +160,16 @@ async def oauth_callback(request: Request, code: str = "", error: str = "", erro
 
             # Save group to DB
             encrypted_token = encrypt_token(token)
-            admin_id = data.get("expires_in", 0)  # VK also returns user info sometimes
 
-            # Try to extract admin VK ID from the response
+            # Extract admin VK ID from OAuth response
             admin_vk_id = 0
-            for k, v in data.items():
-                if k == "user_id" or k.startswith("user_id"):
-                    admin_vk_id = int(v)
-                    break
+            if "user_id" in data:
+                admin_vk_id = int(data["user_id"])
+            else:
+                # VK sometimes returns user_id per group: user_id_GROUPID
+                uid_key = f"user_id_{gid}"
+                if uid_key in data:
+                    admin_vk_id = int(data[uid_key])
 
             await create_group(
                 group_id=gid,

@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timezone
 from openai import AsyncOpenAI
 from core.config import settings
 
@@ -64,7 +65,10 @@ async def chat_with_memory(group_id: int, vk_id: int, user_text: str) -> str:
         "Ты вежливый и отзывчивый помощник-администратор группы ВКонтакте."
     )
 
-    if stats.is_vip:
+    is_vip_active = stats.is_vip and (
+        not stats.vip_expires or stats.vip_expires > datetime.now(timezone.utc)
+    )
+    if is_vip_active:
         system_prompt += (
             "\nВАЖНО: Ты общаешься с пользователем со статусом VIP. "
             "Будь к нему максимально почтителен и услужлив."

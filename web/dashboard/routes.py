@@ -5,6 +5,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from core.config import settings as app_settings
+from core.auth import is_authenticated, set_auth_cookie, clear_auth_cookie, get_dashboard_password
 from database.service import (
     get_all_active_groups, get_group, get_setting, set_setting,
     deactivate_group, get_content_sources, add_content_source,
@@ -13,6 +14,13 @@ from database.service import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _require_auth(request: Request):
+    """Returns RedirectResponse to login if not authenticated, else None."""
+    if not is_authenticated(request):
+        return RedirectResponse("/dashboard/login", status_code=303)
+    return None
 
 
 # ─── Settings schema: grouped, with human-readable labels and input types ────
@@ -267,10 +275,67 @@ def _base_html(title: str, content: str) -> str:
 <body><div class="container">{content}</div></body></html>"""
 
 
+# ─── Login / Logout ──────────────────────────────────────────────────────────
+
+@router.get("/dashboard/login")
+async def login_page(request: Request):
+    if is_authenticated(request):
+        return RedirectResponse("/dashboard", status_code=303)
+
+    error = request.query_params.get("error", "")
+    error_html = '<p style="color:#d32f2f;margin-bottom:12px;">Неверный пароль</p>' if error else ""
+
+    content = f"""
+    <div style="max-width:380px;margin:80px auto;">
+        <div class="header" style="text-align:center;">
+            <h1>VKAdmin</h1>
+            <p>Панель управления</p>
+        </div>
+        {error_html}
+        <div class="card">
+            <form method="POST" action="/dashboard/login">
+                <div class="form-group" style="margin-bottom:16px;">
+                    <label style="display:block;font-weight:600;margin-bottom:6px;">Пароль</label>
+                    <input type="password" name="password" placeholder="Введите пароль..." required autofocus
+                           style="width:100%;padding:10px 14px;border:1.5px solid #e0e0e0;border-radius:8px;font-size:1rem;">
+                </div>
+                <button type="submit" class="btn" style="width:100%;">Войти</button>
+            </form>
+            <p class="hint" style="margin-top:12px;text-align:center;">Пароль задаётся в .env как JWT_SECRET</p>
+        </div>
+    </div>
+    """
+    return HTMLResponse(_base_html("Вход", content))
+
+
+@router.post("/dashboard/login")
+async def login_submit(request: Request):
+    form = await request.form()
+    password = str(form.get("password", ""))
+
+    if password == get_dashboard_password():
+        response = RedirectResponse("/dashboard", status_code=303)
+        set_auth_cookie(response)
+        return response
+
+    return RedirectResponse("/dashboard/login?error=1", status_code=303)
+
+
+@router.get("/dashboard/logout")
+async def logout(request: Request):
+    response = RedirectResponse("/dashboard/login", status_code=303)
+    clear_auth_cookie(response)
+    return response
+
+
 # ─── Dashboard home ─────────────────────────────────────────────────────────
 
 @router.get("/dashboard")
 async def dashboard_home(request: Request):
+    redirect = _require_auth(request)
+    if redirect:
+        return redirect
+
     groups = await get_all_active_groups()
 
     if not groups:
@@ -340,6 +405,10 @@ async def dashboard_home(request: Request):
 
 @router.get("/dashboard/group/{group_id}")
 async def group_settings_page(request: Request, group_id: int):
+    redirect = _require_auth(request)
+    if redirect:
+        return redirect
+
     group = await get_group(group_id)
     if not group:
         return HTMLResponse(
@@ -521,6 +590,9 @@ def _render_control(group_id: int, setting: dict, current_value: str) -> str:
 
 @router.post("/dashboard/group/{group_id}/settings")
 async def update_group_setting(request: Request, group_id: int):
+    redirect = _require_auth(request)
+    if redirect:
+        return redirect
     form = await request.form()
     key = str(form.get("key", "")).strip()
 
@@ -538,6 +610,9 @@ async def update_group_setting(request: Request, group_id: int):
 
 @router.post("/dashboard/group/{group_id}/sources/add")
 async def add_source(request: Request, group_id: int):
+    redirect = _require_auth(request)
+    if redirect:
+        return redirect
     form = await request.form()
     source_type = str(form.get("source_type", "rss")).strip()
     source_url = str(form.get("source_url", "")).strip()
@@ -551,6 +626,9 @@ async def add_source(request: Request, group_id: int):
 
 @router.post("/dashboard/group/{group_id}/sources/delete")
 async def remove_source(request: Request, group_id: int):
+    redirect = _require_auth(request)
+    if redirect:
+        return redirect
     form = await request.form()
     source_id = int(form.get("source_id", 0))
     if source_id:
@@ -561,5 +639,8 @@ async def remove_source(request: Request, group_id: int):
 
 @router.post("/dashboard/group/{group_id}/disconnect")
 async def disconnect_group(request: Request, group_id: int):
+    redirect = _require_auth(request)
+    if redirect:
+        return redirect
     await deactivate_group(group_id)
     return RedirectResponse("/dashboard", status_code=303)

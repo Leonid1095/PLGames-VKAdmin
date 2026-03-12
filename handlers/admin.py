@@ -336,14 +336,13 @@ async def cmd_source(ctx, from_id, parts, peer_id) -> str:
 
 
 async def cmd_newsletter(ctx, from_id, parts, peer_id) -> str:
-    if len(parts) < 2:
-        return "Формат: /рассылка текст сообщения"
-    text = " ".join(parts[1:]).strip() if len(parts) > 1 else ""
+    # /рассылка текст — всё после команды это текст
+    raw = parts[1] if len(parts) > 1 else ""
     if len(parts) > 2:
-        text = parts[1] + " " + parts[2]
-    text = text.strip()
+        raw = raw + " " + parts[2]
+    text = raw.strip()
     if not text:
-        return "Укажите текст рассылки."
+        return "Формат: /рассылка текст сообщения"
 
     # Get member count
     try:

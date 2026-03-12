@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from collections import OrderedDict
 from fastapi import APIRouter, Request
 from fastapi.responses import PlainTextResponse
 from vkbottle import API
@@ -16,19 +17,21 @@ from handlers.comments import handle_wall_comment
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Track processed events to avoid duplicates on VK retries
-_processed_events: set[str] = set()
+# LRU cache for event deduplication
+_processed_events: OrderedDict[str, None] = OrderedDict()
 _MAX_EVENTS_CACHE = 10000
 
 
-def _make_event_key(group_id: int, event_id: str) -> str:
-    return f"{group_id}:{event_id}"
-
-
-def _cleanup_events_cache():
-    global _processed_events
-    if len(_processed_events) > _MAX_EVENTS_CACHE:
-        _processed_events = set()
+def _check_and_add_event(group_id: int, event_id: str) -> bool:
+    """Returns True if event is duplicate (already seen)."""
+    key = f"{group_id}:{event_id}"
+    if key in _processed_events:
+        _processed_events.move_to_end(key)
+        return True
+    _processed_events[key] = None
+    while len(_processed_events) > _MAX_EVENTS_CACHE:
+        _processed_events.popitem(last=False)
+    return False
 
 
 async def _build_context(group_id: int) -> GroupContext | None:
@@ -148,11 +151,8 @@ async def vk_callback(request: Request):
 
     # ── Deduplicate ──
     if event_id:
-        event_key = _make_event_key(group_id, event_id)
-        if event_key in _processed_events:
+        if _check_and_add_event(group_id, event_id):
             return PlainTextResponse("ok")
-        _processed_events.add(event_key)
-        _cleanup_events_cache()
 
     # ── Build context ──
     ctx = await _build_context(group_id)
