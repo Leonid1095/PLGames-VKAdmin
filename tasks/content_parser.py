@@ -64,6 +64,31 @@ async def parse_vk_group(source_url: str) -> list[dict]:
         return []
 
 
+async def parse_api(url: str) -> list[dict]:
+    """Fetch news from a JSON API. Expects list of objects with title/text fields."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url)
+        data = resp.json()
+        if isinstance(data, dict):
+            data = data.get("items", data.get("news", data.get("data", [])))
+        if not isinstance(data, list):
+            return []
+        items = []
+        for entry in data[:5]:
+            title = entry.get("title") or entry.get("title_ru") or ""
+            text = entry.get("text") or entry.get("text_ru") or entry.get("description") or ""
+            import re
+            text = re.sub(r"<[^>]+>", "", text).strip()
+            link = entry.get("link") or entry.get("url") or ""
+            if title or text:
+                items.append({"title": title, "text": text[:500], "link": link})
+        return items
+    except Exception as e:
+        logger.error(f"API parse error for {url}: {e}")
+        return []
+
+
 async def fetch_and_schedule(group_id: int) -> int:
     """Fetch all sources for a group, rewrite via AI, schedule posts. Returns count."""
     sources = await get_content_sources(group_id)
@@ -76,6 +101,8 @@ async def fetch_and_schedule(group_id: int) -> int:
             items = await parse_rss(source.source_url)
         elif source.source_type == "vk_group":
             items = await parse_vk_group(source.source_url)
+        elif source.source_type == "api":
+            items = await parse_api(source.source_url)
         else:
             continue
 
@@ -94,10 +121,12 @@ async def fetch_and_schedule(group_id: int) -> int:
 
             # Rewrite via AI
             rewritten = await generate_response(
-                prompt=f"Перепиши этот текст своими словами для поста в группе ВКонтакте. "
-                       f"Сделай его живым и интересным. Исходный текст:\n\n{raw_text}",
-                system_prompt="Ты контент-менеджер группы ВКонтакте. Перепиши текст уникально, "
-                              "без копирования. 3-8 предложений. Без хэштегов.",
+                prompt=f"Вот исходная новость:\n\n{raw_text}\n\n"
+                       f"Перепиши коротко и по делу для поста ВКонтакте. "
+                       f"Только факты, без воды и эмодзи. 2-4 предложения максимум.",
+                system_prompt="Ты копирайтер. Пиши кратко, по-деловому, без восклицаний и эмодзи. "
+                              "Не добавляй призывы, не приукрашивай. Просто перескажи суть новости "
+                              "своими словами в 2-4 предложениях.",
                 group_id=group_id,
             )
 

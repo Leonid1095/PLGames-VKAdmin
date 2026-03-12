@@ -11,6 +11,7 @@ def _get_client() -> AsyncOpenAI:
     return AsyncOpenAI(
         base_url=settings.OPENROUTER_BASE_URL,
         api_key=settings.OPENROUTER_API_KEY,
+        timeout=60.0,
     )
 
 # ─── Core AI call ─────────────────────────────────────────────────────────────
@@ -129,8 +130,9 @@ async def generate_post(group_id: int, topic: str = "") -> str:
 
     topics = topic or await get_setting(group_id, "autopost_topics", "интересные факты")
     system_prompt = (
-        "Ты контент-менеджер группы ВКонтакте. Напиши увлекательный, живой пост "
-        "для публикации на стене. Без хэштегов в начале. Текст должен быть от 3 до 10 предложений."
+        "Ты копирайтер группы ВКонтакте. Напиши короткий информативный пост "
+        "для стены. Без эмодзи, без хэштегов, без воды и восклицаний. "
+        "Пиши по делу, 3-5 предложений. Как будто рассказываешь другу."
     )
     return await generate_response(
         prompt=f"Напиши пост на одну из следующих тем: {topics}",
