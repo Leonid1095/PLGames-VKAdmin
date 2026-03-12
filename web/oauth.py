@@ -61,9 +61,48 @@ async def oauth_callback(request: Request, code: str = "", error: str = "", erro
         )
 
     if not code:
-        # VK Mini App launch params — redirect to dashboard
+        # VK Mini App launch params — show app page inside VK iframe
         if request.query_params.get("vk_app_id"):
-            return RedirectResponse("/dashboard")
+            group_id = 236517033  # TODO: detect from context
+            dashboard_url = f"{settings.BASE_URL}/dashboard"
+            return HTMLResponse(f"""
+            <!DOCTYPE html>
+            <html><head><meta charset="utf-8"><title>VKAdmin</title>
+            <script>
+                // Init VK Mini App via postMessage (no external deps)
+                try {{
+                    parent.postMessage(JSON.stringify({{
+                        handler: 'VKWebAppInit',
+                        type: 'vk-connect',
+                        params: {{}}
+                    }}), '*');
+                }} catch(e) {{}}
+            </script>
+            <style>
+                body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 0; padding: 30px; background: #f5f5f5; }}
+                .card {{ background: white; border-radius: 12px; padding: 24px; max-width: 500px; margin: 0 auto; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+                h2 {{ margin-top: 0; color: #333; }}
+                .status {{ color: #2e7d32; font-weight: bold; }}
+                .btn {{ display: inline-block; padding: 12px 24px; background: #4a76a8; color: white; text-decoration: none; border-radius: 8px; margin-top: 16px; }}
+                .btn:hover {{ background: #3d6590; }}
+                .info {{ color: #666; font-size: 14px; margin-top: 12px; }}
+            </style></head>
+            <body>
+                <div class="card">
+                    <h2>🤖 VKAdmin — AI Администратор</h2>
+                    <p class="status">✅ Бот подключен и работает</p>
+                    <p>Бот автоматически:</p>
+                    <ul>
+                        <li>Отвечает на сообщения</li>
+                        <li>Модерирует комментарии</li>
+                        <li>Публикует контент по расписанию</li>
+                        <li>Парсит новости из источников</li>
+                    </ul>
+                    <a class="btn" href="{dashboard_url}" target="_blank">Открыть панель управления</a>
+                    <p class="info">Панель откроется в новой вкладке</p>
+                </div>
+            </body></html>
+            """)
 
         # VK might return token in fragment (Standalone app) — show JS extractor
         return HTMLResponse("""

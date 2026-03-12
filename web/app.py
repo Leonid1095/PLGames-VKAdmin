@@ -63,6 +63,22 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+
+
+class VKFrameMiddleware(BaseHTTPMiddleware):
+    """Remove X-Frame-Options for VK Mini App callback so it loads in VK iframe."""
+    async def dispatch(self, request: StarletteRequest, call_next):
+        response = await call_next(request)
+        if request.url.path == "/api/vk/callback" and request.query_params.get("vk_app_id"):
+            # Allow VK iframe
+            response.headers["X-Frame-Options"] = ""
+            response.headers["Content-Security-Policy"] = "frame-ancestors https://*.vk.com https://vk.com"
+        return response
+
+app.add_middleware(VKFrameMiddleware)
+
 app.include_router(callback_router)
 app.include_router(oauth_router)
 app.include_router(dashboard_router)
