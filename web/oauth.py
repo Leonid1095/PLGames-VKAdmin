@@ -61,6 +61,10 @@ async def oauth_callback(request: Request, code: str = "", error: str = "", erro
         )
 
     if not code:
+        # VK Mini App launch params — redirect to dashboard
+        if request.query_params.get("vk_app_id"):
+            return RedirectResponse("/dashboard")
+
         # VK might return token in fragment (Standalone app) — show JS extractor
         return HTMLResponse("""
         <!DOCTYPE html>
