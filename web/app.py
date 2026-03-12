@@ -3,6 +3,7 @@
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from fastapi.responses import RedirectResponse
 
 from database.engine import init_db
 from database.service import create_group, seed_default_settings
@@ -64,6 +65,11 @@ app = FastAPI(
 app.include_router(callback_router)
 app.include_router(oauth_router)
 app.include_router(dashboard_router)
+
+
+@app.get("/")
+async def root():
+    return RedirectResponse("/dashboard")
 
 
 @app.get("/api/health")

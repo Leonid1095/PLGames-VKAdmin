@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 
 Base = declarative_base()
 
+_now = lambda: datetime.now(timezone.utc)
+
 
 class Group(Base):
     """Connected VK group (tenant)."""
@@ -17,7 +19,7 @@ class Group(Base):
     confirmation_code = Column(String, default="")
     secret_key = Column(String, default="")
     is_active = Column(Boolean, default=True, nullable=False)
-    connected_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    connected_at = Column(DateTime, default=_now)
 
 
 class UserContext(Base):
@@ -27,7 +29,7 @@ class UserContext(Base):
     group_id = Column(BigInteger, ForeignKey("groups.group_id"), nullable=False, index=True)
     vk_id = Column(BigInteger, nullable=False, index=True)
     context_data = Column(Text, default="", nullable=False)
-    last_interaction = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    last_interaction = Column(DateTime, default=_now, nullable=False)
 
     __table_args__ = (
         UniqueConstraint("group_id", "vk_id", name="uq_context_group_user"),
@@ -70,3 +72,99 @@ class UserStats(Base):
     __table_args__ = (
         UniqueConstraint("group_id", "vk_id", name="uq_stats_group_user"),
     )
+
+
+# ─── Suggested Posts (Предложка) ─────────────────────────────────────────────
+
+class SuggestedPost(Base):
+    __tablename__ = "suggested_posts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(BigInteger, ForeignKey("groups.group_id"), nullable=False, index=True)
+    from_vk_id = Column(BigInteger, nullable=False)
+    text = Column(Text, nullable=False)
+    attachments = Column(Text, default="")  # JSON list of attachment strings
+    status = Column(String, default="pending", nullable=False, index=True)  # pending / approved / rejected / published
+    created_at = Column(DateTime, default=_now, nullable=False)
+    reviewed_at = Column(DateTime, nullable=True)
+    reviewed_by = Column(BigInteger, nullable=True)
+    reject_reason = Column(String, nullable=True)
+
+
+# ─── Content Sources (Парсинг) ───────────────────────────────────────────────
+
+class ContentSource(Base):
+    __tablename__ = "content_sources"
+
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(BigInteger, ForeignKey("groups.group_id"), nullable=False, index=True)
+    source_type = Column(String, nullable=False)  # rss / vk_group
+    source_url = Column(String, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    last_fetched_at = Column(DateTime, nullable=True)
+    filter_keywords = Column(Text, default="")  # comma-separated
+
+
+# ─── Scheduled Posts (Контент-план) ──────────────────────────────────────────
+
+class ScheduledPost(Base):
+    __tablename__ = "scheduled_posts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(BigInteger, ForeignKey("groups.group_id"), nullable=False, index=True)
+    text = Column(Text, nullable=False)
+    attachments = Column(Text, default="")
+    scheduled_at = Column(DateTime, nullable=False, index=True)
+    status = Column(String, default="pending", nullable=False, index=True)  # pending / published / failed
+    source = Column(String, default="manual")  # manual / ai / parsed / suggested
+    published_at = Column(DateTime, nullable=True)
+    vk_post_id = Column(BigInteger, nullable=True)
+
+
+# ─── Post Analytics ──────────────────────────────────────────────────────────
+
+class PostAnalytics(Base):
+    __tablename__ = "post_analytics"
+
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(BigInteger, ForeignKey("groups.group_id"), nullable=False, index=True)
+    vk_post_id = Column(BigInteger, nullable=False)
+    published_at = Column(DateTime, nullable=True)
+    likes = Column(Integer, default=0)
+    reposts = Column(Integer, default=0)
+    comments = Column(Integer, default=0)
+    views = Column(Integer, default=0)
+    last_checked_at = Column(DateTime, default=_now)
+
+    __table_args__ = (
+        UniqueConstraint("group_id", "vk_post_id", name="uq_analytics_group_post"),
+    )
+
+
+# ─── Newsletter (Рассылка) ──────────────────────────────────────────────────
+
+class Newsletter(Base):
+    __tablename__ = "newsletters"
+
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(BigInteger, ForeignKey("groups.group_id"), nullable=False, index=True)
+    text = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=_now, nullable=False)
+    status = Column(String, default="sending", nullable=False)  # sending / sent / failed
+    total_recipients = Column(Integer, default=0)
+    sent_count = Column(Integer, default=0)
+    created_by = Column(BigInteger, nullable=False)
+
+
+# ─── Ban Records (Аудит банов) ───────────────────────────────────────────────
+
+class BanRecord(Base):
+    __tablename__ = "ban_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(BigInteger, ForeignKey("groups.group_id"), nullable=False, index=True)
+    vk_id = Column(BigInteger, nullable=False)
+    banned_by = Column(BigInteger, nullable=False)
+    reason = Column(String, default="")
+    banned_at = Column(DateTime, default=_now, nullable=False)
+    unbanned_at = Column(DateTime, nullable=True)

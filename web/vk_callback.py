@@ -8,7 +8,7 @@ from vkbottle import API
 
 from core.group_context import GroupContext
 from core.crypto import decrypt_token
-from database.service import get_group
+from database.service import get_group, get_setting
 from handlers.admin import handle_admin_command
 from handlers.messages import handle_message
 from handlers.comments import handle_wall_comment
@@ -32,7 +32,6 @@ def _cleanup_events_cache():
 
 
 async def _build_context(group_id: int) -> GroupContext | None:
-    """Build a GroupContext from DB for the given group."""
     group = await get_group(group_id)
     if not group:
         logger.warning(f"Received event for unknown/inactive group {group_id}")
@@ -45,15 +44,12 @@ async def _build_context(group_id: int) -> GroupContext | None:
         return None
 
     api = API(token=token)
-    return GroupContext(
-        group_id=group_id,
-        api=api,
-        admin_vk_id=group.admin_vk_id,
-    )
+    return GroupContext(group_id=group_id, api=api, admin_vk_id=group.admin_vk_id)
 
+
+# ─── Event processors ───────────────────────────────────────────────────────
 
 async def _process_message(ctx: GroupContext, obj: dict):
-    """Process a message_new event in background."""
     message = obj.get("message", obj)
     from_id = message.get("from_id", 0)
     text = message.get("text", "")
@@ -62,34 +58,71 @@ async def _process_message(ctx: GroupContext, obj: dict):
     if not text.strip():
         return
 
-    # Try admin commands first
     reply = await handle_admin_command(ctx, from_id, text, peer_id)
     if reply is None:
         reply = await handle_message(ctx, from_id, text, peer_id)
 
     if reply:
         try:
-            await ctx.api.messages.send(
-                peer_id=peer_id,
-                message=reply,
-                random_id=0,
-            )
+            await ctx.api.messages.send(peer_id=peer_id, message=reply, random_id=0)
         except Exception as e:
             logger.error(f"Failed to send message to {peer_id}: {e}")
 
 
 async def _process_wall_reply(ctx: GroupContext, obj: dict):
-    """Process a wall_reply_new event in background."""
     await handle_wall_comment(ctx, obj)
 
 
+async def _process_group_join(ctx: GroupContext, obj: dict):
+    """Welcome new group member."""
+    user_id = obj.get("user_id", 0)
+    if not user_id:
+        return
+
+    welcome_msg = await get_setting(ctx.group_id, "welcome_message", "")
+    use_ai = (await get_setting(ctx.group_id, "welcome_ai", "false")).lower() == "true"
+
+    if not welcome_msg and not use_ai:
+        return
+
+    if use_ai:
+        from core.ai_brain import generate_response
+        try:
+            # Get user name for personalized greeting
+            users = await ctx.api.users.get(user_ids=[user_id])
+            name = users[0].first_name if users else "друг"
+        except Exception:
+            name = "друг"
+
+        welcome_msg = await generate_response(
+            prompt=f"Пользователь {name} вступил в группу. Поприветствуй его!",
+            system_prompt=(
+                "Ты дружелюбный администратор группы ВКонтакте. Напиши короткое, "
+                "тёплое приветствие для нового участника (2-3 предложения). "
+                "Расскажи что интересного есть в группе."
+            ),
+            group_id=ctx.group_id,
+        )
+
+    if welcome_msg:
+        try:
+            await ctx.api.messages.send(user_id=user_id, message=welcome_msg, random_id=0)
+            logger.info(f"Welcome message sent to {user_id} in group {ctx.group_id}")
+        except Exception as e:
+            logger.warning(f"Failed to send welcome to {user_id}: {e}")
+
+
+async def _process_group_leave(ctx: GroupContext, obj: dict):
+    """Log when a member leaves."""
+    user_id = obj.get("user_id", 0)
+    if user_id:
+        logger.info(f"User {user_id} left group {ctx.group_id}")
+
+
+# ─── Main callback endpoint ─────────────────────────────────────────────────
+
 @router.post("/api/vk/events")
 async def vk_callback(request: Request):
-    """
-    Main Callback API endpoint.
-    VK sends JSON with type, group_id, object, secret, event_id.
-    Must respond with 'ok' within 3 seconds.
-    """
     try:
         data = await request.json()
     except Exception:
@@ -99,7 +132,7 @@ async def vk_callback(request: Request):
     group_id = data.get("group_id", 0)
     event_id = data.get("event_id", "")
 
-    # ── Confirmation (VK verifying the server) ──
+    # ── Confirmation ──
     if event_type == "confirmation":
         group = await get_group(group_id)
         if group and group.confirmation_code:
@@ -128,11 +161,14 @@ async def vk_callback(request: Request):
 
     obj = data.get("object", {})
 
-    # ── Dispatch event to background task ──
+    # ── Dispatch event ──
     if event_type == "message_new":
         asyncio.create_task(_process_message(ctx, obj))
     elif event_type == "wall_reply_new":
         asyncio.create_task(_process_wall_reply(ctx, obj))
+    elif event_type == "group_join":
+        asyncio.create_task(_process_group_join(ctx, obj))
+    elif event_type == "group_leave":
+        asyncio.create_task(_process_group_leave(ctx, obj))
 
-    # Respond immediately so VK doesn't retry
     return PlainTextResponse("ok")

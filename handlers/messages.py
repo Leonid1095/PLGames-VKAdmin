@@ -2,6 +2,7 @@ import logging
 from core.ai_brain import chat_with_memory, generate_response
 from core.group_context import GroupContext
 from database.service import get_user_stats, get_user_history
+from handlers.suggestions import handle_suggestion
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,23 @@ async def handle_message(ctx: GroupContext, from_id: int, text: str, peer_id: in
             "2. 1000 коинов — 100 руб\n\n"
             "Для оплаты переведите нужную сумму по реквизитам и напишите "
             "администратору группы. Скоро здесь появится автоматическая оплата!"
+        )
+
+    # ── !предложить ──
+    if lower.startswith("!предложить"):
+        content = stripped[len("!предложить"):].strip()
+        return await handle_suggestion(ctx, from_id, content, peer_id)
+
+    # ── !команды / !помощь ──
+    if lower in ("!команды", "!помощь"):
+        return (
+            "Доступные команды:\n\n"
+            "!профиль — ваш личный кабинет\n"
+            "!купить — магазин VIP и коинов\n"
+            "!предложить <текст> — предложить пост\n"
+            "!гороскоп — шуточный гороскоп\n"
+            "!кто я — ИИ-анализ личности\n\n"
+            "Или просто напишите мне — я отвечу!"
         )
 
     # ── !гороскоп ──
