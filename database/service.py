@@ -79,6 +79,14 @@ async def get_all_active_groups() -> list[Group]:
         return list(result.scalars().all())
 
 
+async def get_groups_by_admin(admin_vk_id: int) -> list[Group]:
+    async with async_session() as session:
+        result = await session.execute(
+            select(Group).where(Group.admin_vk_id == admin_vk_id, Group.is_active == True)
+        )
+        return list(result.scalars().all())
+
+
 async def deactivate_group(group_id: int) -> None:
     async with async_session() as session:
         result = await session.execute(select(Group).where(Group.group_id == group_id))

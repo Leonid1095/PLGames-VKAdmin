@@ -12,6 +12,7 @@ from web.vk_callback import router as callback_router
 from web.oauth import router as oauth_router
 from web.dashboard.routes import router as dashboard_router
 from web.api_public import router as api_router
+from web.miniapp.routes import router as miniapp_router
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +72,12 @@ class VKFrameMiddleware(BaseHTTPMiddleware):
     """Remove X-Frame-Options for VK Mini App callback so it loads in VK iframe."""
     async def dispatch(self, request: StarletteRequest, call_next):
         response = await call_next(request)
-        if request.url.path == "/api/vk/callback" and request.query_params.get("vk_app_id"):
-            # Allow VK iframe
+        path = request.url.path
+        is_vk_frame = (
+            path.startswith("/miniapp")
+            or (path == "/api/vk/callback" and request.query_params.get("vk_app_id"))
+        )
+        if is_vk_frame:
             response.headers["X-Frame-Options"] = ""
             response.headers["Content-Security-Policy"] = "frame-ancestors https://*.vk.com https://vk.com"
         return response
@@ -83,6 +88,7 @@ app.include_router(callback_router)
 app.include_router(oauth_router)
 app.include_router(dashboard_router)
 app.include_router(api_router)
+app.include_router(miniapp_router)
 
 
 @app.get("/")
