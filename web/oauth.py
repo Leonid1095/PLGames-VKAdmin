@@ -68,15 +68,10 @@ async def oauth_callback(request: Request, code: str = "", error: str = "", erro
             return HTMLResponse(f"""
             <!DOCTYPE html>
             <html><head><meta charset="utf-8"><title>VKAdmin</title>
+            <script src="https://unpkg.com/@vkontakte/vk-bridge/dist/browser.min.js"></script>
             <script>
-                // Init VK Mini App via postMessage (no external deps)
-                try {{
-                    parent.postMessage(JSON.stringify({{
-                        handler: 'VKWebAppInit',
-                        type: 'vk-connect',
-                        params: {{}}
-                    }}), '*');
-                }} catch(e) {{}}
+                // Init VK Mini App — must be called before page loads
+                vkBridge.send("VKWebAppInit", {{}});
             </script>
             <style>
                 body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 0; padding: 30px; background: #f5f5f5; }}
