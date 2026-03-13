@@ -11,6 +11,8 @@ class Settings(BaseSettings):
     VK_APP_ID: str = ""
     VK_APP_SECRET: str = ""
     VK_APP_SERVICE_KEY: str = ""
+    VK_MINIAPP_ID: str = ""
+    VK_MINIAPP_SECRET: str = ""
     BASE_URL: str = "http://localhost:8000"
 
     # AI Provider

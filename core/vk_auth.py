@@ -42,19 +42,29 @@ def verify_vk_launch_params(query_params: dict) -> VKLaunchParams | None:
     # Build query string
     query_string = urlencode(vk_params)
 
-    # Compute HMAC-SHA256
-    secret = settings.VK_APP_SECRET
-    if not secret:
-        logger.error("VK_APP_SECRET not set, cannot verify launch params")
+    # Compute HMAC-SHA256 — try Mini App secret first, then main app secret
+    secrets_to_try = []
+    if settings.VK_MINIAPP_SECRET:
+        secrets_to_try.append(settings.VK_MINIAPP_SECRET)
+    if settings.VK_APP_SECRET:
+        secrets_to_try.append(settings.VK_APP_SECRET)
+
+    if not secrets_to_try:
+        logger.error("No VK app secrets configured, cannot verify launch params")
         return None
 
-    computed = hmac.new(
-        secret.encode(), query_string.encode(), hashlib.sha256
-    ).digest()
-    computed_sign = base64.urlsafe_b64encode(computed).rstrip(b"=").decode()
+    verified = False
+    for secret in secrets_to_try:
+        computed = hmac.new(
+            secret.encode(), query_string.encode(), hashlib.sha256
+        ).digest()
+        computed_sign = base64.urlsafe_b64encode(computed).rstrip(b"=").decode()
+        if hmac.compare_digest(computed_sign, sign):
+            verified = True
+            break
 
-    if not hmac.compare_digest(computed_sign, sign):
-        logger.warning(f"VK launch params signature mismatch")
+    if not verified:
+        logger.warning("VK launch params signature mismatch")
         return None
 
     return VKLaunchParams(
