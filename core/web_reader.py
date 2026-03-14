@@ -1,5 +1,6 @@
 """Web reader — fetch and extract text from URLs (web pages, GitHub, etc.)."""
 
+import html
 import re
 import logging
 from urllib.parse import urlparse
@@ -43,8 +44,7 @@ async def _read_webpage(url: str) -> str:
         # Clean up whitespace
         text = re.sub(r"\s+", " ", text).strip()
         # Decode HTML entities
-        text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-        text = text.replace("&quot;", '"').replace("&#39;", "'").replace("&nbsp;", " ")
+        text = html.unescape(text)
 
         return text[:5000]
     except Exception as e:

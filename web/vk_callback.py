@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from collections import OrderedDict
 from fastapi import APIRouter, Request
 from fastapi.responses import PlainTextResponse
@@ -20,6 +21,25 @@ router = APIRouter()
 # LRU cache for event deduplication
 _processed_events: OrderedDict[str, None] = OrderedDict()
 _MAX_EVENTS_CACHE = 10000
+
+# Basic rate limiting: max events per group per window
+_RATE_LIMIT_WINDOW = 60  # seconds
+_RATE_LIMIT_MAX = 120  # max events per group per window
+_rate_counters: dict[int, tuple[float, int]] = {}  # group_id -> (window_start, count)
+
+
+def _check_rate_limit(group_id: int) -> bool:
+    """Returns True if rate limit exceeded for this group."""
+    now = time.monotonic()
+    entry = _rate_counters.get(group_id)
+    if entry is None or now - entry[0] > _RATE_LIMIT_WINDOW:
+        _rate_counters[group_id] = (now, 1)
+        return False
+    window_start, count = entry
+    if count >= _RATE_LIMIT_MAX:
+        return True
+    _rate_counters[group_id] = (window_start, count + 1)
+    return False
 
 
 def _check_and_add_event(group_id: int, event_id: str) -> bool:
@@ -180,6 +200,11 @@ async def vk_callback(request: Request):
     group = await get_group(group_id)
     if group and group.secret_key and secret != group.secret_key:
         logger.warning(f"Invalid secret for group {group_id}")
+        return PlainTextResponse("ok")
+
+    # ── Rate limit ──
+    if _check_rate_limit(group_id):
+        logger.warning(f"Rate limit exceeded for group {group_id}")
         return PlainTextResponse("ok")
 
     # ── Deduplicate ──

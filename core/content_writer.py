@@ -127,6 +127,33 @@ async def write_from_multiple_sources(
     return await write_from_source(group_id, combined, instruction)
 
 
+async def write_article(
+    group_id: int,
+    source_url: str = "",
+    instruction: str = "",
+    length: str = "medium",
+) -> str:
+    """
+    Write an article post — wrapper over write_from_url/write_from_source.
+    length: 'short' (~5 sentences), 'medium' (~10-15), 'long' (~20-30).
+    """
+    length_hints = {
+        "short": "Напиши кратко, 5-7 предложений.",
+        "medium": "Напиши статью средней длины, 10-15 предложений.",
+        "long": "Напиши развёрнутую статью, 20-30 предложений.",
+    }
+    length_hint = length_hints.get(length, length_hints["medium"])
+    full_instruction = f"{instruction} {length_hint}".strip() if instruction else length_hint
+
+    if source_url:
+        return await write_from_url(group_id, source_url, full_instruction)
+
+    # No URL — generate from instruction alone using write_from_source
+    if not instruction:
+        return "Не указан ни URL-источник, ни инструкция для статьи."
+    return await write_from_source(group_id, instruction, full_instruction)
+
+
 async def write_patch_notes(
     group_id: int,
     github_url: str,

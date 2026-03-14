@@ -1,9 +1,11 @@
 """Public API — allows external clients to fetch content from connected groups."""
 
+import hmac
 import logging
 from datetime import datetime, timezone
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, Query, HTTPException, Depends, Header
 
+from core.config import settings
 from database.service import (
     get_group, get_all_active_groups,
     get_post_analytics, get_content_plan,
@@ -13,7 +15,16 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1")
 
 
-@router.get("/groups")
+async def _require_api_key(x_api_key: str = Header(default="")):
+    """Verify API key from X-API-Key header."""
+    if not settings.API_KEY:
+        # No API key configured — API is disabled
+        raise HTTPException(status_code=503, detail="API not configured. Set API_KEY in .env")
+    if not x_api_key or not hmac.compare_digest(x_api_key, settings.API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+@router.get("/groups", dependencies=[Depends(_require_api_key)])
 async def list_groups():
     """List all active groups (public info only)."""
     groups = await get_all_active_groups()
@@ -29,7 +40,7 @@ async def list_groups():
     }
 
 
-@router.get("/groups/{group_id}/feed")
+@router.get("/groups/{group_id}/feed", dependencies=[Depends(_require_api_key)])
 async def group_feed(
     group_id: int,
     limit: int = Query(default=20, ge=1, le=100),
@@ -62,7 +73,7 @@ async def group_feed(
     }
 
 
-@router.get("/groups/{group_id}/schedule")
+@router.get("/groups/{group_id}/schedule", dependencies=[Depends(_require_api_key)])
 async def group_schedule(group_id: int):
     """Get today's content plan for a group."""
     group = await get_group(group_id)

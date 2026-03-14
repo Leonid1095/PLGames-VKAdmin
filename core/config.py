@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     # Security
     ENCRYPTION_KEY: str = ""  # Fernet key for encrypting tokens
     JWT_SECRET: str = "change-me-to-random-secret"
+    API_KEY: str = ""  # API key for public API endpoints
 
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
@@ -33,3 +34,12 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+# Validate critical settings at import time
+if not settings.ENCRYPTION_KEY:
+    import warnings
+    warnings.warn(
+        "ENCRYPTION_KEY is not set! Token encryption will fail. "
+        "Generate one with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\"",
+        stacklevel=1,
+    )

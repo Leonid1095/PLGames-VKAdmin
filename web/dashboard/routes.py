@@ -1,11 +1,15 @@
 """Admin dashboard — web panel for managing connected groups."""
 
 import logging
+from html import escape
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from core.config import settings as app_settings
-from core.auth import is_authenticated, set_auth_cookie, clear_auth_cookie, get_dashboard_password
+from core.auth import (
+    is_authenticated, set_auth_cookie, clear_auth_cookie, get_dashboard_password,
+    get_csrf_token, set_csrf_cookie, verify_csrf_token,
+)
 from database.service import (
     get_all_active_groups, get_group, get_setting, set_setting,
     deactivate_group, get_content_sources, add_content_source,
@@ -22,6 +26,12 @@ def _require_auth(request: Request):
     if not is_authenticated(request):
         return RedirectResponse("/dashboard/login", status_code=303)
     return None
+
+
+def _csrf_field(request: Request) -> str:
+    """Generate a hidden CSRF input field for forms."""
+    token = get_csrf_token(request)
+    return f'<input type="hidden" name="_csrf" value="{token}">'
 
 
 # ─── Settings schema: grouped, with human-readable labels and input types ────
@@ -414,6 +424,7 @@ async def login_page(request: Request):
         {error_html}
         <div class="card">
             <form method="POST" action="/dashboard/login">
+                <input type="hidden" name="_csrf" value="{get_csrf_token(request)}">
                 <div class="form-group" style="margin-bottom:16px;">
                     <label style="display:block;font-weight:600;margin-bottom:6px;">Пароль</label>
                     <input type="password" name="password" placeholder="Введите пароль..." required autofocus
@@ -425,11 +436,15 @@ async def login_page(request: Request):
         </div>
     </div>
     """
-    return HTMLResponse(_base_html("Вход", content))
+    response = HTMLResponse(_base_html("Вход", content))
+    set_csrf_cookie(response, get_csrf_token(request))
+    return response
 
 
 @router.post("/dashboard/login")
 async def login_submit(request: Request):
+    if not await verify_csrf_token(request):
+        return RedirectResponse("/dashboard/login?error=1", status_code=303)
     form = await request.form()
     password = str(form.get("password", ""))
 
@@ -456,6 +471,9 @@ async def dashboard_home(request: Request):
     if redirect:
         return redirect
 
+    csrf = _csrf_field(request)
+    csrf_token = get_csrf_token(request)
+
     groups = await get_all_active_groups()
 
     if not groups:
@@ -477,11 +495,13 @@ async def dashboard_home(request: Request):
             <p class="hint">Где найти ID: откройте группу ВК, в адресе будет vk.com/club<b>123456</b> — число после club и есть ID</p>
         </div>
         """
-        return HTMLResponse(_base_html("Панель управления", content))
+        response = HTMLResponse(_base_html("Панель управления", content))
+        set_csrf_cookie(response, csrf_token)
+        return response
 
     groups_html = ""
     for g in groups:
-        name = g.group_name or f"Группа {g.group_id}"
+        name = escape(g.group_name or f"Группа {g.group_id}")
         groups_html += f"""
         <div class="card">
             <div class="group-card">
@@ -493,6 +513,7 @@ async def dashboard_home(request: Request):
                     <a href="/dashboard/group/{g.group_id}" class="btn btn-sm">Настроить</a>
                     <form method="POST" action="/dashboard/group/{g.group_id}/disconnect"
                           onsubmit="return confirm('Отключить бота от этой группы?');">
+                        {csrf}
                         <button type="submit" class="btn btn-danger btn-sm">Отключить</button>
                     </form>
                 </div>
@@ -518,7 +539,9 @@ async def dashboard_home(request: Request):
         <p class="hint">vk.com/club<b>123456</b> → ID = 123456</p>
     </div>
     """
-    return HTMLResponse(_base_html("Панель управления", content))
+    response = HTMLResponse(_base_html("Панель управления", content))
+    set_csrf_cookie(response, csrf_token)
+    return response
 
 
 # ─── Group settings page ────────────────────────────────────────────────────
@@ -536,6 +559,9 @@ async def group_settings_page(request: Request, group_id: int):
             status_code=404,
         )
 
+    csrf = _csrf_field(request)
+    csrf_token = get_csrf_token(request)
+
     flash = ""
     msg = request.query_params.get("msg", "")
     if msg == "saved":
@@ -547,7 +573,7 @@ async def group_settings_page(request: Request, group_id: int):
         for s in section["settings"]:
             key = s["key"]
             current_value = await get_setting(group_id, key, s.get("default", ""))
-            control = _render_control(group_id, s, current_value)
+            control = _render_control(group_id, s, current_value, csrf)
             items_html += f"""
             <div class="setting">
                 <div class="setting-header">
@@ -581,11 +607,12 @@ async def group_settings_page(request: Request, group_id: int):
             sources_rows += f"""
             <tr>
                 <td><span class="source-type source-type-{type_class}">{type_label}</span></td>
-                <td><span class="source-url">{s.source_url}</span></td>
+                <td><span class="source-url">{escape(s.source_url)}</span></td>
                 <td><span class="source-fetched">{fetched}</span></td>
                 <td>
                     <form method="POST" action="/dashboard/group/{group_id}/sources/delete"
                           onsubmit="return confirm('Удалить этот источник?');">
+                        {csrf}
                         <input type="hidden" name="source_id" value="{s.id}">
                         <button type="submit" class="btn-delete">Удалить</button>
                     </form>
@@ -609,6 +636,7 @@ async def group_settings_page(request: Request, group_id: int):
         </div>
         {sources_table}
         <form method="POST" action="/dashboard/group/{group_id}/sources/add" class="source-add">
+            {csrf}
             <div class="form-group">
                 <label style="font-size:0.85rem;">Тип</label>
                 <select name="source_type" style="width:140px;">
@@ -647,12 +675,13 @@ async def group_settings_page(request: Request, group_id: int):
             tasks_rows += f"""
             <tr>
                 <td><span class="source-type source-type-api">{type_label}</span></td>
-                <td><span class="source-url">{t.source_url or '—'}</span></td>
-                <td><code style="font-size:0.82rem;">{t.schedule_cron}</code></td>
+                <td><span class="source-url">{escape(t.source_url or '—')}</span></td>
+                <td><code style="font-size:0.82rem;">{escape(t.schedule_cron)}</code></td>
                 <td><span class="source-fetched">{last}</span></td>
                 <td>
                     <form method="POST" action="/dashboard/group/{group_id}/tasks/delete"
                           onsubmit="return confirm('Удалить задачу?');">
+                        {csrf}
                         <input type="hidden" name="task_id" value="{t.id}">
                         <button type="submit" class="btn-delete">Удалить</button>
                     </form>
@@ -676,6 +705,7 @@ async def group_settings_page(request: Request, group_id: int):
         </div>
         {tasks_table}
         <form method="POST" action="/dashboard/group/{group_id}/tasks/add" class="source-add">
+            {csrf}
             <div class="form-group">
                 <label style="font-size:0.85rem;">Тип</label>
                 <select name="task_type" style="width:140px;">
@@ -704,7 +734,7 @@ async def group_settings_page(request: Request, group_id: int):
     # ── AI refresh section ──
     ai_desc = await get_setting(group_id, "ai_group_description", "")
     if ai_desc:
-        ai_status = f'<span style="color:#2e7d32;">✓ Настроен: {ai_desc[:100]}</span>'
+        ai_status = f'<span style="color:#2e7d32;">✓ Настроен: {escape(ai_desc[:100])}</span>'
     else:
         ai_status = '<span style="color:#d32f2f;">✗ Не настроен — нажмите кнопку ниже</span>'
 
@@ -717,12 +747,13 @@ async def group_settings_page(request: Request, group_id: int):
             правила модерации и темы контента под тематику группы.
         </p>
         <form method="POST" action="/dashboard/group/{group_id}/ai-refresh">
+            {csrf}
             <button type="submit" class="btn">Обновить ИИ-профиль</button>
         </form>
     </div>
     """
 
-    name = group.group_name or f"Группа {group_id}"
+    name = escape(group.group_name or f"Группа {group_id}")
     content = f"""
     <a href="/dashboard" class="back">← Назад</a>
     <div class="header">
@@ -735,10 +766,12 @@ async def group_settings_page(request: Request, group_id: int):
     {tasks_html}
     {ai_refresh_html}
     """
-    return HTMLResponse(_base_html(name, content))
+    response = HTMLResponse(_base_html(name, content))
+    set_csrf_cookie(response, csrf_token)
+    return response
 
 
-def _render_control(group_id: int, setting: dict, current_value: str) -> str:
+def _render_control(group_id: int, setting: dict, current_value: str, csrf: str = "") -> str:
     """Render the appropriate input control for a setting."""
     key = setting["key"]
     stype = setting.get("type", "text")
@@ -747,6 +780,7 @@ def _render_control(group_id: int, setting: dict, current_value: str) -> str:
         checked = "checked" if current_value.lower() == "true" else ""
         return f"""
         <form method="POST" action="/dashboard/group/{group_id}/settings" style="display:flex;align-items:center;justify-content:flex-end;gap:8px;">
+            {csrf}
             <input type="hidden" name="key" value="{key}">
             <input type="hidden" name="value" value="false">
             <label class="toggle">
@@ -765,6 +799,7 @@ def _render_control(group_id: int, setting: dict, current_value: str) -> str:
             opts_html += f'<option value="{val}" {selected}>{label}</option>'
         return f"""
         <form method="POST" action="/dashboard/group/{group_id}/settings">
+            {csrf}
             <input type="hidden" name="key" value="{key}">
             <select name="value" onchange="this.form.submit()" style="cursor:pointer;">
                 {opts_html}
@@ -776,9 +811,10 @@ def _render_control(group_id: int, setting: dict, current_value: str) -> str:
         placeholder = setting.get("placeholder", "")
         return f"""
         <form method="POST" action="/dashboard/group/{group_id}/settings">
+            {csrf}
             <input type="hidden" name="key" value="{key}">
-            <textarea name="value" placeholder="{placeholder}"
-                      onfocus="this.nextElementSibling.classList.add('show')">{current_value}</textarea>
+            <textarea name="value" placeholder="{escape(placeholder)}"
+                      onfocus="this.nextElementSibling.classList.add('show')">{escape(current_value)}</textarea>
             <button type="submit" class="save-btn">Сохранить</button>
         </form>
         """
@@ -787,8 +823,9 @@ def _render_control(group_id: int, setting: dict, current_value: str) -> str:
     placeholder = setting.get("placeholder", "")
     return f"""
     <form method="POST" action="/dashboard/group/{group_id}/settings">
+        {csrf}
         <input type="hidden" name="key" value="{key}">
-        <input type="text" name="value" value="{current_value}" placeholder="{placeholder}"
+        <input type="text" name="value" value="{escape(current_value, quote=True)}" placeholder="{escape(placeholder, quote=True)}"
                onfocus="this.nextElementSibling.classList.add('show')">
         <button type="submit" class="save-btn">Сохранить</button>
     </form>
@@ -802,6 +839,8 @@ async def update_group_setting(request: Request, group_id: int):
     redirect = _require_auth(request)
     if redirect:
         return redirect
+    if not await verify_csrf_token(request):
+        return RedirectResponse(f"/dashboard/group/{group_id}", status_code=303)
     form = await request.form()
     key = str(form.get("key", "")).strip()
 
@@ -822,6 +861,8 @@ async def add_source(request: Request, group_id: int):
     redirect = _require_auth(request)
     if redirect:
         return redirect
+    if not await verify_csrf_token(request):
+        return RedirectResponse(f"/dashboard/group/{group_id}", status_code=303)
     form = await request.form()
     source_type = str(form.get("source_type", "rss")).strip()
     source_url = str(form.get("source_url", "")).strip()
@@ -838,6 +879,8 @@ async def remove_source(request: Request, group_id: int):
     redirect = _require_auth(request)
     if redirect:
         return redirect
+    if not await verify_csrf_token(request):
+        return RedirectResponse(f"/dashboard/group/{group_id}", status_code=303)
     form = await request.form()
     source_id = int(form.get("source_id", 0))
     if source_id:
@@ -851,6 +894,8 @@ async def add_task(request: Request, group_id: int):
     redirect = _require_auth(request)
     if redirect:
         return redirect
+    if not await verify_csrf_token(request):
+        return RedirectResponse(f"/dashboard/group/{group_id}", status_code=303)
     form = await request.form()
     task_type = str(form.get("task_type", "article")).strip()
     source_url = str(form.get("source_url", "")).strip()
@@ -876,6 +921,8 @@ async def remove_task(request: Request, group_id: int):
     redirect = _require_auth(request)
     if redirect:
         return redirect
+    if not await verify_csrf_token(request):
+        return RedirectResponse(f"/dashboard/group/{group_id}", status_code=303)
     form = await request.form()
     task_id = int(form.get("task_id", 0))
     if task_id:
@@ -888,6 +935,8 @@ async def ai_refresh(request: Request, group_id: int):
     redirect = _require_auth(request)
     if redirect:
         return redirect
+    if not await verify_csrf_token(request):
+        return RedirectResponse(f"/dashboard/group/{group_id}", status_code=303)
 
     group = await get_group(group_id)
     if group:
@@ -907,5 +956,7 @@ async def disconnect_group(request: Request, group_id: int):
     redirect = _require_auth(request)
     if redirect:
         return redirect
+    if not await verify_csrf_token(request):
+        return RedirectResponse("/dashboard", status_code=303)
     await deactivate_group(group_id)
     return RedirectResponse("/dashboard", status_code=303)

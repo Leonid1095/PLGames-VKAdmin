@@ -31,22 +31,34 @@ async def start_oauth(request: Request, group_ids: str = ""):
     redirect_uri = f"{settings.BASE_URL}/api/vk/callback"
     scope = "messages,wall,manage,photos"
 
+    # Generate state parameter to prevent CSRF
+    state = secrets.token_hex(16)
+
     vk_auth_url = (
         f"https://oauth.vk.com/authorize?"
         f"client_id={settings.VK_APP_ID}"
         f"&redirect_uri={redirect_uri}"
         f"&scope={scope}"
         f"&response_type=code"
+        f"&state={state}"
         f"&v=5.199"
     )
     if group_ids:
         vk_auth_url += f"&group_ids={group_ids}"
 
-    return RedirectResponse(vk_auth_url)
+    response = RedirectResponse(vk_auth_url)
+    response.set_cookie(
+        key="vkadmin_oauth_state",
+        value=state,
+        httponly=True,
+        samesite="lax",
+        max_age=600,  # 10 minutes
+    )
+    return response
 
 
 @router.get("/api/vk/callback")
-async def oauth_callback(request: Request, code: str = "", error: str = "", error_description: str = ""):
+async def oauth_callback(request: Request, code: str = "", error: str = "", error_description: str = "", state: str = ""):
     """
     Step 2: VK redirects back with an authorization code.
     Exchange it for a group access token.
@@ -55,8 +67,9 @@ async def oauth_callback(request: Request, code: str = "", error: str = "", erro
     logger.info(f"OAuth callback params: {dict(request.query_params)}")
 
     if error:
+        from html import escape
         return HTMLResponse(
-            f"<h2>Ошибка авторизации</h2><p>{error}: {error_description}</p>",
+            f"<h2>Ошибка авторизации</h2><p>{escape(error)}: {escape(error_description)}</p>",
             status_code=400,
         )
 
@@ -92,6 +105,15 @@ async def oauth_callback(request: Request, code: str = "", error: str = "", erro
             <p id="msg">Подождите...</p>
         </body></html>
         """, status_code=200)
+
+    # Verify OAuth state parameter
+    cookie_state = request.cookies.get("vkadmin_oauth_state", "")
+    if not cookie_state or not secrets.compare_digest(cookie_state, state):
+        logger.warning("OAuth state mismatch — possible CSRF")
+        return HTMLResponse(
+            "<h2>Ошибка безопасности</h2><p>Несоответствие state-параметра. Попробуйте ещё раз.</p>",
+            status_code=400,
+        )
 
     redirect_uri = f"{settings.BASE_URL}/api/vk/callback"
 
@@ -242,7 +264,8 @@ async def oauth_callback(request: Request, code: str = "", error: str = "", erro
             status_code=400,
         )
 
-    groups_html = "".join(f"<li>{g}</li>" for g in groups_connected)
+    from html import escape as html_escape
+    groups_html = "".join(f"<li>{html_escape(g)}</li>" for g in groups_connected)
     return _success_html(groups_html)
 
 
@@ -365,5 +388,6 @@ async def oauth_token_callback(request: Request):
             status_code=400,
         )
 
-    groups_html = "".join(f"<li>{g}</li>" for g in groups_connected)
+    from html import escape as html_escape
+    groups_html = "".join(f"<li>{html_escape(g)}</li>" for g in groups_connected)
     return _success_html(groups_html)

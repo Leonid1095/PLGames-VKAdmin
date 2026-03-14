@@ -8,6 +8,7 @@ from vkbottle import API
 
 from core.ai_brain import generate_post
 from core.crypto import decrypt_token
+from tasks.content_parser import fetch_and_schedule
 from database.service import (
     get_all_active_groups, get_setting, set_setting,
     get_due_posts, mark_post_published, mark_post_failed,
@@ -25,7 +26,6 @@ async def _autopost_job():
     Auto-posting: fetch content from group sources, then write a real post.
     Never generates from nothing — always uses source material.
     """
-    from tasks.content_parser import fetch_and_schedule
     from database.service import get_content_sources
 
     groups = await get_all_active_groups()
@@ -109,13 +109,14 @@ async def _scheduled_posts_job():
 # ─── Job 3: Content parser ──────────────────────────────────────────────────
 
 async def _content_parse_job():
-    from tasks.content_parser import fetch_and_schedule
-
+    """Parse content sources for groups that don't have autopost enabled (those are handled by _autopost_job)."""
     groups = await get_all_active_groups()
     for group in groups:
         try:
-            sources_exist = bool(await get_setting(group.group_id, "_has_sources", ""))
-            # Check every time (lightweight)
+            autopost = (await get_setting(group.group_id, "autopost_enabled", "false")).lower()
+            if autopost == "true":
+                continue  # already handled by _autopost_job
+
             count = await fetch_and_schedule(group.group_id)
             if count:
                 logger.info(f"Content parser: scheduled {count} posts for group {group.group_id}")

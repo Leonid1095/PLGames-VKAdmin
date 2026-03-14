@@ -1,6 +1,7 @@
 """VK Mini App — admin panel inside VK iframe."""
 
 import logging
+from html import escape
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
@@ -161,7 +162,7 @@ async def miniapp_entry(request: Request):
 
     groups_html = ""
     for g in groups:
-        name = g.group_name or f"Группа {g.group_id}"
+        name = escape(g.group_name or f"Группа {g.group_id}")
         groups_html += f"""
         <div class="card">
             <div class="group-card">
@@ -238,7 +239,7 @@ async def miniapp_group_settings(request: Request, group_id: int):
             sources_rows += f"""
             <tr>
                 <td><span class="source-type source-type-{type_class}">{type_label}</span></td>
-                <td><span class="source-url">{s.source_url}</span></td>
+                <td><span class="source-url">{escape(s.source_url)}</span></td>
                 <td>
                     <form method="POST" action="/miniapp/group/{group_id}/sources/delete?token={token}"
                           onsubmit="return confirm('Удалить?');">
@@ -292,8 +293,8 @@ async def miniapp_group_settings(request: Request, group_id: int):
             tasks_rows += f"""
             <tr>
                 <td><span class="source-type source-type-api">{type_label}</span></td>
-                <td><span class="source-url">{t.source_url or '—'}</span></td>
-                <td style="font-size:0.75rem;color:#888;">{t.schedule_cron}</td>
+                <td><span class="source-url">{escape(t.source_url or '—')}</span></td>
+                <td style="font-size:0.75rem;color:#888;">{escape(t.schedule_cron)}</td>
                 <td style="font-size:0.75rem;color:#888;">{last}</td>
                 <td>
                     <form method="POST" action="/miniapp/group/{group_id}/tasks/delete?token={token}"
@@ -342,7 +343,7 @@ async def miniapp_group_settings(request: Request, group_id: int):
 
     # AI refresh button
     ai_desc = await get_setting(group_id, "ai_group_description", "")
-    ai_status = f'<span style="color:#2e7d32;">Настроен: {ai_desc[:80]}...</span>' if ai_desc else '<span style="color:#d32f2f;">Не настроен — нажмите кнопку ниже</span>'
+    ai_status = f'<span style="color:#2e7d32;">Настроен: {escape(ai_desc[:80])}...</span>' if ai_desc else '<span style="color:#d32f2f;">Не настроен — нажмите кнопку ниже</span>'
 
     ai_refresh_html = f"""
     <div class="card">
@@ -358,7 +359,7 @@ async def miniapp_group_settings(request: Request, group_id: int):
     </div>
     """
 
-    name = group.group_name or f"Группа {group_id}"
+    name = escape(group.group_name or f"Группа {group_id}")
     back_html = f'<a href="/miniapp?token={token}" class="back">← Назад</a>'
 
     content = f"""
@@ -412,8 +413,8 @@ def _render_miniapp_control(group_id: int, setting: dict, current_value: str, to
         return f"""
         <form method="POST" action="{action}">
             <input type="hidden" name="key" value="{key}">
-            <textarea name="value" placeholder="{placeholder}"
-                      onfocus="this.nextElementSibling.classList.add('show')">{current_value}</textarea>
+            <textarea name="value" placeholder="{escape(placeholder)}"
+                      onfocus="this.nextElementSibling.classList.add('show')">{escape(current_value)}</textarea>
             <button type="submit" class="save-btn">Сохранить</button>
         </form>
         """
@@ -422,7 +423,7 @@ def _render_miniapp_control(group_id: int, setting: dict, current_value: str, to
     return f"""
     <form method="POST" action="{action}">
         <input type="hidden" name="key" value="{key}">
-        <input type="text" name="value" value="{current_value}" placeholder="{placeholder}"
+        <input type="text" name="value" value="{escape(current_value, quote=True)}" placeholder="{escape(placeholder, quote=True)}"
                onfocus="this.nextElementSibling.classList.add('show')">
         <button type="submit" class="save-btn">Сохранить</button>
     </form>
@@ -496,7 +497,7 @@ async def miniapp_add_task(request: Request, group_id: int):
             from croniter import croniter
             croniter(schedule_cron)
         except Exception:
-            return _error_page(f"Неверный cron: {schedule_cron}")
+            return _error_page(f"Неверный cron: {escape(schedule_cron)}")
 
         name = f"{task_type}_{source_url.split('/')[-1] if source_url else 'manual'}"
         await create_content_task(
