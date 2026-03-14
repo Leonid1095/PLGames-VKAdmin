@@ -7,9 +7,22 @@ from urllib.parse import urlparse
 
 import httpx
 
+from core.config import settings
+
 logger = logging.getLogger(__name__)
 
 _GITHUB_API = "https://api.github.com"
+
+
+def _github_headers() -> dict:
+    """Build GitHub API headers, with auth token if available."""
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "VKAdminBot/1.0",
+    }
+    if settings.GITHUB_TOKEN:
+        headers["Authorization"] = f"token {settings.GITHUB_TOKEN}"
+    return headers
 
 
 async def read_url(url: str) -> str:
@@ -69,10 +82,7 @@ async def _read_github(repo_path: str) -> str:
     repo = repo.removesuffix(".git")
     sub = parts[2] if len(parts) > 2 else ""
 
-    headers = {
-        "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "VKAdminBot/1.0",
-    }
+    headers = _github_headers()
 
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
@@ -147,10 +157,7 @@ async def read_github_commits(owner: str, repo: str, since_days: int = 7) -> str
 
 async def _fetch_commits_api(owner: str, repo: str, since_dt) -> str | None:
     """Fetch commits via GitHub API. Returns None if unreachable."""
-    headers = {
-        "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "VKAdminBot/1.0",
-    }
+    headers = _github_headers()
     try:
         async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
             resp = await client.get(
@@ -184,11 +191,13 @@ async def _fetch_commits_atom(owner: str, repo: str, since_dt) -> str:
     from datetime import datetime, timezone
     url = f"https://github.com/{owner}/{repo}/commits/main.atom"
 
+    atom_headers = {"User-Agent": "Mozilla/5.0 (compatible; VKAdminBot/1.0)"}
+    if settings.GITHUB_TOKEN:
+        atom_headers["Authorization"] = f"token {settings.GITHUB_TOKEN}"
+
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            resp = await client.get(url, headers={
-                "User-Agent": "Mozilla/5.0 (compatible; VKAdminBot/1.0)",
-            })
+            resp = await client.get(url, headers=atom_headers)
             if resp.status_code != 200:
                 return f"Ошибка загрузки коммитов: HTTP {resp.status_code}"
 

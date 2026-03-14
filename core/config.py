@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
     DEFAULT_MODEL: str = "openai/gpt-4o-mini"
 
+    # GitHub (for private repos)
+    GITHUB_TOKEN: str = ""
+
     # Telegram (global fallback, per-group tokens override via settings)
     TELEGRAM_BOT_TOKEN: str = ""
 
