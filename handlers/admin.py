@@ -569,7 +569,17 @@ async def cmd_patch_notes(ctx, from_id, parts, peer_id) -> str:
         return text
 
     try:
-        result = await ctx.api.wall.post(owner_id=-ctx.group_id, message=text)
+        # Try to attach a relevant image
+        post_kwargs = {"owner_id": -ctx.group_id, "message": text}
+        try:
+            from core.images import find_and_upload_image
+            attachment = await find_and_upload_image(ctx.api, ctx.group_id, post_type="patch_notes")
+            if attachment:
+                post_kwargs["attachments"] = attachment
+        except Exception:
+            pass
+
+        result = await ctx.api.wall.post(**post_kwargs)
         vk_post_id = result.post_id if result else 0
         await send_to_telegram(ctx.group_id, text, vk_post_id)
         return f"Патч-ноты опубликованы!\n\n{text[:500]}..."

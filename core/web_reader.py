@@ -75,7 +75,7 @@ async def _read_github(repo_path: str) -> str:
     }
 
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             # Always get repo info
             repo_resp = await client.get(f"{_GITHUB_API}/repos/{owner}/{repo}", headers=headers)
             repo_data = repo_resp.json() if repo_resp.status_code == 200 else {}
@@ -135,27 +135,38 @@ async def read_github_commits(owner: str, repo: str, since_days: int = 7) -> str
     """Fetch commits from the last N days for patch notes generation."""
     from datetime import datetime, timezone, timedelta
 
-    since = (datetime.now(timezone.utc) - timedelta(days=since_days)).isoformat()
+    since_dt = datetime.now(timezone.utc) - timedelta(days=since_days)
+
+    # Try GitHub API first, fallback to Atom feed if API is blocked
+    commits_text = await _fetch_commits_api(owner, repo, since_dt)
+    if commits_text is None:
+        commits_text = await _fetch_commits_atom(owner, repo, since_dt)
+
+    return commits_text
+
+
+async def _fetch_commits_api(owner: str, repo: str, since_dt) -> str | None:
+    """Fetch commits via GitHub API. Returns None if unreachable."""
     headers = {
         "Accept": "application/vnd.github.v3+json",
         "User-Agent": "VKAdminBot/1.0",
     }
-
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
             resp = await client.get(
                 f"{_GITHUB_API}/repos/{owner}/{repo}/commits",
                 headers=headers,
-                params={"since": since, "per_page": 100},
+                params={"since": since_dt.isoformat(), "per_page": 100},
             )
             if resp.status_code != 200:
-                return f"Ошибка GitHub API: {resp.status_code}"
+                return None
 
             commits = resp.json()
             if not commits:
-                return f"Нет коммитов за последние {since_days} дней."
+                days = ((__import__('datetime').datetime.now(__import__('datetime').timezone.utc) - since_dt).days)
+                return f"Нет коммитов за последние {days} дней."
 
-            lines = [f"Коммиты за последние {since_days} дней ({len(commits)} шт.):\n"]
+            lines = [f"Коммиты ({len(commits)} шт.):\n"]
             for c in commits:
                 sha = c.get("sha", "")[:7]
                 msg = c.get("commit", {}).get("message", "").split("\n")[0]
@@ -164,5 +175,54 @@ async def read_github_commits(owner: str, repo: str, since_days: int = 7) -> str
 
             return "\n".join(lines)[:5000]
     except Exception as e:
-        logger.error(f"GitHub commits error: {e}")
+        logger.warning(f"GitHub API unreachable, falling back to Atom: {e}")
+        return None
+
+
+async def _fetch_commits_atom(owner: str, repo: str, since_dt) -> str:
+    """Fetch commits via GitHub Atom feed (works when API is blocked)."""
+    from datetime import datetime, timezone
+    url = f"https://github.com/{owner}/{repo}/commits/main.atom"
+
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            resp = await client.get(url, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; VKAdminBot/1.0)",
+            })
+            if resp.status_code != 200:
+                return f"Ошибка загрузки коммитов: HTTP {resp.status_code}"
+
+        # Parse Atom XML
+        text = resp.text
+        entries = re.findall(
+            r'<entry>.*?<link[^>]*href="([^"]*?/commit/([a-f0-9]+))".*?'
+            r'<title>\s*(.*?)\s*</title>.*?'
+            r'<updated>(\d{4}-\d{2}-\d{2}T[\d:]+Z)</updated>.*?'
+            r'<name>(.*?)</name>',
+            text, re.DOTALL,
+        )
+
+        if not entries:
+            return "Нет коммитов (не удалось распарсить Atom feed)."
+
+        commits = []
+        for link, sha, title, date_str, author in entries:
+            try:
+                commit_date = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                if commit_date < since_dt:
+                    continue
+            except ValueError:
+                continue
+            title = html.unescape(title.strip())
+            commits.append(f"- [{sha[:7]}] {author}: {title}")
+
+        if not commits:
+            days = (datetime.now(timezone.utc) - since_dt).days
+            return f"Нет коммитов за последние {days} дней."
+
+        lines = [f"Коммиты ({len(commits)} шт.):\n"] + commits
+        return "\n".join(lines)[:5000]
+
+    except Exception as e:
+        logger.error(f"GitHub Atom feed error: {e}")
         return f"Ошибка загрузки коммитов: {e}"

@@ -1,0 +1,16 @@
+[Unit]
+Description=VKAdmin — AI-администратор для групп ВКонтакте
+After=network.target
+
+[Service]
+Type=simple
+User=plg
+WorkingDirectory=/home/plg/PLGames-VKAdmin
+ExecStart=/home/plg/PLGames-VKAdmin/venv/bin/uvicorn web.app:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/plg/PLGames-VKAdmin/.env
+
+[Install]
+WantedBy=multi-user.target

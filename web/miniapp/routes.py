@@ -3,7 +3,7 @@
 import logging
 from html import escape
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from core.vk_auth import verify_vk_launch_params, create_miniapp_token, verify_miniapp_token
 from database.service import (
@@ -42,8 +42,26 @@ def _miniapp_html(title: str, content: str, token: str) -> str:
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
-<script src="https://unpkg.com/@vkontakte/vk-bridge/dist/browser.min.js"></script>
-<script>vkBridge.send("VKWebAppInit", {{}});</script>
+<script src="https://unpkg.com/@vkontakte/vk-bridge@2/dist/browser.min.js"></script>
+<script>
+(function() {{
+    function initBridge() {{
+        if (typeof vkBridge !== 'undefined') {{
+            vkBridge.send('VKWebAppInit')
+                .then(function() {{ console.log('VK Bridge initialized'); }})
+                .catch(function(e) {{ console.warn('VK Bridge init error:', e); }});
+        }} else {{
+            console.warn('vkBridge not loaded, retrying...');
+            setTimeout(initBridge, 100);
+        }}
+    }}
+    if (document.readyState === 'loading') {{
+        document.addEventListener('DOMContentLoaded', initBridge);
+    }} else {{
+        initBridge();
+    }}
+}})();
+</script>
 <style>
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{ font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif; background: #EBEDF0; color: #222; line-height: 1.5; padding: 12px; }}
@@ -114,8 +132,37 @@ def _miniapp_html(title: str, content: str, token: str) -> str:
     .source-add label {{ font-size: 0.8rem; display: block; margin-bottom: 2px; font-weight: 500; }}
     .btn-delete {{ background: none; border: none; color: #d32f2f; cursor: pointer; font-size: 0.82rem; padding: 3px 6px; }}
     .hint {{ margin-top: 6px; font-size: 0.75rem; color: #aaa; }}
-</style></head>
-<body>{content}</body></html>"""
+
+    .toast {{
+        position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+        background: #2e7d32; color: white; padding: 10px 24px; border-radius: 10px;
+        font-size: 0.9rem; font-weight: 500; z-index: 9999; opacity: 0;
+        transition: opacity 0.3s; pointer-events: none;
+    }}
+    .toast.show {{ opacity: 1; }}
+</style>
+<script>
+function showToast(msg) {{
+    var t = document.getElementById('toast');
+    t.textContent = msg || 'Сохранено';
+    t.classList.add('show');
+    setTimeout(function(){{ t.classList.remove('show'); }}, 2000);
+}}
+function ajaxSubmit(form) {{
+    var data = new FormData(form);
+    fetch(form.action, {{
+        method: 'POST',
+        body: data,
+        headers: {{'X-Requested-With': 'XMLHttpRequest'}}
+    }}).then(function(r) {{
+        if (r.ok) showToast();
+        else showToast('Ошибка');
+    }}).catch(function() {{ showToast('Ошибка сети'); }});
+    return false;
+}}
+</script>
+</head>
+<body><div id="toast" class="toast"></div>{content}</body></html>"""
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
@@ -201,11 +248,6 @@ async def miniapp_group_settings(request: Request, group_id: int):
         return _error_page("Группа не найдена")
     if group.admin_vk_id != vk_user_id:
         return _error_page("У вас нет доступа к этой группе")
-
-    flash = ""
-    msg = request.query_params.get("msg", "")
-    if msg == "saved":
-        flash = '<div class="flash flash-success">✓ Сохранено</div>'
 
     sections_html = ""
     for section in SETTINGS_SCHEMA:
@@ -368,7 +410,6 @@ async def miniapp_group_settings(request: Request, group_id: int):
         <h2 style="font-size: 1rem; font-weight: 700;">{name}</h2>
         <p style="opacity: 0.85; font-size: 0.8rem;">ID: {group_id} · <span class="badge badge-green" style="font-size:0.7rem;">Работает</span></p>
     </div>
-    {flash}
     {sections_html}
     {sources_html}
     {tasks_html}
@@ -386,11 +427,11 @@ def _render_miniapp_control(group_id: int, setting: dict, current_value: str, to
     if stype == "toggle":
         checked = "checked" if current_value.lower() == "true" else ""
         return f"""
-        <form method="POST" action="{action}" style="display:flex;align-items:center;gap:8px;">
+        <form method="POST" action="{action}" onsubmit="return ajaxSubmit(this)" style="display:flex;align-items:center;gap:8px;">
             <input type="hidden" name="key" value="{key}">
             <input type="hidden" name="value" value="false">
             <label class="toggle">
-                <input type="checkbox" name="value" value="true" {checked} onchange="this.form.submit()">
+                <input type="checkbox" name="value" value="true" {checked} onchange="ajaxSubmit(this.form)">
                 <span class="toggle-slider"></span>
             </label>
         </form>
@@ -402,16 +443,16 @@ def _render_miniapp_control(group_id: int, setting: dict, current_value: str, to
             selected = "selected" if val == current_value else ""
             opts_html += f'<option value="{val}" {selected}>{label}</option>'
         return f"""
-        <form method="POST" action="{action}">
+        <form method="POST" action="{action}" onsubmit="return ajaxSubmit(this)">
             <input type="hidden" name="key" value="{key}">
-            <select name="value" onchange="this.form.submit()">{opts_html}</select>
+            <select name="value" onchange="ajaxSubmit(this.form)">{opts_html}</select>
         </form>
         """
 
     if stype == "textarea":
         placeholder = setting.get("placeholder", "")
         return f"""
-        <form method="POST" action="{action}">
+        <form method="POST" action="{action}" onsubmit="return ajaxSubmit(this)">
             <input type="hidden" name="key" value="{key}">
             <textarea name="value" placeholder="{escape(placeholder)}"
                       onfocus="this.nextElementSibling.classList.add('show')">{escape(current_value)}</textarea>
@@ -421,7 +462,7 @@ def _render_miniapp_control(group_id: int, setting: dict, current_value: str, to
 
     placeholder = setting.get("placeholder", "")
     return f"""
-    <form method="POST" action="{action}">
+    <form method="POST" action="{action}" onsubmit="return ajaxSubmit(this)">
         <input type="hidden" name="key" value="{key}">
         <input type="text" name="value" value="{escape(current_value, quote=True)}" placeholder="{escape(placeholder, quote=True)}"
                onfocus="this.nextElementSibling.classList.add('show')">
@@ -436,11 +477,15 @@ def _render_miniapp_control(group_id: int, setting: dict, current_value: str, to
 async def miniapp_update_setting(request: Request, group_id: int):
     auth = _get_auth(request)
     if not auth:
+        if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+            return JSONResponse({"error": "Сессия истекла"}, status_code=401)
         return _error_page("Сессия истекла")
 
     token = request.query_params.get("token", "")
     group = await get_group(group_id)
     if not group or group.admin_vk_id != auth["uid"]:
+        if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+            return JSONResponse({"error": "Нет доступа"}, status_code=403)
         return _error_page("Нет доступа")
 
     form = await request.form()
@@ -450,6 +495,9 @@ async def miniapp_update_setting(request: Request, group_id: int):
 
     if key:
         await set_setting(group_id, key, value)
+
+    if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        return JSONResponse({"ok": True})
 
     return RedirectResponse(f"/miniapp/group/{group_id}?token={token}&msg=saved", status_code=303)
 

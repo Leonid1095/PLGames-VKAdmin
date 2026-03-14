@@ -3,7 +3,7 @@
 import logging
 from html import escape
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from core.config import settings as app_settings
 from core.auth import (
@@ -437,8 +437,38 @@ def _base_html(title: str, content: str) -> str:
     .source-fetched {{ font-size: 0.78rem; color: #aaa; }}
     .btn-delete {{ background: none; border: none; color: #d32f2f; cursor: pointer; font-size: 0.85rem; padding: 4px 8px; border-radius: 4px; }}
     .btn-delete:hover {{ background: #ffebee; }}
-</style></head>
-<body><div class="container">{content}</div></body></html>"""
+
+    .toast {{
+        position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+        background: #2e7d32; color: white; padding: 12px 28px; border-radius: 10px;
+        font-size: 0.95rem; font-weight: 500; z-index: 9999; opacity: 0;
+        transition: opacity 0.3s; pointer-events: none; box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    }}
+    .toast.show {{ opacity: 1; }}
+</style>
+<script>
+function showToast(msg) {{
+    var t = document.getElementById('toast');
+    if (!t) return;
+    t.textContent = msg || 'Сохранено';
+    t.classList.add('show');
+    setTimeout(function(){{ t.classList.remove('show'); }}, 2000);
+}}
+function ajaxSubmit(form) {{
+    var data = new FormData(form);
+    fetch(form.action, {{
+        method: 'POST',
+        body: data,
+        headers: {{'X-Requested-With': 'XMLHttpRequest'}}
+    }}).then(function(r) {{
+        if (r.ok) showToast();
+        else showToast('Ошибка');
+    }}).catch(function() {{ showToast('Ошибка сети'); }});
+    return false;
+}}
+</script>
+</head>
+<body><div id="toast" class="toast"></div><div class="container">{content}</div></body></html>"""
 
 
 # ─── Login / Logout ──────────────────────────────────────────────────────────
@@ -597,11 +627,6 @@ async def group_settings_page(request: Request, group_id: int):
 
     csrf = _csrf_field(request)
     csrf_token = get_csrf_token(request)
-
-    flash = ""
-    msg = request.query_params.get("msg", "")
-    if msg == "saved":
-        flash = '<div class="flash flash-success">Настройки сохранены!</div>'
 
     sections_html = ""
     for section in SETTINGS_SCHEMA:
@@ -796,7 +821,6 @@ async def group_settings_page(request: Request, group_id: int):
         <h1>{name}</h1>
         <p>ID: {group_id} &nbsp; <span class="badge badge-green" style="font-size:0.75rem;">Работает</span></p>
     </div>
-    {flash}
     {sections_html}
     {sources_html}
     {tasks_html}
@@ -815,13 +839,13 @@ def _render_control(group_id: int, setting: dict, current_value: str, csrf: str 
     if stype == "toggle":
         checked = "checked" if current_value.lower() == "true" else ""
         return f"""
-        <form method="POST" action="/dashboard/group/{group_id}/settings" style="display:flex;align-items:center;justify-content:flex-end;gap:8px;">
+        <form method="POST" action="/dashboard/group/{group_id}/settings" onsubmit="return ajaxSubmit(this)" style="display:flex;align-items:center;justify-content:flex-end;gap:8px;">
             {csrf}
             <input type="hidden" name="key" value="{key}">
             <input type="hidden" name="value" value="false">
             <label class="toggle">
                 <input type="checkbox" name="value" value="true" {checked}
-                       onchange="this.form.submit()">
+                       onchange="ajaxSubmit(this.form)">
                 <span class="toggle-slider"></span>
             </label>
         </form>
@@ -834,10 +858,10 @@ def _render_control(group_id: int, setting: dict, current_value: str, csrf: str 
             selected = "selected" if val == current_value else ""
             opts_html += f'<option value="{val}" {selected}>{label}</option>'
         return f"""
-        <form method="POST" action="/dashboard/group/{group_id}/settings">
+        <form method="POST" action="/dashboard/group/{group_id}/settings" onsubmit="return ajaxSubmit(this)">
             {csrf}
             <input type="hidden" name="key" value="{key}">
-            <select name="value" onchange="this.form.submit()" style="cursor:pointer;">
+            <select name="value" onchange="ajaxSubmit(this.form)" style="cursor:pointer;">
                 {opts_html}
             </select>
         </form>
@@ -846,7 +870,7 @@ def _render_control(group_id: int, setting: dict, current_value: str, csrf: str 
     if stype == "textarea":
         placeholder = setting.get("placeholder", "")
         return f"""
-        <form method="POST" action="/dashboard/group/{group_id}/settings">
+        <form method="POST" action="/dashboard/group/{group_id}/settings" onsubmit="return ajaxSubmit(this)">
             {csrf}
             <input type="hidden" name="key" value="{key}">
             <textarea name="value" placeholder="{escape(placeholder)}"
@@ -858,7 +882,7 @@ def _render_control(group_id: int, setting: dict, current_value: str, csrf: str 
     # text
     placeholder = setting.get("placeholder", "")
     return f"""
-    <form method="POST" action="/dashboard/group/{group_id}/settings">
+    <form method="POST" action="/dashboard/group/{group_id}/settings" onsubmit="return ajaxSubmit(this)">
         {csrf}
         <input type="hidden" name="key" value="{key}">
         <input type="text" name="value" value="{escape(current_value, quote=True)}" placeholder="{escape(placeholder, quote=True)}"
@@ -888,6 +912,9 @@ async def update_group_setting(request: Request, group_id: int):
 
     if key:
         await set_setting(group_id, key, value)
+
+    if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        return JSONResponse({"ok": True})
 
     return RedirectResponse(f"/dashboard/group/{group_id}?msg=saved", status_code=303)
 

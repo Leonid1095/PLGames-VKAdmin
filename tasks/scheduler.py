@@ -96,7 +96,11 @@ async def _scheduled_posts_job():
 
             for p in group_posts:
                 try:
-                    result = await api.wall.post(owner_id=-gid, message=p.text)
+                    attachments = p.attachments or ""
+                    post_kwargs = {"owner_id": -gid, "message": p.text}
+                    if attachments:
+                        post_kwargs["attachments"] = attachments
+                    result = await api.wall.post(**post_kwargs)
                     vk_post_id = result.post_id if result else 0
                     await mark_post_published(p.id, vk_post_id)
                     logger.info(f"Scheduled post #{p.id} published for group {gid}")
@@ -139,6 +143,7 @@ async def _content_tasks_job():
     from datetime import timedelta
     from croniter import croniter
     from core.content_writer import write_article, write_patch_notes
+    from core.images import find_and_upload_image
     from database.service import (
         get_all_active_content_tasks, update_content_task_run,
         create_scheduled_post,
@@ -187,6 +192,18 @@ async def _content_tasks_job():
                 continue
 
             if text and not text.startswith("Ошибка") and not text.startswith("Не удалось"):
+                # Try to find and upload a relevant image
+                attachment = ""
+                try:
+                    from database.service import get_group as _get_group
+                    group = await _get_group(task.group_id)
+                    if group:
+                        token = decrypt_token(group.access_token)
+                        api = API(token=token)
+                        attachment = await find_and_upload_image(api, task.group_id, post_type=task.task_type) or ""
+                except Exception as img_err:
+                    logger.warning(f"Image upload failed for task #{task.id}: {img_err}")
+
                 # Schedule for publication in 10 minutes
                 scheduled_at = now + timedelta(minutes=10)
                 await create_scheduled_post(
@@ -194,6 +211,7 @@ async def _content_tasks_job():
                     text=text,
                     scheduled_at=scheduled_at,
                     source=f"task:{task.name}",
+                    attachments=attachment,
                 )
                 logger.info(f"Content task #{task.id} generated post for group {task.group_id}")
             else:
