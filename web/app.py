@@ -43,6 +43,14 @@ async def _migrate_legacy_group():
         admin_vk_id=int(settings.OWNER_VK_ID),
     )
     await seed_default_settings(group_id)
+
+    # Auto-setup AI personality
+    try:
+        from core.group_setup import setup_group_ai
+        await setup_group_ai(group_id, settings.VK_TOKEN)
+    except Exception as e:
+        logger.warning(f"AI setup for legacy group failed: {e}")
+
     logger.info(f"Legacy group {group_id} migrated successfully.")
 
 

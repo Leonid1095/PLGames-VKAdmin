@@ -92,10 +92,22 @@ async def handle_wall_comment(ctx: GroupContext, event_object: dict) -> None:
     if not should_reply:
         return
 
-    system_prompt = (
-        "Ты администратор группы ВКонтакте. Напиши краткий, дружелюбный ответ "
-        "на комментарий пользователя (1-2 предложения)."
-    )
+    # Build group-aware reply prompt
+    from core.ai_brain import _get_group_ai_context
+    ai_ctx = await _get_group_ai_context(ctx.group_id)
+
+    if ai_ctx["ai_system_prompt"]:
+        system_prompt = (
+            f"{ai_ctx['ai_system_prompt']}\n"
+            "Напиши краткий ответ на комментарий пользователя (1-2 предложения). "
+            "Отвечай в стиле и тематике группы."
+        )
+    else:
+        system_prompt = (
+            "Ты администратор группы ВКонтакте. Напиши краткий, дружелюбный ответ "
+            "на комментарий пользователя (1-2 предложения)."
+        )
+
     reply_text = await generate_response(
         prompt=f"Комментарий: «{stripped}»",
         system_prompt=system_prompt,

@@ -8,6 +8,7 @@ from core.vk_auth import verify_vk_launch_params, create_miniapp_token, verify_m
 from database.service import (
     get_group, get_groups_by_admin, get_setting, set_setting,
     get_content_sources, add_content_source, delete_content_source,
+    get_content_tasks, create_content_task, delete_content_task,
 )
 from web.dashboard.routes import SETTINGS_SCHEMA
 
@@ -105,6 +106,7 @@ def _miniapp_html(title: str, content: str, token: str) -> str:
     .source-type-rss {{ background: #fff3e0; color: #e65100; }}
     .source-type-vk {{ background: #e3f2fd; color: #1565c0; }}
     .source-type-api {{ background: #f3e5f5; color: #7b1fa2; }}
+    .source-type-web {{ background: #e0f2f1; color: #00695c; }}
     .source-empty {{ text-align: center; padding: 16px; color: #bbb; font-size: 0.85rem; }}
     .source-add {{ display: flex; gap: 6px; align-items: flex-end; margin-top: 12px; flex-wrap: wrap; }}
     .source-add .form-group {{ margin: 0; }}
@@ -231,8 +233,8 @@ async def miniapp_group_settings(request: Request, group_id: int):
     sources_rows = ""
     if sources:
         for s in sources:
-            type_class = {"rss": "rss", "vk_group": "vk", "api": "api"}.get(s.source_type, "api")
-            type_label = {"rss": "RSS", "vk_group": "VK", "api": "API"}.get(s.source_type, s.source_type)
+            type_class = {"rss": "rss", "vk_group": "vk", "api": "api", "web": "web"}.get(s.source_type, "api")
+            type_label = {"rss": "RSS", "vk_group": "VK", "api": "API", "web": "Сайт"}.get(s.source_type, s.source_type)
             sources_rows += f"""
             <tr>
                 <td><span class="source-type source-type-{type_class}">{type_label}</span></td>
@@ -264,6 +266,7 @@ async def miniapp_group_settings(request: Request, group_id: int):
                 <label>Тип</label>
                 <select name="source_type" style="width:100px;">
                     <option value="rss">RSS</option>
+                    <option value="web">Сайт</option>
                     <option value="vk_group">VK</option>
                     <option value="api">API</option>
                 </select>
@@ -274,12 +277,88 @@ async def miniapp_group_settings(request: Request, group_id: int):
             </div>
             <button type="submit" class="btn btn-sm">+</button>
         </form>
+        <p class="hint">Бот читает источники и пишет статьи на основе реального контента</p>
+    </div>
+    """
+
+    # Content tasks
+    tasks = await get_content_tasks(group_id)
+    tasks_rows = ""
+    if tasks:
+        for t in tasks:
+            last = t.last_run_at.strftime("%d.%m %H:%M") if t.last_run_at else "никогда"
+            type_labels = {"patch_notes": "Патч-ноты", "article": "Статья", "digest": "Дайджест"}
+            type_label = type_labels.get(t.task_type, t.task_type)
+            tasks_rows += f"""
+            <tr>
+                <td><span class="source-type source-type-api">{type_label}</span></td>
+                <td><span class="source-url">{t.source_url or '—'}</span></td>
+                <td style="font-size:0.75rem;color:#888;">{t.schedule_cron}</td>
+                <td style="font-size:0.75rem;color:#888;">{last}</td>
+                <td>
+                    <form method="POST" action="/miniapp/group/{group_id}/tasks/delete?token={token}"
+                          onsubmit="return confirm('Удалить?');">
+                        <input type="hidden" name="task_id" value="{t.id}">
+                        <button type="submit" class="btn-delete">✕</button>
+                    </form>
+                </td>
+            </tr>
+            """
+        tasks_table = f"""
+        <table class="source-table">
+            <thead><tr><th>Тип</th><th>Источник</th><th>Расписание</th><th>Последний</th><th></th></tr></thead>
+            <tbody>{tasks_rows}</tbody>
+        </table>
+        """
+    else:
+        tasks_table = '<p class="source-empty">Нет автозадач. Добавьте, чтобы бот сам писал контент по расписанию.</p>'
+
+    tasks_html = f"""
+    <div class="card">
+        <div class="card-title">📋 Контент-задачи</div>
+        {tasks_table}
+        <form method="POST" action="/miniapp/group/{group_id}/tasks/add?token={token}" class="source-add">
+            <div class="form-group">
+                <label>Тип</label>
+                <select name="task_type" style="width:120px;">
+                    <option value="patch_notes">Патч-ноты</option>
+                    <option value="article">Статья</option>
+                    <option value="digest">Дайджест</option>
+                </select>
+            </div>
+            <div class="form-group" style="flex:1;">
+                <label>Источник (URL)</label>
+                <input type="text" name="source_url" placeholder="https://github.com/user/repo">
+            </div>
+            <div class="form-group">
+                <label>Расписание (cron)</label>
+                <input type="text" name="schedule_cron" placeholder="0 18 * * 5" style="width:120px;" required>
+            </div>
+            <button type="submit" class="btn btn-sm">+</button>
+        </form>
+        <p class="hint">Cron: мин час день мес день_недели. Пример: 0 18 * * 5 = пятница 18:00 UTC</p>
+    </div>
+    """
+
+    # AI refresh button
+    ai_desc = await get_setting(group_id, "ai_group_description", "")
+    ai_status = f'<span style="color:#2e7d32;">Настроен: {ai_desc[:80]}...</span>' if ai_desc else '<span style="color:#d32f2f;">Не настроен — нажмите кнопку ниже</span>'
+
+    ai_refresh_html = f"""
+    <div class="card">
+        <div class="card-title">🔄 ИИ-профиль</div>
+        <p style="font-size:0.85rem;margin-bottom:10px;">{ai_status}</p>
+        <p style="font-size:0.78rem;color:#888;margin-bottom:12px;">
+            Бот сканирует группу (описание, посты) и настраивает свою личность,
+            правила модерации и темы контента автоматически.
+        </p>
+        <form method="POST" action="/miniapp/group/{group_id}/ai-refresh?token={token}">
+            <button type="submit" class="btn">Обновить ИИ-профиль</button>
+        </form>
     </div>
     """
 
     name = group.group_name or f"Группа {group_id}"
-
-    # Back link — show only if user has multiple groups
     back_html = f'<a href="/miniapp?token={token}" class="back">← Назад</a>'
 
     content = f"""
@@ -291,6 +370,8 @@ async def miniapp_group_settings(request: Request, group_id: int):
     {flash}
     {sections_html}
     {sources_html}
+    {tasks_html}
+    {ai_refresh_html}
     """
     return HTMLResponse(_miniapp_html(name, content, token))
 
@@ -390,6 +471,80 @@ async def miniapp_add_source(request: Request, group_id: int):
 
     if source_url:
         await add_content_source(group_id, source_type, source_url, filter_keywords)
+
+    return RedirectResponse(f"/miniapp/group/{group_id}?token={token}&msg=saved", status_code=303)
+
+
+@router.post("/miniapp/group/{group_id}/tasks/add")
+async def miniapp_add_task(request: Request, group_id: int):
+    auth = _get_auth(request)
+    if not auth:
+        return _error_page("Сессия истекла")
+
+    token = request.query_params.get("token", "")
+    group = await get_group(group_id)
+    if not group or group.admin_vk_id != auth["uid"]:
+        return _error_page("Нет доступа")
+
+    form = await request.form()
+    task_type = str(form.get("task_type", "article")).strip()
+    source_url = str(form.get("source_url", "")).strip()
+    schedule_cron = str(form.get("schedule_cron", "")).strip()
+
+    if schedule_cron:
+        try:
+            from croniter import croniter
+            croniter(schedule_cron)
+        except Exception:
+            return _error_page(f"Неверный cron: {schedule_cron}")
+
+        name = f"{task_type}_{source_url.split('/')[-1] if source_url else 'manual'}"
+        await create_content_task(
+            group_id=group_id, name=name, task_type=task_type,
+            schedule_cron=schedule_cron, source_url=source_url,
+        )
+
+    return RedirectResponse(f"/miniapp/group/{group_id}?token={token}&msg=saved", status_code=303)
+
+
+@router.post("/miniapp/group/{group_id}/tasks/delete")
+async def miniapp_delete_task(request: Request, group_id: int):
+    auth = _get_auth(request)
+    if not auth:
+        return _error_page("Сессия истекла")
+
+    token = request.query_params.get("token", "")
+    group = await get_group(group_id)
+    if not group or group.admin_vk_id != auth["uid"]:
+        return _error_page("Нет доступа")
+
+    form = await request.form()
+    task_id = int(form.get("task_id", 0))
+    if task_id:
+        await delete_content_task(task_id)
+
+    return RedirectResponse(f"/miniapp/group/{group_id}?token={token}&msg=saved", status_code=303)
+
+
+@router.post("/miniapp/group/{group_id}/ai-refresh")
+async def miniapp_ai_refresh(request: Request, group_id: int):
+    auth = _get_auth(request)
+    if not auth:
+        return _error_page("Сессия истекла")
+
+    token = request.query_params.get("token", "")
+    group = await get_group(group_id)
+    if not group or group.admin_vk_id != auth["uid"]:
+        return _error_page("Нет доступа")
+
+    from core.crypto import decrypt_token
+    from core.group_setup import setup_group_ai
+
+    try:
+        vk_token = decrypt_token(group.access_token)
+        await setup_group_ai(group_id, vk_token)
+    except Exception as e:
+        logger.error(f"AI refresh failed for group {group_id}: {e}")
 
     return RedirectResponse(f"/miniapp/group/{group_id}?token={token}&msg=saved", status_code=303)
 

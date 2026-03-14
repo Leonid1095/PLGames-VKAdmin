@@ -9,7 +9,8 @@ from core.auth import is_authenticated, set_auth_cookie, clear_auth_cookie, get_
 from database.service import (
     get_all_active_groups, get_group, get_setting, set_setting,
     deactivate_group, get_content_sources, add_content_source,
-    delete_content_source,
+    delete_content_source, get_content_tasks, create_content_task,
+    delete_content_task,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,11 +47,63 @@ SETTINGS_SCHEMA = [
             },
             {
                 "key": "system_prompt",
-                "label": "Характер бота",
-                "description": "Как бот общается с пользователями. Опишите его личность и стиль",
+                "label": "Характер бота (ручной)",
+                "description": "Ручная настройка — переопределяет автоматический профиль",
                 "type": "textarea",
-                "default": "Ты вежливый и отзывчивый помощник-администратор группы ВКонтакте.",
-                "placeholder": "Например: Ты весёлый и дружелюбный админ, шутишь и помогаешь...",
+                "default": "",
+                "placeholder": "Оставьте пустым для автоматического профиля (рекомендуется)",
+            },
+        ],
+    },
+    {
+        "title": "ИИ-профиль группы",
+        "icon": "🧠",
+        "settings": [
+            {
+                "key": "ai_group_description",
+                "label": "Описание группы",
+                "description": "Автоматически сгенерировано. Бот использует это для понимания контекста",
+                "type": "textarea",
+                "default": "",
+                "placeholder": "Нажмите 'Обновить ИИ' внизу страницы для автогенерации",
+            },
+            {
+                "key": "ai_system_prompt",
+                "label": "ИИ-промпт (автоматический)",
+                "description": "Как бот общается — сгенерировано на основе анализа группы",
+                "type": "textarea",
+                "default": "",
+                "placeholder": "Генерируется автоматически при подключении группы",
+            },
+            {
+                "key": "ai_moderation_rules",
+                "label": "Правила модерации ИИ",
+                "description": "Контекстные правила модерации для этой группы",
+                "type": "textarea",
+                "default": "",
+                "placeholder": "Генерируется автоматически",
+            },
+            {
+                "key": "ai_content_topics",
+                "label": "Темы для контента",
+                "description": "ИИ использует эти темы при генерации постов и подборе контента",
+                "type": "textarea",
+                "default": "",
+                "placeholder": "Генерируется автоматически",
+            },
+            {
+                "key": "ai_tone",
+                "label": "Стиль общения",
+                "description": "Тон, в котором бот пишет посты и общается",
+                "type": "select",
+                "options": [
+                    ("friendly", "Дружелюбный"),
+                    ("casual", "Неформальный"),
+                    ("gaming", "Геймерский"),
+                    ("professional", "Профессиональный"),
+                    ("formal", "Деловой"),
+                ],
+                "default": "friendly",
             },
         ],
     },
@@ -86,7 +139,7 @@ SETTINGS_SCHEMA = [
             {
                 "key": "autopost_enabled",
                 "label": "Автопостинг включён",
-                "description": "Бот сам генерирует и публикует посты по расписанию",
+                "description": "Бот берёт контент из источников (RSS, сайты) и публикует. Добавьте источники ниже!",
                 "type": "toggle",
                 "default": "false",
             },
@@ -166,6 +219,72 @@ SETTINGS_SCHEMA = [
                     ("12", "Каждые 12 часов"),
                 ],
                 "default": "4",
+            },
+        ],
+    },
+    {
+        "title": "Виджет-лидерборд",
+        "icon": "🏆",
+        "settings": [
+            {
+                "key": "widget_enabled",
+                "label": "Виджет топ-участников",
+                "description": "Показывает таблицу лучших участников в виджете сообщества (как Coliseum)",
+                "type": "toggle",
+                "default": "false",
+            },
+            {
+                "key": "widget_sort_by",
+                "label": "Сортировка",
+                "description": "По какому показателю строить рейтинг",
+                "type": "select",
+                "options": [
+                    ("xp", "Опыт (XP)"),
+                    ("level", "Уровень"),
+                    ("messages", "Сообщения"),
+                    ("rep", "Репутация"),
+                ],
+                "default": "xp",
+            },
+            {
+                "key": "widget_top_count",
+                "label": "Количество в топе",
+                "description": "Сколько участников показывать в виджете",
+                "type": "select",
+                "options": [
+                    ("5", "5"),
+                    ("10", "10"),
+                    ("15", "15"),
+                    ("20", "20"),
+                ],
+                "default": "10",
+            },
+            {
+                "key": "xp_per_like",
+                "label": "XP за лайк",
+                "description": "Сколько опыта получает пользователь за лайк поста в группе",
+                "type": "select",
+                "options": [
+                    ("0", "Отключено"),
+                    ("1", "1 XP"),
+                    ("2", "2 XP"),
+                    ("3", "3 XP"),
+                    ("5", "5 XP"),
+                ],
+                "default": "2",
+            },
+            {
+                "key": "xp_per_repost",
+                "label": "XP за репост",
+                "description": "Сколько опыта получает пользователь за репост",
+                "type": "select",
+                "options": [
+                    ("0", "Отключено"),
+                    ("3", "3 XP"),
+                    ("5", "5 XP"),
+                    ("10", "10 XP"),
+                ],
+                "default": "5",
             },
         ],
     },
@@ -265,6 +384,7 @@ def _base_html(title: str, content: str) -> str:
     .source-type-rss {{ background: #fff3e0; color: #e65100; }}
     .source-type-vk {{ background: #e3f2fd; color: #1565c0; }}
     .source-type-api {{ background: #f3e5f5; color: #7b1fa2; }}
+    .source-type-web {{ background: #e0f2f1; color: #00695c; }}
     .source-empty {{ text-align: center; padding: 24px; color: #bbb; font-size: 0.9rem; }}
     .source-add {{ display: flex; gap: 8px; align-items: flex-end; margin-top: 16px; flex-wrap: wrap; }}
     .source-add .form-group {{ margin: 0; }}
@@ -454,8 +574,8 @@ async def group_settings_page(request: Request, group_id: int):
     sources_rows = ""
     if sources:
         for s in sources:
-            type_class = {"rss": "rss", "vk_group": "vk", "api": "api"}.get(s.source_type, "api")
-            type_label = {"rss": "RSS", "vk_group": "VK группа", "api": "API"}.get(s.source_type, s.source_type)
+            type_class = {"rss": "rss", "vk_group": "vk", "api": "api", "web": "web"}.get(s.source_type, "api")
+            type_label = {"rss": "RSS", "vk_group": "VK группа", "api": "API", "web": "Сайт"}.get(s.source_type, s.source_type)
             fetched = s.last_fetched_at.strftime("%d.%m %H:%M") if s.last_fetched_at else "ещё не запускался"
             keywords = s.filter_keywords or "—"
             sources_rows += f"""
@@ -493,6 +613,7 @@ async def group_settings_page(request: Request, group_id: int):
                 <label style="font-size:0.85rem;">Тип</label>
                 <select name="source_type" style="width:140px;">
                     <option value="rss">RSS-лента</option>
+                    <option value="web">Сайт (URL)</option>
                     <option value="vk_group">VK группа</option>
                     <option value="api">API (JSON)</option>
                 </select>
@@ -515,6 +636,92 @@ async def group_settings_page(request: Request, group_id: int):
     </div>
     """
 
+    # ── Content tasks section ──
+    tasks = await get_content_tasks(group_id)
+    tasks_rows = ""
+    if tasks:
+        for t in tasks:
+            last = t.last_run_at.strftime("%d.%m %H:%M") if t.last_run_at else "ещё не запускалась"
+            type_labels = {"patch_notes": "Патч-ноты", "article": "Статья", "digest": "Дайджест"}
+            type_label = type_labels.get(t.task_type, t.task_type)
+            tasks_rows += f"""
+            <tr>
+                <td><span class="source-type source-type-api">{type_label}</span></td>
+                <td><span class="source-url">{t.source_url or '—'}</span></td>
+                <td><code style="font-size:0.82rem;">{t.schedule_cron}</code></td>
+                <td><span class="source-fetched">{last}</span></td>
+                <td>
+                    <form method="POST" action="/dashboard/group/{group_id}/tasks/delete"
+                          onsubmit="return confirm('Удалить задачу?');">
+                        <input type="hidden" name="task_id" value="{t.id}">
+                        <button type="submit" class="btn-delete">Удалить</button>
+                    </form>
+                </td>
+            </tr>
+            """
+        tasks_table = f"""
+        <table class="source-table">
+            <thead><tr><th>Тип</th><th>Источник</th><th>Расписание</th><th>Последний запуск</th><th></th></tr></thead>
+            <tbody>{tasks_rows}</tbody>
+        </table>
+        """
+    else:
+        tasks_table = '<p class="source-empty">Нет контент-задач. Добавьте, чтобы бот сам писал статьи по расписанию.</p>'
+
+    tasks_html = f"""
+    <div class="card">
+        <div class="card-title">📋 Контент-задачи</div>
+        <div class="setting-desc" style="margin-bottom:8px;">
+            Бот автоматически создаёт контент по расписанию: патч-ноты из GitHub, статьи с сайтов, дайджесты
+        </div>
+        {tasks_table}
+        <form method="POST" action="/dashboard/group/{group_id}/tasks/add" class="source-add">
+            <div class="form-group">
+                <label style="font-size:0.85rem;">Тип</label>
+                <select name="task_type" style="width:140px;">
+                    <option value="patch_notes">Патч-ноты</option>
+                    <option value="article">Статья</option>
+                    <option value="digest">Дайджест</option>
+                </select>
+            </div>
+            <div class="form-group" style="flex:1;">
+                <label style="font-size:0.85rem;">Источник (URL)</label>
+                <input type="text" name="source_url" placeholder="https://github.com/user/repo">
+            </div>
+            <div class="form-group">
+                <label style="font-size:0.85rem;">Расписание (cron)</label>
+                <input type="text" name="schedule_cron" placeholder="0 18 * * 5" style="width:140px;" required>
+            </div>
+            <button type="submit" class="btn btn-sm">Добавить</button>
+        </form>
+        <p class="hint">
+            Cron формат: минута час день месяц день_недели.<br>
+            Примеры: <code>0 18 * * 5</code> = пятница 18:00 UTC, <code>0 10 * * 1</code> = понедельник 10:00 UTC
+        </p>
+    </div>
+    """
+
+    # ── AI refresh section ──
+    ai_desc = await get_setting(group_id, "ai_group_description", "")
+    if ai_desc:
+        ai_status = f'<span style="color:#2e7d32;">✓ Настроен: {ai_desc[:100]}</span>'
+    else:
+        ai_status = '<span style="color:#d32f2f;">✗ Не настроен — нажмите кнопку ниже</span>'
+
+    ai_refresh_html = f"""
+    <div class="card">
+        <div class="card-title">🔄 ИИ-профиль группы</div>
+        <p style="font-size:0.9rem;margin-bottom:8px;">{ai_status}</p>
+        <p style="font-size:0.82rem;color:#888;margin-bottom:14px;">
+            Бот сканирует группу (описание, последние посты) и автоматически настраивает свою личность,
+            правила модерации и темы контента под тематику группы.
+        </p>
+        <form method="POST" action="/dashboard/group/{group_id}/ai-refresh">
+            <button type="submit" class="btn">Обновить ИИ-профиль</button>
+        </form>
+    </div>
+    """
+
     name = group.group_name or f"Группа {group_id}"
     content = f"""
     <a href="/dashboard" class="back">← Назад</a>
@@ -525,6 +732,8 @@ async def group_settings_page(request: Request, group_id: int):
     {flash}
     {sections_html}
     {sources_html}
+    {tasks_html}
+    {ai_refresh_html}
     """
     return HTMLResponse(_base_html(name, content))
 
@@ -633,6 +842,62 @@ async def remove_source(request: Request, group_id: int):
     source_id = int(form.get("source_id", 0))
     if source_id:
         await delete_content_source(source_id)
+
+    return RedirectResponse(f"/dashboard/group/{group_id}?msg=saved", status_code=303)
+
+
+@router.post("/dashboard/group/{group_id}/tasks/add")
+async def add_task(request: Request, group_id: int):
+    redirect = _require_auth(request)
+    if redirect:
+        return redirect
+    form = await request.form()
+    task_type = str(form.get("task_type", "article")).strip()
+    source_url = str(form.get("source_url", "")).strip()
+    schedule_cron = str(form.get("schedule_cron", "")).strip()
+
+    if schedule_cron:
+        try:
+            from croniter import croniter
+            croniter(schedule_cron)
+        except Exception:
+            pass  # let it fail at runtime
+        name = f"{task_type}_{source_url.split('/')[-1] if source_url else 'manual'}"
+        await create_content_task(
+            group_id=group_id, name=name, task_type=task_type,
+            schedule_cron=schedule_cron, source_url=source_url,
+        )
+
+    return RedirectResponse(f"/dashboard/group/{group_id}?msg=saved", status_code=303)
+
+
+@router.post("/dashboard/group/{group_id}/tasks/delete")
+async def remove_task(request: Request, group_id: int):
+    redirect = _require_auth(request)
+    if redirect:
+        return redirect
+    form = await request.form()
+    task_id = int(form.get("task_id", 0))
+    if task_id:
+        await delete_content_task(task_id)
+    return RedirectResponse(f"/dashboard/group/{group_id}?msg=saved", status_code=303)
+
+
+@router.post("/dashboard/group/{group_id}/ai-refresh")
+async def ai_refresh(request: Request, group_id: int):
+    redirect = _require_auth(request)
+    if redirect:
+        return redirect
+
+    group = await get_group(group_id)
+    if group:
+        from core.crypto import decrypt_token
+        from core.group_setup import setup_group_ai
+        try:
+            token = decrypt_token(group.access_token)
+            await setup_group_ai(group_id, token)
+        except Exception as e:
+            logger.error(f"AI refresh failed for group {group_id}: {e}")
 
     return RedirectResponse(f"/dashboard/group/{group_id}?msg=saved", status_code=303)
 

@@ -9,7 +9,7 @@ from vkbottle import API
 
 from core.group_context import GroupContext
 from core.crypto import decrypt_token
-from database.service import get_group, get_setting
+from database.service import get_group, get_setting, add_xp_activity
 from handlers.admin import handle_admin_command
 from handlers.messages import handle_message
 from handlers.comments import handle_wall_comment
@@ -97,13 +97,26 @@ async def _process_group_join(ctx: GroupContext, obj: dict):
         except Exception:
             name = "друг"
 
-        welcome_msg = await generate_response(
-            prompt=f"Пользователь {name} вступил в группу. Поприветствуй его!",
-            system_prompt=(
+        # Use group-aware prompt for welcome
+        from core.ai_brain import _get_group_ai_context
+        ai_ctx = await _get_group_ai_context(ctx.group_id)
+
+        if ai_ctx["ai_system_prompt"]:
+            welcome_system = (
+                f"{ai_ctx['ai_system_prompt']}\n"
+                "Напиши короткое, тёплое приветствие для нового участника (2-3 предложения). "
+                "Расскажи что интересного есть в группе."
+            )
+        else:
+            welcome_system = (
                 "Ты дружелюбный администратор группы ВКонтакте. Напиши короткое, "
                 "тёплое приветствие для нового участника (2-3 предложения). "
                 "Расскажи что интересного есть в группе."
-            ),
+            )
+
+        welcome_msg = await generate_response(
+            prompt=f"Пользователь {name} вступил в группу. Поприветствуй его!",
+            system_prompt=welcome_system,
             group_id=ctx.group_id,
         )
 
@@ -113,6 +126,26 @@ async def _process_group_join(ctx: GroupContext, obj: dict):
             logger.info(f"Welcome message sent to {user_id} in group {ctx.group_id}")
         except Exception as e:
             logger.warning(f"Failed to send welcome to {user_id}: {e}")
+
+
+async def _process_like(ctx: GroupContext, obj: dict):
+    """Award XP when someone likes a post."""
+    liker_id = obj.get("liker_id", 0)
+    if not liker_id or liker_id < 0:
+        return
+    xp = int(await get_setting(ctx.group_id, "xp_per_like", "2"))
+    if xp > 0:
+        await add_xp_activity(ctx.group_id, liker_id, xp)
+
+
+async def _process_repost(ctx: GroupContext, obj: dict):
+    """Award XP when someone reposts."""
+    from_id = obj.get("from_id", 0)
+    if not from_id or from_id < 0:
+        return
+    xp = int(await get_setting(ctx.group_id, "xp_per_repost", "5"))
+    if xp > 0:
+        await add_xp_activity(ctx.group_id, from_id, xp)
 
 
 async def _process_group_leave(ctx: GroupContext, obj: dict):
@@ -170,5 +203,9 @@ async def vk_callback(request: Request):
         asyncio.create_task(_process_group_join(ctx, obj))
     elif event_type == "group_leave":
         asyncio.create_task(_process_group_leave(ctx, obj))
+    elif event_type == "like_add":
+        asyncio.create_task(_process_like(ctx, obj))
+    elif event_type == "wall_repost":
+        asyncio.create_task(_process_repost(ctx, obj))
 
     return PlainTextResponse("ok")

@@ -187,6 +187,13 @@ async def oauth_callback(request: Request, code: str = "", error: str = "", erro
             # Seed default settings
             await seed_default_settings(gid)
 
+            # Auto-setup AI personality for this group
+            try:
+                from core.group_setup import setup_group_ai
+                await setup_group_ai(gid, token)
+            except Exception as e:
+                logger.warning(f"AI setup failed for group {gid}, will use defaults: {e}")
+
             # Set up Callback API server for this group
             try:
                 callback_url = f"{settings.BASE_URL}/api/vk/events"
@@ -314,6 +321,13 @@ async def oauth_token_callback(request: Request):
                 secret_key=secret_key,
             )
             await seed_default_settings(gid)
+
+            # Auto-setup AI personality
+            try:
+                from core.group_setup import setup_group_ai
+                await setup_group_ai(gid, token)
+            except Exception as e:
+                logger.warning(f"AI setup failed for group {gid}: {e}")
 
             # Setup Callback API
             try:

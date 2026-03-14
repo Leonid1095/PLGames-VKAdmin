@@ -14,6 +14,7 @@ from database.service import (
     get_post_analytics, get_top_users,
     create_ban_record, remove_ban_record, get_ban_history,
     create_newsletter, update_newsletter_progress,
+    create_content_task, get_content_tasks, delete_content_task,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,12 +45,19 @@ async def cmd_help(ctx, from_id, parts, peer_id) -> str:
     return (
         "Команды администратора:\n\n"
         "📝 Контент:\n"
-        "/пост [тема] — сгенерировать и опубликовать пост\n"
+        "/пост [тема] — короткий пост (3-5 предложений)\n"
+        "/статья <url|тема> [инструкция] — полноценная статья\n"
+        "/черновик <url|тема> — статья без публикации\n"
+        "/патчнот <github_url> [дней] — патч-ноты из GitHub\n"
         "/запланировать ЧЧ:ММ текст — запланировать пост\n"
         "/контентплан — посты на сегодня\n"
         "/предложка — предложенные посты\n"
         "/принять <id> — опубликовать предложение\n"
         "/отклонить <id> [причина] — отклонить\n\n"
+        "📋 Контент-задачи:\n"
+        "/задача список — автоматические задачи\n"
+        '/задача добавить <тип> "<cron>" <url>\n'
+        "/задача удалить <id>\n\n"
         "📊 Аналитика:\n"
         "/стата — статистика группы\n"
         "/аналитика — статистика постов\n"
@@ -65,6 +73,11 @@ async def cmd_help(ctx, from_id, parts, peer_id) -> str:
         "/источник удалить <id> — удалить\n\n"
         "📨 Рассылка:\n"
         "/рассылка текст — отправить всем участникам\n\n"
+        "🏆 Виджет-лидерборд:\n"
+        "/виджет — обновить виджет топ-участников\n\n"
+        "🤖 ИИ-настройки:\n"
+        "/обновить — пересканировать группу и обновить ИИ\n"
+        "/аинфо — текущие ИИ-настройки группы\n\n"
         "⚙️ Настройки:\n"
         "/настройка <ключ> <значение>\n"
         "/посмотреть <ключ>\n"
@@ -307,8 +320,8 @@ async def cmd_source(ctx, from_id, parts, peer_id) -> str:
             return "Формат: /источник добавить rss <url>"
         stype = sub_parts[1].lower()
         url = sub_parts[2].strip()
-        if stype not in ("rss", "vk_group"):
-            return "Поддерживаемые типы: rss, vk_group"
+        if stype not in ("rss", "vk_group", "api", "web"):
+            return "Поддерживаемые типы: rss, vk_group, api, web"
         src = await add_content_source(ctx.group_id, stype, url)
         return f"Источник #{src.id} добавлен: {stype} — {url}"
 
@@ -445,6 +458,284 @@ async def cmd_vip(ctx, from_id, parts, peer_id) -> str:
         return "Ошибка формата. Укажите: /vip <vk_id> <days>"
 
 
+async def cmd_article(ctx, from_id, parts, peer_id) -> str:
+    """Write an article from URL and publish to wall."""
+    if len(parts) < 2:
+        return (
+            "Формат:\n"
+            "/статья https://example.com [инструкция]\n\n"
+            "Примеры:\n"
+            "/статья https://github.com/user/repo напиши патч-ноты\n"
+            "/статья https://news.site/article расскажи подробно\n"
+            "/статья https://wowhead.com/guide обзор для новичков"
+        )
+
+    from core.content_writer import write_from_url
+
+    raw = parts[1]
+    if len(parts) > 2:
+        raw = raw + " " + parts[2]
+    raw = raw.strip()
+
+    if not raw.startswith("http"):
+        return "Укажите ссылку на источник. Бот читает страницу и пишет статью на её основе."
+
+    url_parts = raw.split(maxsplit=1)
+    url = url_parts[0]
+    instruction = url_parts[1] if len(url_parts) > 1 else ""
+
+    text = await write_from_url(
+        group_id=ctx.group_id,
+        url=url,
+        instruction=instruction,
+    )
+
+    if text.startswith("Не удалось") or text.startswith("Ошибка"):
+        return text
+
+    try:
+        await ctx.api.wall.post(owner_id=-ctx.group_id, message=text)
+        return f"Статья опубликована!\n\n{text[:500]}..."
+    except Exception as e:
+        logger.error(f"Failed to publish article: {e}")
+        return f"Статья готова, но ошибка публикации: {e}\n\nТекст:\n{text[:1000]}"
+
+
+async def cmd_draft(ctx, from_id, parts, peer_id) -> str:
+    """Write an article but don't publish — just show it."""
+    if len(parts) < 2:
+        return "Формат: /черновик https://url [инструкция]"
+
+    from core.content_writer import write_from_url
+
+    raw = parts[1]
+    if len(parts) > 2:
+        raw = raw + " " + parts[2]
+    raw = raw.strip()
+
+    if not raw.startswith("http"):
+        return "Укажите ссылку на источник."
+
+    url_parts = raw.split(maxsplit=1)
+    url = url_parts[0]
+    instruction = url_parts[1] if len(url_parts) > 1 else ""
+
+    text = await write_from_url(
+        group_id=ctx.group_id,
+        url=url,
+        instruction=instruction,
+    )
+
+    return f"Черновик (не опубликован):\n\n{text}"
+
+
+async def cmd_patch_notes(ctx, from_id, parts, peer_id) -> str:
+    """Generate patch notes from GitHub repo."""
+    if len(parts) < 2:
+        return "Формат: /патчнот https://github.com/owner/repo [дней]"
+
+    from core.content_writer import write_patch_notes
+
+    raw = parts[1]
+    if len(parts) > 2:
+        raw = raw + " " + parts[2]
+
+    sub = raw.strip().split(maxsplit=1)
+    url = sub[0]
+    days = 7
+    if len(sub) > 1:
+        try:
+            days = int(sub[1])
+        except ValueError:
+            pass
+
+    if not url.startswith("http"):
+        url = f"https://github.com/{url}"
+
+    text = await write_patch_notes(
+        group_id=ctx.group_id,
+        github_url=url,
+        days=days,
+    )
+
+    if text.startswith("Ошибка") or text.startswith("Нет коммитов") or text.startswith("Неверная"):
+        return text
+
+    try:
+        await ctx.api.wall.post(owner_id=-ctx.group_id, message=text)
+        return f"Патч-ноты опубликованы!\n\n{text[:500]}..."
+    except Exception as e:
+        return f"Ошибка публикации: {e}\n\nТекст:\n{text[:1000]}"
+
+
+async def cmd_content_task(ctx, from_id, parts, peer_id) -> str:
+    """Manage recurring content tasks."""
+    if len(parts) < 2:
+        return (
+            "Формат:\n"
+            "/задача список — показать задачи\n"
+            "/задача добавить <тип> <cron> <url> [инструкция]\n"
+            "/задача удалить <id>\n\n"
+            "Типы: patch_notes, article, digest\n\n"
+            "Примеры:\n"
+            '/задача добавить patch_notes "0 18 * * 5" https://github.com/user/repo\n'
+            "  → Каждую пятницу в 18:00 — патч-ноты\n"
+            '/задача добавить article "0 10 * * 1" https://news.site/feed дайджест новостей\n'
+            "  → Каждый понедельник в 10:00 — статья по ссылке"
+        )
+
+    raw = parts[1]
+    if len(parts) > 2:
+        raw = raw + " " + parts[2]
+    sub = raw.strip().split(maxsplit=1)
+    sub_cmd = sub[0].lower()
+
+    if sub_cmd == "список":
+        tasks = await get_content_tasks(ctx.group_id)
+        if not tasks:
+            return "Нет активных контент-задач. Добавьте через /задача добавить"
+        lines = ["Контент-задачи:\n"]
+        for t in tasks:
+            last = t.last_run_at.strftime("%d.%m %H:%M") if t.last_run_at else "никогда"
+            lines.append(
+                f"#{t.id} [{t.task_type}] {t.name}\n"
+                f"  Расписание: {t.schedule_cron}\n"
+                f"  Источник: {t.source_url or '—'}\n"
+                f"  Последний запуск: {last}"
+            )
+        return "\n".join(lines)
+
+    elif sub_cmd == "удалить":
+        if len(sub) < 2:
+            return "Формат: /задача удалить <id>"
+        try:
+            tid = int(sub[1].strip())
+        except ValueError:
+            return "Укажите числовой ID задачи."
+        ok = await delete_content_task(tid)
+        return f"Задача #{tid} удалена." if ok else "Задача не найдена."
+
+    elif sub_cmd == "добавить":
+        if len(sub) < 2:
+            return 'Формат: /задача добавить <тип> "<cron>" <url> [инструкция]'
+
+        # Parse: type "cron" url [instruction]
+        import re
+        rest = sub[1].strip()
+
+        # Extract type
+        type_parts = rest.split(maxsplit=1)
+        task_type = type_parts[0]
+        if task_type not in ("patch_notes", "article", "digest"):
+            return "Тип должен быть: patch_notes, article или digest"
+
+        rest = type_parts[1] if len(type_parts) > 1 else ""
+
+        # Extract cron (in quotes)
+        cron_match = re.match(r'"([^"]+)"\s*(.*)', rest)
+        if not cron_match:
+            return 'Укажите расписание в кавычках: "0 18 * * 5" (cron формат)'
+
+        cron_expr = cron_match.group(1)
+        rest = cron_match.group(2).strip()
+
+        # Validate cron
+        try:
+            from croniter import croniter
+            croniter(cron_expr)
+        except Exception:
+            return f"Неверный cron: {cron_expr}. Пример: 0 18 * * 5 (пятница 18:00)"
+
+        # Extract URL and instruction
+        url_parts = rest.split(maxsplit=1)
+        source_url = url_parts[0] if url_parts else ""
+        instruction = url_parts[1] if len(url_parts) > 1 else ""
+
+        # Generate name
+        name = f"{task_type}_{source_url.split('/')[-1] if source_url else 'manual'}"
+
+        task = await create_content_task(
+            group_id=ctx.group_id,
+            name=name,
+            task_type=task_type,
+            schedule_cron=cron_expr,
+            source_url=source_url,
+            instruction=instruction,
+        )
+        return (
+            f"Задача #{task.id} создана!\n"
+            f"Тип: {task_type}\n"
+            f"Расписание: {cron_expr}\n"
+            f"Источник: {source_url or '—'}\n"
+            f"Инструкция: {instruction or '—'}"
+        )
+
+    return "Неизвестная подкоманда. Используйте: /задача список | добавить | удалить"
+
+
+async def cmd_refresh(ctx, from_id, parts, peer_id) -> str:
+    """Re-scan group and regenerate AI settings."""
+    from core.crypto import decrypt_token
+    from database.service import get_group
+
+    group = await get_group(ctx.group_id)
+    if not group:
+        return "Ошибка: группа не найдена."
+
+    try:
+        token = decrypt_token(group.access_token)
+    except Exception:
+        return "Ошибка: не удалось расшифровать токен группы."
+
+    from core.group_setup import setup_group_ai
+    ok = await setup_group_ai(ctx.group_id, token)
+    if ok:
+        return (
+            "ИИ-настройки группы обновлены!\n"
+            "Бот пересканировал группу и адаптировал свою личность, "
+            "правила модерации и темы контента."
+        )
+    return "Не удалось обновить настройки. Проверьте логи."
+
+
+async def cmd_ai_info(ctx, from_id, parts, peer_id) -> str:
+    """Show current AI settings for the group."""
+    from core.ai_brain import _get_group_ai_context
+
+    ai_ctx = await _get_group_ai_context(ctx.group_id)
+
+    if not ai_ctx["ai_system_prompt"]:
+        return (
+            "ИИ-настройки не сгенерированы. "
+            "Выполните /обновить для автоматической настройки."
+        )
+
+    lines = ["Текущие ИИ-настройки группы:\n"]
+    lines.append(f"Описание: {ai_ctx['ai_group_description']}")
+    lines.append(f"Стиль: {ai_ctx['ai_tone']}")
+    lines.append(f"\nСистемный промпт:\n{ai_ctx['ai_system_prompt']}")
+    lines.append(f"\nПравила модерации:\n{ai_ctx['ai_moderation_rules']}")
+    lines.append(f"\nТемы контента:\n{ai_ctx['ai_content_topics']}")
+    return "\n".join(lines)
+
+
+async def cmd_widget(ctx, from_id, parts, peer_id) -> str:
+    """Manually refresh the leaderboard widget."""
+    from core.widgets import update_widget_for_group
+
+    widget_enabled = (await get_setting(ctx.group_id, "widget_enabled", "false")).lower()
+    if widget_enabled != "true":
+        return (
+            "Виджет отключён. Включите его в настройках:\n"
+            "/настройка widget_enabled true"
+        )
+
+    ok = await update_widget_for_group(ctx.group_id)
+    if ok:
+        return "Виджет топ-участников обновлён!"
+    return "Не удалось обновить виджет. Проверьте логи и права токена."
+
+
 # ─── Command dispatch table ──────────────────────────────────────────────────
 
 COMMANDS = {
@@ -474,4 +765,14 @@ COMMANDS = {
     "/посмотреть": cmd_view,
     "/очистить": cmd_clear,
     "/vip": cmd_vip,
+    # Content writer
+    "/статья": cmd_article,
+    "/черновик": cmd_draft,
+    "/патчнот": cmd_patch_notes,
+    "/задача": cmd_content_task,
+    # AI setup
+    "/обновить": cmd_refresh,
+    "/аинфо": cmd_ai_info,
+    # Widget
+    "/виджет": cmd_widget,
 }

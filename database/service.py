@@ -7,7 +7,7 @@ from database.engine import async_session
 from database.models import (
     Group, UserContext, GroupSettings, UserStats,
     SuggestedPost, ContentSource, ScheduledPost, PostAnalytics,
-    Newsletter, BanRecord,
+    Newsletter, BanRecord, ContentTask,
 )
 
 logger = logging.getLogger(__name__)
@@ -308,6 +308,32 @@ async def add_xp(group_id: int, vk_id: int, xp_amount: int) -> tuple[int, bool]:
             session.add(stats)
 
         stats.messages_count += 1
+        stats.xp += xp_amount
+
+        old_level = stats.level
+        new_level = int((stats.xp / 10) ** 0.5) + 1
+        leveled_up = new_level > old_level
+
+        if leveled_up:
+            stats.level = new_level
+
+        await session.commit()
+        return stats.level, leveled_up
+
+
+async def add_xp_activity(group_id: int, vk_id: int, xp_amount: int) -> tuple[int, bool]:
+    """Add XP for activity (likes, reposts) without incrementing messages_count."""
+    async with async_session() as session:
+        result = await session.execute(
+            select(UserStats).where(
+                UserStats.group_id == group_id, UserStats.vk_id == vk_id,
+            )
+        )
+        stats = result.scalar_one_or_none()
+        if not stats:
+            stats = UserStats(group_id=group_id, vk_id=vk_id)
+            session.add(stats)
+
         stats.xp += xp_amount
 
         old_level = stats.level
@@ -651,3 +677,63 @@ async def get_ban_history(group_id: int, limit: int = 50) -> list[BanRecord]:
             .limit(limit)
         )
         return list(result.scalars().all())
+
+
+# ─── Content Tasks (Авто-задачи копирайтера) ────────────────────────────────
+
+async def create_content_task(
+    group_id: int, name: str, task_type: str, schedule_cron: str,
+    source_url: str = "", instruction: str = "", length: str = "auto",
+) -> ContentTask:
+    async with async_session() as session:
+        task = ContentTask(
+            group_id=group_id, name=name, task_type=task_type,
+            source_url=source_url, instruction=instruction,
+            schedule_cron=schedule_cron, length=length,
+        )
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+        return task
+
+
+async def get_content_tasks(group_id: int) -> list[ContentTask]:
+    async with async_session() as session:
+        result = await session.execute(
+            select(ContentTask).where(
+                ContentTask.group_id == group_id, ContentTask.is_active == True,
+            )
+        )
+        return list(result.scalars().all())
+
+
+async def get_all_active_content_tasks() -> list[ContentTask]:
+    async with async_session() as session:
+        result = await session.execute(
+            select(ContentTask).where(ContentTask.is_active == True)
+        )
+        return list(result.scalars().all())
+
+
+async def update_content_task_run(task_id: int) -> None:
+    async with async_session() as session:
+        result = await session.execute(
+            select(ContentTask).where(ContentTask.id == task_id)
+        )
+        task = result.scalar_one_or_none()
+        if task:
+            task.last_run_at = datetime.now(timezone.utc)
+            await session.commit()
+
+
+async def delete_content_task(task_id: int) -> bool:
+    async with async_session() as session:
+        result = await session.execute(
+            select(ContentTask).where(ContentTask.id == task_id)
+        )
+        task = result.scalar_one_or_none()
+        if task:
+            task.is_active = False
+            await session.commit()
+            return True
+        return False

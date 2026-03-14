@@ -158,6 +158,29 @@ class Newsletter(Base):
 
 # ─── Ban Records (Аудит банов) ───────────────────────────────────────────────
 
+# ─── Content Tasks (Авто-задачи копирайтера) ────────────────────────────────
+
+class ContentTask(Base):
+    """Recurring content task — e.g. 'every Friday, write patch notes from GitHub'."""
+    __tablename__ = "content_tasks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(BigInteger, ForeignKey("groups.group_id"), nullable=False, index=True)
+    name = Column(String, nullable=False)  # human-readable name
+    task_type = Column(String, nullable=False)  # patch_notes, article, digest
+    source_url = Column(String, default="")  # URL to fetch data from
+    instruction = Column(Text, default="")  # custom instruction for AI
+    schedule_cron = Column(String, nullable=False)  # cron expression: "0 18 * * 5" = Friday 18:00
+    length = Column(String, default="auto")  # short / medium / long / auto
+    is_active = Column(Boolean, default=True, nullable=False)
+    last_run_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=_now, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("group_id", "name", name="uq_content_task_group_name"),
+    )
+
+
 class BanRecord(Base):
     __tablename__ = "ban_records"
 

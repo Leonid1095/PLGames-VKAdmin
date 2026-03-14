@@ -42,10 +42,24 @@ async def _call_llm(messages: list[dict], model: str = None, group_id: int = Non
         logger.error(f"AI provider error: {e}")
         return "Извините, произошла ошибка при обращении к ИИ. Попробуйте позже."
 
+# ─── Group context helper ────────────────────────────────────────────────────
+
+async def _get_group_ai_context(group_id: int) -> dict:
+    """Load AI settings for a group from DB."""
+    from database.service import get_setting
+
+    return {
+        "ai_system_prompt": await get_setting(group_id, "ai_system_prompt", ""),
+        "ai_moderation_rules": await get_setting(group_id, "ai_moderation_rules", ""),
+        "ai_content_topics": await get_setting(group_id, "ai_content_topics", ""),
+        "ai_group_description": await get_setting(group_id, "ai_group_description", ""),
+        "ai_tone": await get_setting(group_id, "ai_tone", "friendly"),
+    }
+
 # ─── Public: Chat with memory ─────────────────────────────────────────────────
 
 async def chat_with_memory(group_id: int, vk_id: int, user_text: str) -> str:
-    """Main chat function with per-group memory."""
+    """Main chat function with per-group memory and group-aware personality."""
     from database.service import (
         get_setting, get_user_history, save_user_history,
         check_and_increment_limit, get_user_stats,
@@ -60,11 +74,16 @@ async def chat_with_memory(group_id: int, vk_id: int, user_text: str) -> str:
         )
 
     stats = await get_user_stats(group_id, vk_id)
+    ctx = await _get_group_ai_context(group_id)
 
-    system_prompt = await get_setting(
-        group_id, "system_prompt",
-        "Ты вежливый и отзывчивый помощник-администратор группы ВКонтакте."
-    )
+    # Use group-specific AI prompt if available, fallback to generic system_prompt
+    if ctx["ai_system_prompt"]:
+        system_prompt = ctx["ai_system_prompt"]
+    else:
+        system_prompt = await get_setting(
+            group_id, "system_prompt",
+            "Ты вежливый и отзывчивый помощник-администратор группы ВКонтакте."
+        )
 
     is_vip_active = stats.is_vip and (
         not stats.vip_expires or stats.vip_expires > datetime.now(timezone.utc)
@@ -109,14 +128,22 @@ _MODERATION_PROMPTS = {
 }
 
 async def analyze_toxicity(group_id: int, text: str) -> bool:
-    """Returns True if the comment should be deleted."""
+    """Returns True if the comment should be deleted. Uses group-specific rules."""
     from database.service import get_setting
 
+    ctx = await _get_group_ai_context(group_id)
     aggressiveness = await get_setting(group_id, "moderation_aggressiveness", "medium")
     extra = _MODERATION_PROMPTS.get(aggressiveness, _MODERATION_PROMPTS["medium"])
 
+    # Add group-specific moderation rules
+    group_rules = ""
+    if ctx["ai_moderation_rules"]:
+        group_rules = f"\nПравила этой группы: {ctx['ai_moderation_rules']}"
+    if ctx["ai_group_description"]:
+        group_rules += f"\nГруппа: {ctx['ai_group_description']}"
+
     system_prompt = (
-        f"Ты строгий модератор сообщества ВКонтакте. {extra} "
+        f"Ты строгий модератор сообщества ВКонтакте. {extra}{group_rules} "
         "Ответь ТОЛЬКО одним словом: ДА (если надо удалить) или НЕТ (если оставить)."
     )
     result = await generate_response(prompt=text, system_prompt=system_prompt, group_id=group_id)
@@ -125,17 +152,45 @@ async def analyze_toxicity(group_id: int, text: str) -> bool:
 # ─── Public: Post generation ──────────────────────────────────────────────────
 
 async def generate_post(group_id: int, topic: str = "") -> str:
-    """Generate a ready-to-publish VK wall post."""
+    """
+    Generate a VK wall post. Used by manual /пост command.
+    For automated posting, use content_writer.write_from_source() instead.
+    """
     from database.service import get_setting
 
-    topics = topic or await get_setting(group_id, "autopost_topics", "интересные факты")
+    ctx = await _get_group_ai_context(group_id)
+
+    if topic:
+        topics = topic
+    elif ctx["ai_content_topics"]:
+        topics = ctx["ai_content_topics"]
+    else:
+        topics = await get_setting(group_id, "autopost_topics", "интересные факты")
+
+    group_context = ""
+    if ctx["ai_group_description"]:
+        group_context = f" Группа: {ctx['ai_group_description']}."
+    tone_hint = ""
+    if ctx["ai_tone"] and ctx["ai_tone"] != "friendly":
+        tone_map = {
+            "formal": "Пиши в деловом стиле.",
+            "casual": "Пиши неформально, как друг.",
+            "gaming": "Пиши в геймерском стиле, с соответствующим сленгом.",
+            "professional": "Пиши профессионально и экспертно.",
+        }
+        tone_hint = " " + tone_map.get(ctx["ai_tone"], "")
+
     system_prompt = (
-        "Ты SMM-специалист группы ВКонтакте. Напиши пост для стены. "
-        "Можно использовать эмодзи. Без хэштегов. Пиши грамотным русским языком, "
-        "естественно, 3-5 предложений. Не лей воду, не повторяйся."
+        f"Ты копирайтер группы ВКонтакте.{group_context}{tone_hint} "
+        "Напиши пост для стены. Можно использовать эмодзи. Без хэштегов. "
+        "Пиши грамотным русским языком, каждое предложение должно нести смысл. "
+        "Пиши 10-15 предложений, раскрой тему с конкретикой и фактами. "
+        "Не лей воду, не повторяйся."
     )
     return await generate_response(
-        prompt=f"Напиши пост на одну из следующих тем: {topics}",
+        prompt=f"Напиши содержательный пост на тему: {topics}. "
+               "Включи конкретные факты, примеры или советы. "
+               "Не пиши общие фразы — давай полезную информацию.",
         system_prompt=system_prompt,
         group_id=group_id,
     )
