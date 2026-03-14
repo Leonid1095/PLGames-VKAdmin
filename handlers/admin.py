@@ -6,6 +6,7 @@ from datetime import datetime, timezone, timedelta
 
 from core.ai_brain import generate_post
 from core.group_context import GroupContext
+from core.telegram import send_to_telegram
 from database.service import (
     get_setting, set_setting, clear_user_history, grant_vip,
     get_pending_suggestions, get_suggestion, review_suggestion,
@@ -91,7 +92,9 @@ async def cmd_post(ctx, from_id, parts, peer_id) -> str:
     topic = parts[1] if len(parts) > 1 else ""
     post_text = await generate_post(group_id=ctx.group_id, topic=topic)
     try:
-        await ctx.api.wall.post(owner_id=-ctx.group_id, message=post_text)
+        result = await ctx.api.wall.post(owner_id=-ctx.group_id, message=post_text)
+        vk_post_id = result.post_id if result else 0
+        await send_to_telegram(ctx.group_id, post_text, vk_post_id)
         return f"Пост опубликован!\n\n{post_text}"
     except Exception as e:
         logger.error(f"Failed to publish post: {e}")
@@ -155,6 +158,8 @@ async def cmd_accept(ctx, from_id, parts, peer_id) -> str:
     await review_suggestion(sid, "approved", from_id)
     try:
         result = await ctx.api.wall.post(owner_id=-ctx.group_id, message=suggestion.text)
+        vk_post_id = result.post_id if result else 0
+        await send_to_telegram(ctx.group_id, suggestion.text, vk_post_id)
         await review_suggestion(sid, "published", from_id)
         # Notify author
         try:
@@ -494,7 +499,9 @@ async def cmd_article(ctx, from_id, parts, peer_id) -> str:
         return text
 
     try:
-        await ctx.api.wall.post(owner_id=-ctx.group_id, message=text)
+        result = await ctx.api.wall.post(owner_id=-ctx.group_id, message=text)
+        vk_post_id = result.post_id if result else 0
+        await send_to_telegram(ctx.group_id, text, vk_post_id)
         return f"Статья опубликована!\n\n{text[:500]}..."
     except Exception as e:
         logger.error(f"Failed to publish article: {e}")
@@ -562,7 +569,9 @@ async def cmd_patch_notes(ctx, from_id, parts, peer_id) -> str:
         return text
 
     try:
-        await ctx.api.wall.post(owner_id=-ctx.group_id, message=text)
+        result = await ctx.api.wall.post(owner_id=-ctx.group_id, message=text)
+        vk_post_id = result.post_id if result else 0
+        await send_to_telegram(ctx.group_id, text, vk_post_id)
         return f"Патч-ноты опубликованы!\n\n{text[:500]}..."
     except Exception as e:
         return f"Ошибка публикации: {e}\n\nТекст:\n{text[:1000]}"

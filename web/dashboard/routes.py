@@ -298,6 +298,42 @@ SETTINGS_SCHEMA = [
             },
         ],
     },
+    {
+        "title": "Telegram кросс-постинг",
+        "icon": "📨",
+        "settings": [
+            {
+                "key": "telegram_enabled",
+                "label": "Кросс-постинг в Telegram",
+                "description": "Автоматически дублировать посты из VK в Telegram-канал",
+                "type": "toggle",
+                "default": "false",
+            },
+            {
+                "key": "telegram_bot_token",
+                "label": "Токен бота",
+                "description": "Токен Telegram-бота (получите у @BotFather). Если пусто — используется глобальный из .env",
+                "type": "text",
+                "default": "",
+                "placeholder": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            },
+            {
+                "key": "telegram_chat_id",
+                "label": "Chat ID / канал",
+                "description": "ID чата или @username канала, куда отправлять посты",
+                "type": "text",
+                "default": "",
+                "placeholder": "@mychannel или -1001234567890",
+            },
+            {
+                "key": "telegram_add_vk_link",
+                "label": "Добавлять ссылку на VK",
+                "description": "Добавлять ссылку на оригинальный пост VK в конец сообщения",
+                "type": "toggle",
+                "default": "true",
+            },
+        ],
+    },
 ]
 
 

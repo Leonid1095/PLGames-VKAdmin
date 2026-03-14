@@ -8,6 +8,7 @@ from vkbottle import API
 
 from core.ai_brain import generate_post
 from core.crypto import decrypt_token
+from core.telegram import send_to_telegram
 from tasks.content_parser import fetch_and_schedule
 from database.service import (
     get_all_active_groups, get_setting, set_setting,
@@ -99,6 +100,13 @@ async def _scheduled_posts_job():
                     vk_post_id = result.post_id if result else 0
                     await mark_post_published(p.id, vk_post_id)
                     logger.info(f"Scheduled post #{p.id} published for group {gid}")
+
+                    # Cross-post to Telegram
+                    try:
+                        await send_to_telegram(gid, p.text, vk_post_id)
+                    except Exception as tg_err:
+                        logger.warning(f"Telegram cross-post failed for post #{p.id}: {tg_err}")
+
                 except Exception as e:
                     logger.error(f"Failed to publish scheduled post #{p.id}: {e}")
                     await mark_post_failed(p.id)
