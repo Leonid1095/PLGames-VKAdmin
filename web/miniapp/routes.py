@@ -1,5 +1,6 @@
 """VK Mini App — admin panel inside VK iframe."""
 
+import json
 import logging
 from html import escape
 from fastapi import APIRouter, Request
@@ -401,6 +402,87 @@ async def miniapp_group_settings(request: Request, group_id: int):
     </div>
     """
 
+    # Widget install section
+    widget_enabled = (await get_setting(group_id, "widget_enabled", "false")).lower() == "true"
+    widget_status = '<span style="color:#2e7d32;">✓ Включён</span>' if widget_enabled else '<span style="color:#888;">Выключен</span>'
+
+    widget_html = f"""
+    <div class="card">
+        <div class="card-title">🏆 Виджет-лидерборд</div>
+        <p style="font-size:0.85rem;margin-bottom:6px;">Статус: {widget_status}</p>
+        <p style="font-size:0.78rem;color:#888;margin-bottom:12px;">
+            Виджет показывает таблицу топ-участников прямо на странице группы.
+            Участники получают XP за сообщения, лайки и репосты.
+        </p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button class="btn" onclick="installWidget()">Установить виджет</button>
+            <button class="btn" style="background:#4caf50;" onclick="refreshWidget()">Обновить данные</button>
+        </div>
+        <p id="widget-status" style="font-size:0.8rem;color:#888;margin-top:8px;"></p>
+    </div>
+    <script>
+    function installWidget() {{
+        var statusEl = document.getElementById('widget-status');
+        statusEl.textContent = 'Подготовка виджета...';
+
+        // 1. Get widget code from server
+        fetch('/miniapp/group/{group_id}/widget/code?token={token}')
+            .then(function(r) {{ return r.json(); }})
+            .then(function(data) {{
+                if (data.error) {{
+                    statusEl.textContent = 'Ошибка: ' + data.error;
+                    return;
+                }}
+                // 2. Show VK widget preview dialog
+                statusEl.textContent = 'Открытие диалога VK...';
+                return vkBridge.send('VKWebAppShowCommunityWidgetPreviewBox', {{
+                    group_id: {group_id},
+                    type: 'table',
+                    code: data.code
+                }});
+            }})
+            .then(function(result) {{
+                if (result) {{
+                    statusEl.innerHTML = '<span style="color:#2e7d32;">✓ Виджет установлен!</span>';
+                    // Enable widget in settings
+                    var fd = new FormData();
+                    fd.append('key', 'widget_enabled');
+                    fd.append('value', 'true');
+                    fetch('/miniapp/group/{group_id}/settings?token={token}', {{
+                        method: 'POST', body: fd,
+                        headers: {{'X-Requested-With': 'XMLHttpRequest'}}
+                    }});
+                    showToast('Виджет установлен!');
+                }}
+            }})
+            .catch(function(e) {{
+                console.error('Widget install error:', e);
+                if (e && e.error_data && e.error_data.error_code === 4) {{
+                    statusEl.textContent = 'Отменено пользователем';
+                }} else {{
+                    statusEl.textContent = 'Ошибка: ' + (e.error_data ? e.error_data.error_reason : (e.message || 'неизвестная'));
+                }}
+            }});
+    }}
+
+    function refreshWidget() {{
+        var statusEl = document.getElementById('widget-status');
+        statusEl.textContent = 'Обновление...';
+        fetch('/miniapp/group/{group_id}/widget/refresh?token={token}', {{method: 'POST'}})
+            .then(function(r) {{ return r.json(); }})
+            .then(function(data) {{
+                if (data.ok) {{
+                    statusEl.innerHTML = '<span style="color:#2e7d32;">✓ Виджет обновлён (' + data.users + ' участников)</span>';
+                    showToast('Виджет обновлён!');
+                }} else {{
+                    statusEl.textContent = 'Ошибка: ' + (data.error || 'не удалось обновить');
+                }}
+            }})
+            .catch(function() {{ statusEl.textContent = 'Ошибка сети'; }});
+    }}
+    </script>
+    """
+
     name = escape(group.group_name or f"Группа {group_id}")
     back_html = f'<a href="/miniapp?token={token}" class="back">← Назад</a>'
 
@@ -413,6 +495,7 @@ async def miniapp_group_settings(request: Request, group_id: int):
     {sections_html}
     {sources_html}
     {tasks_html}
+    {widget_html}
     {ai_refresh_html}
     """
     return HTMLResponse(_miniapp_html(name, content, token))
@@ -615,3 +698,83 @@ async def miniapp_delete_source(request: Request, group_id: int):
         await delete_content_source(source_id)
 
     return RedirectResponse(f"/miniapp/group/{group_id}?token={token}&msg=saved", status_code=303)
+
+
+# ─── Widget API ────────────────────────────────────────────────────────────
+
+@router.get("/miniapp/group/{group_id}/widget/code")
+async def miniapp_widget_code(request: Request, group_id: int):
+    """Return VKScript code for the widget preview dialog."""
+    auth = _get_auth(request)
+    if not auth:
+        return JSONResponse({"error": "Сессия истекла"}, status_code=401)
+
+    group = await get_group(group_id)
+    if not group or group.admin_vk_id != auth["uid"]:
+        return JSONResponse({"error": "Нет доступа"}, status_code=403)
+
+    from core.widgets import _build_table_widget_code, _resolve_user_names
+    from core.crypto import decrypt_token
+    from database.service import get_top_users
+    from vkbottle import API
+
+    widget_count = int(await get_setting(group_id, "widget_top_count", "10"))
+    widget_sort = await get_setting(group_id, "widget_sort_by", "xp")
+    top = await get_top_users(group_id, order_by=widget_sort, limit=widget_count)
+
+    if not top:
+        # Demo widget if no data yet
+        import json
+        demo = {
+            "title": "🏆 Топ участников",
+            "head": [{"text": "#"}, {"text": "Участник"}, {"text": "Уровень"}, {"text": "XP"}],
+            "body": [
+                [{"text": "1"}, {"text": "Пока нет данных"}, {"text": "1"}, {"text": "0"}],
+            ],
+        }
+        return JSONResponse({"code": f"return {json.dumps(demo, ensure_ascii=False)};"})
+
+    try:
+        token = decrypt_token(group.access_token)
+        api = API(token=token)
+        vk_ids = [u.vk_id for u in top]
+        names = await _resolve_user_names(api, vk_ids)
+    except Exception:
+        names = {}
+
+    rows = []
+    for u in top:
+        rows.append({
+            "vk_id": u.vk_id,
+            "name": names.get(u.vk_id, f"id{u.vk_id}"),
+            "level": u.level,
+            "xp": u.xp,
+        })
+
+    code = _build_table_widget_code(rows)
+    return JSONResponse({"code": code})
+
+
+@router.post("/miniapp/group/{group_id}/widget/refresh")
+async def miniapp_widget_refresh(request: Request, group_id: int):
+    """Force-refresh the widget data."""
+    auth = _get_auth(request)
+    if not auth:
+        return JSONResponse({"error": "Сессия истекла"}, status_code=401)
+
+    group = await get_group(group_id)
+    if not group or group.admin_vk_id != auth["uid"]:
+        return JSONResponse({"error": "Нет доступа"}, status_code=403)
+
+    await set_setting(group_id, "widget_enabled", "true")
+
+    from core.widgets import update_widget_for_group
+    success = await update_widget_for_group(group_id)
+
+    if success:
+        from database.service import get_top_users
+        widget_count = int(await get_setting(group_id, "widget_top_count", "10"))
+        top = await get_top_users(group_id, limit=widget_count)
+        return JSONResponse({"ok": True, "users": len(top)})
+
+    return JSONResponse({"ok": False, "error": "Нет данных об участниках или ошибка VK API"})
