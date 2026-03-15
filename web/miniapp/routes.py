@@ -297,6 +297,39 @@ async def miniapp_profile(request: Request):
         vip_html = f'<div style="background:#7c4dff;color:white;padding:8px 14px;border-radius:8px;font-size:0.85rem;margin-bottom:10px;">⭐ VIP до {expires}</div>'
 
     requests_left = "∞" if stats.is_vip else max(0, 10 - stats.daily_requests)
+
+    # Achievements
+    badges = []
+    if stats.messages_count >= 1:
+        badges.append(("💬", "Первое слово"))
+    if stats.messages_count >= 50:
+        badges.append(("🗣", "Болтун"))
+    if stats.messages_count >= 200:
+        badges.append(("📢", "Оратор"))
+    if stats.level >= 5:
+        badges.append(("⭐", "Уровень 5"))
+    if stats.level >= 10:
+        badges.append(("🌟", "Уровень 10"))
+    if stats.level >= 25:
+        badges.append(("💎", "Уровень 25"))
+    if stats.reputation >= 10:
+        badges.append(("👍", "Уважаемый"))
+    if stats.reputation >= 50:
+        badges.append(("🏅", "Авторитет"))
+    if stats.xp >= 1000:
+        badges.append(("🔥", "1000 XP"))
+    if stats.xp >= 5000:
+        badges.append(("🚀", "5000 XP"))
+    if stats.is_vip:
+        badges.append(("👑", "VIP"))
+    if rank != "—" and rank <= 3:
+        badges.append(("🏆", f"Топ-{rank}"))
+
+    badges_html = ""
+    if badges:
+        items = "".join(f'<div style="display:inline-flex;align-items:center;gap:3px;background:#f5f5f5;padding:4px 10px;border-radius:12px;font-size:0.78rem;"><span style="font-size:1rem;">{icon}</span>{label}</div>' for icon, label in badges)
+        badges_html = f'<div class="card"><div class="card-title" style="font-size:0.9rem;">🎖 Достижения ({len(badges)})</div><div style="display:flex;flex-wrap:wrap;gap:6px;">{items}</div></div>'
+
     is_admin = group.admin_vk_id == vk_user_id
     nav = _bottom_nav("profile", token, group_id, is_admin)
     group_name = escape(group.group_name or f"Группа {group_id}")
@@ -343,12 +376,15 @@ async def miniapp_profile(request: Request):
         </div>
     </div>
 
+    {badges_html}
+
     <div class="card">
-        <div class="card-title" style="font-size:0.9rem;">📊 Активность</div>
-        <div style="font-size:0.85rem;color:#666;line-height:1.8;">
-            Предупреждений: {stats.warnings}/3<br>
-            XP за сообщения, лайки и репосты<br>
-            Репутация: +/- через ответы на комментарии
+        <div class="card-title" style="font-size:0.9rem;">📊 Как получить XP</div>
+        <div style="font-size:0.82rem;color:#666;line-height:1.8;">
+            💬 Сообщения боту — 1-5 XP<br>
+            👍 Лайки постов — 2 XP<br>
+            🔁 Репосты — 5 XP<br>
+            Предупреждений: {stats.warnings}/3
         </div>
     </div>
     {nav}
@@ -1020,6 +1056,302 @@ async def api_review_suggestion(request: Request):
         return JSONResponse({"error": "Неизвестное действие"}, status_code=400)
 
 
+# ─── Content calendar ─────────────────────────────────────────────────────────
+
+@router.get("/miniapp/admin/calendar")
+async def miniapp_calendar(request: Request):
+    """Content calendar — scheduled posts view."""
+    auth = _get_auth(request)
+    token = request.query_params.get("token", request.query_params.get("t", ""))
+    group_id = int(request.query_params.get("gid", auth.get("gid", 0) if auth else 0))
+
+    group = await get_group(group_id) if group_id else None
+    err = _admin_check(auth, group)
+    if err:
+        return _error_page(err)
+
+    from datetime import datetime, timezone, timedelta
+    from database.service import get_content_plan
+
+    # Get posts for today and next 7 days
+    now = datetime.now(timezone.utc)
+    days_html = ""
+
+    for day_offset in range(7):
+        day = now + timedelta(days=day_offset)
+        posts = await get_content_plan(group_id, day)
+
+        day_label = "Сегодня" if day_offset == 0 else ("Завтра" if day_offset == 1 else day.strftime("%d.%m %a"))
+        posts_count = len(posts)
+
+        posts_items = ""
+        if posts:
+            for p in posts:
+                time_str = p.scheduled_at.strftime("%H:%M") if p.scheduled_at else "—"
+                status_cls = {"pending": "🕐", "published": "✅", "failed": "❌"}.get(p.status, "")
+                source_label = {"manual": "вручную", "ai": "ИИ", "parsed": "парсинг", "suggested": "предложка"}.get(p.source.split(":")[0] if p.source else "", p.source or "")
+                text_preview = escape(p.text[:80]) + ("..." if len(p.text) > 80 else "")
+                posts_items += f"""
+                <div style="padding:8px 0;border-bottom:1px solid #f0f0f0;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;">
+                        <span style="font-weight:600;font-size:0.85rem;">{status_cls} {time_str}</span>
+                        <span style="font-size:0.72rem;color:#888;background:#f5f5f5;padding:2px 6px;border-radius:4px;">{source_label}</span>
+                    </div>
+                    <div style="font-size:0.8rem;color:#555;margin-top:3px;">{text_preview}</div>
+                </div>
+                """
+        else:
+            posts_items = '<div style="padding:12px;text-align:center;color:#bbb;font-size:0.82rem;">Нет постов</div>'
+
+        dot_color = "#4caf50" if posts_count > 0 else "#e0e0e0"
+        days_html += f"""
+        <div class="card" style="padding:12px 16px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+                <div style="font-weight:600;font-size:0.9rem;">
+                    <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:{dot_color};margin-right:6px;"></span>
+                    {day_label}
+                </div>
+                <span style="font-size:0.75rem;color:#888;">{posts_count} пост(ов)</span>
+            </div>
+            {posts_items}
+        </div>
+        """
+
+    nav = _bottom_nav("settings", token, group_id, True)
+
+    content = f"""
+    <a href="/miniapp/group/{group_id}?token={token}" class="back">← Настройки</a>
+    <div class="card" style="background:linear-gradient(135deg,#7b1fa2,#4a148c);color:white;">
+        <div class="card-title" style="color:white;">📅 Контент-план</div>
+        <p style="opacity:0.85;font-size:0.8rem;">Ближайшие 7 дней</p>
+    </div>
+    <a href="/miniapp/admin/create-post?token={token}&gid={group_id}" class="btn" style="display:block;text-align:center;margin-bottom:10px;">+ Создать пост</a>
+    {days_html}
+    {nav}
+    """
+    return HTMLResponse(_miniapp_html("Контент-план", content, token, body_class="has-nav"))
+
+
+# ─── Newsletter ───────────────────────────────────────────────────────────────
+
+@router.get("/miniapp/admin/newsletter")
+async def miniapp_newsletter_page(request: Request):
+    """Newsletter form page."""
+    auth = _get_auth(request)
+    token = request.query_params.get("token", request.query_params.get("t", ""))
+    group_id = int(request.query_params.get("gid", auth.get("gid", 0) if auth else 0))
+
+    group = await get_group(group_id) if group_id else None
+    err = _admin_check(auth, group)
+    if err:
+        return _error_page(err)
+
+    nav = _bottom_nav("settings", token, group_id, True)
+
+    content = f"""
+    <a href="/miniapp/group/{group_id}?token={token}" class="back">← Настройки</a>
+    <div class="card" style="background:linear-gradient(135deg,#d32f2f,#b71c1c);color:white;">
+        <div class="card-title" style="color:white;">📨 Рассылка</div>
+        <p style="opacity:0.85;font-size:0.8rem;">Отправка сообщения всем участникам группы</p>
+    </div>
+
+    <div class="card">
+        <label style="font-size:0.85rem;font-weight:600;display:block;margin-bottom:6px;">Текст рассылки</label>
+        <textarea id="nl-text" rows="5" placeholder="Привет! У нас для вас отличные новости..."></textarea>
+
+        <div style="margin-top:12px;">
+            <label style="font-size:0.82rem;color:#888;">
+                <input type="checkbox" id="nl-confirm" style="margin-right:6px;">
+                Я понимаю, что сообщение будет отправлено всем участникам группы
+            </label>
+        </div>
+
+        <button class="btn" id="nl-btn" onclick="sendNewsletter()" style="width:100%;margin-top:12px;" disabled>Отправить рассылку</button>
+        <div id="nl-status" style="text-align:center;font-size:0.82rem;color:#888;margin-top:8px;"></div>
+    </div>
+
+    <div class="card">
+        <div style="font-size:0.82rem;color:#888;">
+            ⚠️ Рассылка отправляется в ЛС каждому участнику.<br>
+            Это может занять время для больших групп.<br>
+            VK может ограничить отправку если участников много.
+        </div>
+    </div>
+
+    <script>
+    document.getElementById('nl-confirm').addEventListener('change', function() {{
+        document.getElementById('nl-btn').disabled = !this.checked;
+    }});
+
+    function sendNewsletter() {{
+        var text = document.getElementById('nl-text').value.trim();
+        if (!text) {{ document.getElementById('nl-status').textContent = 'Введите текст'; return; }}
+
+        var btn = document.getElementById('nl-btn');
+        btn.disabled = true; btn.textContent = 'Отправка...';
+        document.getElementById('nl-status').textContent = 'Запуск рассылки...';
+
+        fetch('/miniapp/admin/api/newsletter?token={token}&gid={group_id}', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{text: text}})
+        }}).then(function(r) {{ return r.json(); }})
+        .then(function(data) {{
+            btn.textContent = 'Отправить рассылку';
+            document.getElementById('nl-confirm').checked = false;
+            btn.disabled = true;
+            if (data.ok) {{
+                document.getElementById('nl-status').innerHTML = '<span style="color:#2e7d32;">✓ Рассылка запущена! ' + data.total + ' получателей</span>';
+                showToast('Рассылка запущена!');
+            }} else {{
+                document.getElementById('nl-status').textContent = 'Ошибка: ' + (data.error || '?');
+            }}
+        }}).catch(function() {{
+            btn.disabled = false; btn.textContent = 'Отправить рассылку';
+            document.getElementById('nl-status').textContent = 'Ошибка сети';
+        }});
+    }}
+    </script>
+    {nav}
+    """
+    return HTMLResponse(_miniapp_html("Рассылка", content, token, body_class="has-nav"))
+
+
+@router.post("/miniapp/admin/api/newsletter")
+async def api_send_newsletter(request: Request):
+    """Start a newsletter broadcast."""
+    auth = _get_auth(request)
+    group_id = int(request.query_params.get("gid", 0))
+    group = await get_group(group_id) if group_id else None
+    err = _admin_check(auth, group)
+    if err:
+        return JSONResponse({"error": err}, status_code=403)
+
+    data = await request.json()
+    text = data.get("text", "").strip()
+    if not text:
+        return JSONResponse({"error": "Пустой текст"}, status_code=400)
+
+    import asyncio
+    from core.crypto import decrypt_token
+    from vkbottle import API
+    from database.service import create_newsletter, update_newsletter_progress
+
+    try:
+        vk_token = decrypt_token(group.access_token)
+        api = API(token=vk_token)
+
+        members_resp = await api.groups.get_members(group_id=group_id, count=0)
+        total = members_resp.count if members_resp else 0
+        if total == 0:
+            return JSONResponse({"error": "Нет участников"}, status_code=400)
+
+        nl = await create_newsletter(group_id, text, auth["uid"], total)
+
+        # Send in background
+        async def _send():
+            sent = 0
+            offset = 0
+            batch = 200
+            while offset < total:
+                try:
+                    resp = await api.groups.get_members(group_id=group_id, offset=offset, count=batch)
+                    for member in (resp.items or []):
+                        try:
+                            await api.messages.send(user_id=member, message=text, random_id=0)
+                            sent += 1
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.05)
+                except Exception:
+                    pass
+                offset += batch
+                await update_newsletter_progress(nl.id, sent)
+            await update_newsletter_progress(nl.id, sent, status="sent")
+
+        asyncio.create_task(_send())
+        return JSONResponse({"ok": True, "total": total, "newsletter_id": nl.id})
+
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ─── Onboarding ──────────────────────────────────────────────────────────────
+
+@router.get("/miniapp/onboarding")
+async def miniapp_onboarding(request: Request):
+    """Onboarding checklist for new groups."""
+    auth = _get_auth(request)
+    token = request.query_params.get("token", request.query_params.get("t", ""))
+    group_id = int(request.query_params.get("gid", auth.get("gid", 0) if auth else 0))
+
+    group = await get_group(group_id) if group_id else None
+    err = _admin_check(auth, group)
+    if err:
+        return _error_page(err)
+
+    # Check what's configured
+    ai_desc = await get_setting(group_id, "ai_group_description", "")
+    sources = await get_content_sources(group_id)
+    autopost = (await get_setting(group_id, "autopost_enabled", "false")).lower() == "true"
+    widget = (await get_setting(group_id, "widget_enabled", "false")).lower() == "true"
+    telegram = (await get_setting(group_id, "telegram_enabled", "false")).lower() == "true"
+
+    steps = [
+        ("ai", "🤖 Настроить ИИ-профиль", "Бот проанализирует группу и создаст персонализированный промпт", bool(ai_desc), f"/miniapp/group/{group_id}?token={token}"),
+        ("sources", "📡 Добавить источники контента", "RSS, VK-группы или сайты для автоматического парсинга", len(sources) > 0, f"/miniapp/group/{group_id}?token={token}"),
+        ("autopost", "📝 Включить автопостинг", "Бот будет сам писать и публиковать посты из источников", autopost, f"/miniapp/group/{group_id}?token={token}"),
+        ("widget", "🏆 Установить виджет", "Таблица топ-участников на странице группы", widget, f"/miniapp/group/{group_id}?token={token}"),
+        ("telegram", "📨 Подключить Telegram", "Автоматический кросс-постинг в Telegram-канал", telegram, f"/miniapp/group/{group_id}?token={token}"),
+    ]
+
+    done_count = sum(1 for _, _, _, done, _ in steps)
+    total = len(steps)
+    pct = int(done_count / total * 100)
+
+    steps_html = ""
+    for key, title, desc, done, link in steps:
+        icon = "✅" if done else "⬜"
+        opacity = "0.6" if done else "1"
+        steps_html += f"""
+        <a href="{link}" style="text-decoration:none;color:inherit;opacity:{opacity};">
+            <div style="display:flex;align-items:flex-start;gap:10px;padding:12px 0;border-bottom:1px solid #f0f0f0;">
+                <div style="font-size:1.2rem;line-height:1;padding-top:2px;">{icon}</div>
+                <div>
+                    <div style="font-weight:600;font-size:0.9rem;">{title}</div>
+                    <div style="font-size:0.78rem;color:#888;">{desc}</div>
+                </div>
+            </div>
+        </a>
+        """
+
+    nav = _bottom_nav("settings", token, group_id, True)
+
+    content = f"""
+    <div class="card" style="background:linear-gradient(135deg,#2688EB,#1565c0);color:white;text-align:center;">
+        <div style="font-size:1.5rem;margin-bottom:4px;">🚀</div>
+        <h2 style="font-size:1.1rem;font-weight:700;">Настройка бота</h2>
+        <p style="opacity:0.85;font-size:0.8rem;">Выполните шаги ниже для полной настройки</p>
+        <div style="margin-top:12px;">
+            <div style="background:rgba(255,255,255,0.2);border-radius:8px;height:8px;overflow:hidden;">
+                <div style="background:white;height:100%;width:{pct}%;border-radius:8px;transition:width 0.5s;"></div>
+            </div>
+            <div style="font-size:0.75rem;opacity:0.8;margin-top:4px;">{done_count} из {total} · {pct}%</div>
+        </div>
+    </div>
+
+    <div class="card">
+        {steps_html}
+    </div>
+
+    <a href="/miniapp/group/{group_id}?token={token}" class="btn" style="display:block;text-align:center;">
+        Перейти к настройкам →
+    </a>
+    {nav}
+    """
+    return HTMLResponse(_miniapp_html("Настройка", content, token, body_class="has-nav"))
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 @router.get("/miniapp")
@@ -1043,10 +1375,16 @@ async def miniapp_entry(request: Request):
     # Create session token
     token = create_miniapp_token(vk_user_id, vk_group_id)
 
-    # If opened from a specific group — go to profile (user-first)
+    # If opened from a specific group
     if vk_group_id:
         group = await get_group(vk_group_id)
         if group:
+            # Admin opening for first time? Show onboarding
+            if group.admin_vk_id == vk_user_id:
+                ai_desc = await get_setting(vk_group_id, "ai_group_description", "")
+                if not ai_desc:
+                    return RedirectResponse(f"/miniapp/onboarding?token={token}&gid={vk_group_id}", status_code=303)
+            # Regular flow — profile page
             return RedirectResponse(f"/miniapp/profile?token={token}&gid={vk_group_id}", status_code=303)
 
     # Otherwise show all groups this admin manages
@@ -1361,9 +1699,11 @@ async def miniapp_group_settings(request: Request, group_id: int):
     </div>
 
     <div style="display:flex;gap:6px;margin-bottom:8px;overflow-x:auto;">
-        <a href="/miniapp/admin/create-post?token={token}&gid={group_id}" class="btn btn-sm" style="white-space:nowrap;">✏️ Создать пост</a>
-        <a href="/miniapp/admin/analytics?token={token}&gid={group_id}" class="btn btn-sm" style="white-space:nowrap;background:#0d47a1;">📊 Аналитика</a>
+        <a href="/miniapp/admin/create-post?token={token}&gid={group_id}" class="btn btn-sm" style="white-space:nowrap;">✏️ Пост</a>
+        <a href="/miniapp/admin/calendar?token={token}&gid={group_id}" class="btn btn-sm" style="white-space:nowrap;background:#7b1fa2;">📅 План</a>
+        <a href="/miniapp/admin/analytics?token={token}&gid={group_id}" class="btn btn-sm" style="white-space:nowrap;background:#0d47a1;">📊 Стата</a>
         <a href="/miniapp/admin/suggestions?token={token}&gid={group_id}" class="btn btn-sm" style="white-space:nowrap;background:#f57c00;">📝 Предложка</a>
+        <a href="/miniapp/admin/newsletter?token={token}&gid={group_id}" class="btn btn-sm" style="white-space:nowrap;background:#d32f2f;">📨 Рассылка</a>
     </div>
 
     <div class="settings-tabs">
