@@ -3,8 +3,13 @@ __pycache__/
 *.db
 *.sqlite3
 .env
+.env.*
+!.env.example
 .venv/
 venv/
 .idea/
 .vscode/
 *.log
+*.bak
+*.swp
+.DS_Store
