@@ -1400,6 +1400,11 @@ async def miniapp_entry(request: Request):
         """
         return HTMLResponse(_miniapp_html("VKAdmin", content, token))
 
+    # If only one group — redirect to profile
+    if len(groups) == 1:
+        g = groups[0]
+        return RedirectResponse(f"/miniapp/profile?token={token}&gid={g.group_id}", status_code=303)
+
     groups_html = ""
     for g in groups:
         name = escape(g.group_name or f"Группа {g.group_id}")
@@ -1410,7 +1415,10 @@ async def miniapp_entry(request: Request):
                     <h3>{name}</h3>
                     <p>ID: {g.group_id} <span class="badge badge-green">Работает</span></p>
                 </div>
-                <a href="/miniapp/group/{g.group_id}?token={token}" class="btn btn-sm">Настроить</a>
+                <div style="display:flex;gap:6px;">
+                    <a href="/miniapp/profile?token={token}&gid={g.group_id}" class="btn btn-sm">Открыть</a>
+                    <a href="/miniapp/group/{g.group_id}?token={token}" class="btn btn-sm" style="background:#455a64;">⚙️</a>
+                </div>
             </div>
         </div>
         """
@@ -2000,7 +2008,7 @@ async def miniapp_widget_code(request: Request, group_id: int):
     return JSONResponse({"code": code})
 
 
-@router.post("/miniapp/group/{group_id}/widget/refresh")
+@router.api_route("/miniapp/group/{group_id}/widget/refresh", methods=["GET", "POST"])
 async def miniapp_widget_refresh(request: Request, group_id: int):
     """Force-refresh the widget data."""
     auth = _get_auth(request)

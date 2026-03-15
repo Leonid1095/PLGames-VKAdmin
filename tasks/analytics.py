@@ -20,7 +20,11 @@ async def collect_analytics():
             token = decrypt_token(group.access_token)
             api = API(token=token)
 
-            resp = await api.wall.get(owner_id=-group.group_id, count=20)
+            try:
+                resp = await api.wall.get(owner_id=-group.group_id, count=20)
+            except Exception as wall_err:
+                logger.warning(f"wall.get failed for group {group.group_id}: {wall_err}")
+                continue
             if not resp or not resp.items:
                 continue
 
