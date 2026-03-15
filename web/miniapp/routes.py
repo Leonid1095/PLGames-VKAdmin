@@ -39,7 +39,7 @@ def _error_page(msg: str) -> HTMLResponse:
 
 # ─── HTML template ────────────────────────────────────────────────────────────
 
-def _miniapp_html(title: str, content: str, token: str) -> str:
+def _miniapp_html(title: str, content: str, token: str, body_class: str = "") -> str:
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
@@ -141,6 +141,65 @@ def _miniapp_html(title: str, content: str, token: str) -> str:
         transition: opacity 0.3s; pointer-events: none;
     }}
     .toast.show {{ opacity: 1; }}
+
+    /* Bottom navigation */
+    .bottom-nav {{
+        position: fixed; bottom: 0; left: 0; right: 0;
+        background: white; border-top: 1px solid #e0e0e0;
+        display: flex; justify-content: space-around; align-items: center;
+        padding: 6px 0 env(safe-area-inset-bottom, 8px); z-index: 100;
+    }}
+    .nav-item {{
+        display: flex; flex-direction: column; align-items: center;
+        text-decoration: none; color: #999; font-size: 0.68rem; padding: 4px 12px;
+        transition: color 0.15s;
+    }}
+    .nav-item.active {{ color: #2688EB; }}
+    .nav-item span {{ font-size: 1.3rem; line-height: 1; }}
+    body.has-nav {{ padding-bottom: 64px; }}
+
+    /* Progress bar */
+    .progress-bar {{ background: #e0e0e0; border-radius: 8px; height: 10px; overflow: hidden; }}
+    .progress-fill {{ background: linear-gradient(90deg, #2688EB, #42a5f5); height: 100%; border-radius: 8px; transition: width 0.5s; }}
+
+    /* Stat grid */
+    .stat-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 12px 0; }}
+    .stat-item {{ background: #f5f5f5; border-radius: 8px; padding: 12px; text-align: center; }}
+    .stat-value {{ font-size: 1.3rem; font-weight: 700; color: #222; }}
+    .stat-label {{ font-size: 0.75rem; color: #888; margin-top: 2px; }}
+
+    /* Leaderboard */
+    .lb-row {{ display: flex; align-items: center; padding: 10px 12px; border-bottom: 1px solid #f0f0f0; }}
+    .lb-row:last-child {{ border-bottom: none; }}
+    .lb-rank {{ font-size: 1.1rem; font-weight: 700; width: 32px; text-align: center; color: #888; }}
+    .lb-rank.gold {{ color: #f9a825; }}
+    .lb-rank.silver {{ color: #90a4ae; }}
+    .lb-rank.bronze {{ color: #a1887f; }}
+    .lb-info {{ flex: 1; margin-left: 10px; }}
+    .lb-name {{ font-size: 0.9rem; font-weight: 600; color: #222; }}
+    .lb-stats {{ font-size: 0.75rem; color: #888; }}
+    .lb-xp {{ font-size: 0.9rem; font-weight: 700; color: #2688EB; }}
+    .lb-me {{ background: #e3f2fd; border-radius: 8px; }}
+
+    /* Shop */
+    .shop-card {{
+        background: linear-gradient(135deg, #7c4dff, #651fff); color: white;
+        border-radius: 12px; padding: 20px; margin-bottom: 10px; position: relative; overflow: hidden;
+    }}
+    .shop-card.coins {{ background: linear-gradient(135deg, #f9a825, #ff8f00); }}
+    .shop-card h3 {{ font-size: 1.1rem; margin-bottom: 4px; }}
+    .shop-card p {{ font-size: 0.82rem; opacity: 0.9; margin-bottom: 12px; }}
+    .shop-card .price {{ font-size: 1.3rem; font-weight: 700; }}
+    .shop-btn {{ background: rgba(255,255,255,0.25); color: white; border: none; border-radius: 8px; padding: 10px 24px; font-size: 0.9rem; font-weight: 600; cursor: pointer; }}
+    .shop-btn:hover {{ background: rgba(255,255,255,0.4); }}
+
+    /* Filter tabs */
+    .filter-tabs {{ display: flex; gap: 6px; margin-bottom: 12px; overflow-x: auto; }}
+    .filter-tab {{
+        padding: 6px 14px; border-radius: 16px; border: 1.5px solid #e0e0e0;
+        background: white; font-size: 0.8rem; color: #666; cursor: pointer; white-space: nowrap;
+    }}
+    .filter-tab.active {{ background: #2688EB; color: white; border-color: #2688EB; }}
 </style>
 <script>
 function showToast(msg) {{
@@ -163,7 +222,305 @@ function ajaxSubmit(form) {{
 }}
 </script>
 </head>
-<body><div id="toast" class="toast"></div>{content}</body></html>"""
+<body class="{body_class}"><div id="toast" class="toast"></div>{content}</body></html>"""
+
+
+def _bottom_nav(active: str, token: str, group_id: int = 0, is_admin: bool = False) -> str:
+    """Render bottom navigation bar."""
+    gid_param = f"&gid={group_id}" if group_id else ""
+    items = [
+        ("profile", "👤", "Профиль", f"/miniapp/profile?token={token}{gid_param}"),
+        ("leaderboard", "🏆", "Рейтинг", f"/miniapp/leaderboard?token={token}{gid_param}"),
+        ("shop", "🛒", "Магазин", f"/miniapp/shop?token={token}{gid_param}"),
+    ]
+    if is_admin and group_id:
+        items.append(("settings", "⚙️", "Настройки", f"/miniapp/group/{group_id}?token={token}"))
+
+    nav = ""
+    for key, icon, label, href in items:
+        cls = "nav-item active" if key == active else "nav-item"
+        nav += f'<a href="{href}" class="{cls}"><span>{icon}</span>{label}</a>'
+
+    return f'<nav class="bottom-nav">{nav}</nav>'
+
+
+# ─── User pages ──────────────────────────────────────────────────────────────
+
+@router.get("/miniapp/profile")
+async def miniapp_profile(request: Request):
+    """User profile page — XP, level, stats."""
+    auth = _get_auth(request)
+    if not auth:
+        return _error_page("Сессия истекла. Откройте приложение заново.")
+
+    token = request.query_params.get("token", request.query_params.get("t", ""))
+    vk_user_id = auth["uid"]
+    group_id = int(request.query_params.get("gid", auth.get("gid", 0)))
+
+    if not group_id:
+        return _error_page("Откройте приложение из группы ВКонтакте.")
+
+    group = await get_group(group_id)
+    if not group:
+        return _error_page("Группа не найдена")
+
+    from database.service import get_user_stats, get_top_users
+    stats = await get_user_stats(group_id, vk_user_id)
+
+    # Calculate level progress
+    xp_for_current = (stats.level - 1) ** 2 * 10 if stats.level > 1 else 0
+    xp_for_next = stats.level ** 2 * 10
+    xp_in_level = stats.xp - xp_for_current
+    xp_needed = xp_for_next - xp_for_current
+    progress_pct = min(100, int(xp_in_level / xp_needed * 100)) if xp_needed > 0 else 0
+
+    # Find user's rank
+    top = await get_top_users(group_id, order_by="xp", limit=100)
+    rank = next((i for i, u in enumerate(top, 1) if u.vk_id == vk_user_id), "—")
+
+    # VIP status
+    vip_html = ""
+    if stats.is_vip:
+        expires = stats.vip_expires.strftime("%d.%m.%Y") if stats.vip_expires else "Навсегда"
+        vip_html = f'<div style="background:#7c4dff;color:white;padding:8px 14px;border-radius:8px;font-size:0.85rem;margin-bottom:10px;">⭐ VIP до {expires}</div>'
+
+    requests_left = "∞" if stats.is_vip else max(0, 10 - stats.daily_requests)
+    is_admin = group.admin_vk_id == vk_user_id
+    nav = _bottom_nav("profile", token, group_id, is_admin)
+    group_name = escape(group.group_name or f"Группа {group_id}")
+
+    content = f"""
+    {vip_html}
+    <div class="card">
+        <div style="text-align:center;padding:8px 0;">
+            <div style="font-size:2.5rem;line-height:1;">👤</div>
+            <div style="font-size:0.8rem;color:#888;margin-top:4px;">{group_name}</div>
+            <div style="font-size:1.4rem;font-weight:700;margin-top:4px;">Уровень {stats.level}</div>
+            <div style="font-size:0.82rem;color:#888;margin-top:2px;">Ранг #{rank}</div>
+        </div>
+        <div style="margin:12px 0 4px;">
+            <div style="display:flex;justify-content:space-between;font-size:0.75rem;color:#888;">
+                <span>{stats.xp} XP</span>
+                <span>{xp_for_next} XP</span>
+            </div>
+            <div class="progress-bar">
+                <div class="progress-fill" style="width:{progress_pct}%"></div>
+            </div>
+            <div style="text-align:center;font-size:0.72rem;color:#aaa;margin-top:3px;">
+                Ещё {xp_for_next - stats.xp} XP до уровня {stats.level + 1}
+            </div>
+        </div>
+    </div>
+
+    <div class="stat-grid">
+        <div class="stat-item">
+            <div class="stat-value">{stats.messages_count}</div>
+            <div class="stat-label">Сообщений</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-value">{stats.reputation}</div>
+            <div class="stat-label">Репутация</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-value">{stats.balance:.0f}</div>
+            <div class="stat-label">Коинов</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-value">{requests_left}</div>
+            <div class="stat-label">ИИ-запросов</div>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-title" style="font-size:0.9rem;">📊 Активность</div>
+        <div style="font-size:0.85rem;color:#666;line-height:1.8;">
+            Предупреждений: {stats.warnings}/3<br>
+            XP за сообщения, лайки и репосты<br>
+            Репутация: +/- через ответы на комментарии
+        </div>
+    </div>
+    {nav}
+    """
+    return HTMLResponse(_miniapp_html("Профиль", content, token, body_class="has-nav"))
+
+
+@router.get("/miniapp/leaderboard")
+async def miniapp_leaderboard(request: Request):
+    """Leaderboard page — top users with filtering."""
+    auth = _get_auth(request)
+    if not auth:
+        return _error_page("Сессия истекла.")
+
+    token = request.query_params.get("token", request.query_params.get("t", ""))
+    vk_user_id = auth["uid"]
+    group_id = int(request.query_params.get("gid", auth.get("gid", 0)))
+    sort_by = request.query_params.get("sort", "xp")
+
+    if not group_id:
+        return _error_page("Откройте приложение из группы.")
+
+    group = await get_group(group_id)
+    if not group:
+        return _error_page("Группа не найдена")
+
+    from database.service import get_top_users
+
+    if sort_by not in ("xp", "level", "messages", "rep"):
+        sort_by = "xp"
+
+    top = await get_top_users(group_id, order_by=sort_by, limit=50)
+
+    # Resolve names via VK API
+    names = {}
+    if top:
+        try:
+            from core.crypto import decrypt_token
+            from vkbottle import API
+            vk_token = decrypt_token(group.access_token)
+            api = API(token=vk_token)
+            vk_ids = [u.vk_id for u in top]
+            users = await api.users.get(user_ids=vk_ids)
+            names = {u.id: f"{u.first_name} {u.last_name}" for u in users}
+        except Exception:
+            pass
+
+    # Filter tabs
+    sort_labels = {"xp": "По XP", "level": "По уровню", "messages": "Сообщения", "rep": "Репутация"}
+    tabs_html = ""
+    for key, label in sort_labels.items():
+        cls = "filter-tab active" if key == sort_by else "filter-tab"
+        tabs_html += f'<a href="/miniapp/leaderboard?token={token}&gid={group_id}&sort={key}" class="{cls}">{label}</a>'
+
+    # Rows
+    rows_html = ""
+    if not top:
+        rows_html = '<p style="text-align:center;color:#aaa;padding:24px;">Пока нет участников. Напишите боту в группе, чтобы начать!</p>'
+    else:
+        for i, u in enumerate(top, 1):
+            name = escape(names.get(u.vk_id, f"id{u.vk_id}"))
+            rank_cls = {1: "gold", 2: "silver", 3: "bronze"}.get(i, "")
+            me_cls = "lb-me" if u.vk_id == vk_user_id else ""
+            stat_val = {"xp": u.xp, "level": u.level, "messages": u.messages_count, "rep": u.reputation}.get(sort_by, u.xp)
+            stat_label = {"xp": "XP", "level": "ур.", "messages": "сообщ.", "rep": "реп."}.get(sort_by, "XP")
+            rows_html += f"""
+            <div class="lb-row {me_cls}">
+                <div class="lb-rank {rank_cls}">{i}</div>
+                <div class="lb-info">
+                    <div class="lb-name">{name}</div>
+                    <div class="lb-stats">Ур. {u.level} · {u.messages_count} сообщ.</div>
+                </div>
+                <div class="lb-xp">{stat_val} {stat_label}</div>
+            </div>
+            """
+
+    is_admin = group.admin_vk_id == vk_user_id
+    nav = _bottom_nav("leaderboard", token, group_id, is_admin)
+
+    content = f"""
+    <div class="card" style="padding-bottom:4px;">
+        <div class="card-title">🏆 Рейтинг участников</div>
+        <div class="filter-tabs">{tabs_html}</div>
+    </div>
+    <div class="card" style="padding:0;">
+        {rows_html}
+    </div>
+    {nav}
+    """
+    return HTMLResponse(_miniapp_html("Рейтинг", content, token, body_class="has-nav"))
+
+
+@router.get("/miniapp/shop")
+async def miniapp_shop(request: Request):
+    """Shop page — VIP and coins."""
+    auth = _get_auth(request)
+    if not auth:
+        return _error_page("Сессия истекла.")
+
+    token = request.query_params.get("token", request.query_params.get("t", ""))
+    vk_user_id = auth["uid"]
+    group_id = int(request.query_params.get("gid", auth.get("gid", 0)))
+
+    if not group_id:
+        return _error_page("Откройте приложение из группы.")
+
+    group = await get_group(group_id)
+    if not group:
+        return _error_page("Группа не найдена")
+
+    from database.service import get_user_stats
+    stats = await get_user_stats(group_id, vk_user_id)
+
+    balance_html = f"""
+    <div class="card" style="text-align:center;">
+        <div style="font-size:0.82rem;color:#888;">Ваш баланс</div>
+        <div style="font-size:1.8rem;font-weight:700;color:#222;">{stats.balance:.0f} <span style="font-size:0.9rem;color:#888;">коинов</span></div>
+    </div>
+    """
+
+    vip_status = ""
+    if stats.is_vip:
+        expires = stats.vip_expires.strftime("%d.%m.%Y") if stats.vip_expires else "Навсегда"
+        vip_status = f'<div style="background:#e8f5e9;color:#2e7d32;padding:10px 14px;border-radius:8px;font-size:0.85rem;margin-bottom:10px;">✓ У вас VIP до {expires}</div>'
+
+    is_admin = group.admin_vk_id == vk_user_id
+    nav = _bottom_nav("shop", token, group_id, is_admin)
+
+    content = f"""
+    {balance_html}
+    {vip_status}
+
+    <div class="shop-card">
+        <h3>⭐ VIP-статус</h3>
+        <p>Безлимитные ИИ-запросы, премиум-модели, приоритетная поддержка</p>
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+            <div class="price">150 ₽/мес</div>
+            <button class="shop-btn" onclick="buyVip()">Купить VIP</button>
+        </div>
+    </div>
+
+    <div class="shop-card coins">
+        <h3>💰 1000 коинов</h3>
+        <p>Внутренняя валюта — для будущих возможностей и бонусов</p>
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+            <div class="price">100 ₽</div>
+            <button class="shop-btn" onclick="buyCoins()">Купить коины</button>
+        </div>
+    </div>
+
+    <div class="card" style="text-align:center;">
+        <p style="font-size:0.82rem;color:#888;">
+            Для оплаты напишите администратору группы.<br>
+            Скоро здесь появится автоматическая оплата через VK Pay!
+        </p>
+    </div>
+
+    <script>
+    function buyVip() {{
+        vkBridge.send('VKWebAppOpenPayForm', {{
+            app_id: {group_id},
+            action: 'pay-to-group',
+            params: {{group_id: {group_id}, amount: 150, description: 'VIP-статус 1 месяц'}}
+        }}).then(function(r) {{ showToast('Спасибо за покупку!'); }})
+        .catch(function(e) {{
+            if (e && e.error_data && e.error_data.error_code !== 4)
+                showToast('Напишите администратору для оплаты');
+        }});
+    }}
+    function buyCoins() {{
+        vkBridge.send('VKWebAppOpenPayForm', {{
+            app_id: {group_id},
+            action: 'pay-to-group',
+            params: {{group_id: {group_id}, amount: 100, description: '1000 коинов'}}
+        }}).then(function(r) {{ showToast('Спасибо за покупку!'); }})
+        .catch(function(e) {{
+            if (e && e.error_data && e.error_data.error_code !== 4)
+                showToast('Напишите администратору для оплаты');
+        }});
+    }}
+    </script>
+    {nav}
+    """
+    return HTMLResponse(_miniapp_html("Магазин", content, token, body_class="has-nav"))
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
@@ -189,11 +546,11 @@ async def miniapp_entry(request: Request):
     # Create session token
     token = create_miniapp_token(vk_user_id, vk_group_id)
 
-    # If opened from a specific group — go directly to its settings
+    # If opened from a specific group — go to profile (user-first)
     if vk_group_id:
         group = await get_group(vk_group_id)
-        if group and group.admin_vk_id == vk_user_id:
-            return RedirectResponse(f"/miniapp/group/{vk_group_id}?token={token}", status_code=303)
+        if group:
+            return RedirectResponse(f"/miniapp/profile?token={token}&gid={vk_group_id}", status_code=303)
 
     # Otherwise show all groups this admin manages
     groups = await get_groups_by_admin(vk_user_id)
