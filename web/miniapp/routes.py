@@ -198,8 +198,20 @@ def _miniapp_html(title: str, content: str, token: str, body_class: str = "") ->
     .filter-tab {{
         padding: 6px 14px; border-radius: 16px; border: 1.5px solid #e0e0e0;
         background: white; font-size: 0.8rem; color: #666; cursor: pointer; white-space: nowrap;
+        text-decoration: none;
     }}
     .filter-tab.active {{ background: #2688EB; color: white; border-color: #2688EB; }}
+
+    /* Settings tabs */
+    .settings-tabs {{ display: flex; gap: 4px; overflow-x: auto; padding: 0 0 8px; margin-bottom: 8px; position: sticky; top: 0; background: #EBEDF0; z-index: 50; }}
+    .settings-tab {{
+        padding: 8px 14px; border-radius: 10px; font-size: 0.78rem; font-weight: 500;
+        background: white; color: #666; cursor: pointer; white-space: nowrap; border: none;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+    }}
+    .settings-tab.active {{ background: #2688EB; color: white; }}
+    .tab-content {{ display: none; }}
+    .tab-content.active {{ display: block; }}
 </style>
 <script>
 function showToast(msg) {{
@@ -607,7 +619,19 @@ async def miniapp_group_settings(request: Request, group_id: int):
     if group.admin_vk_id != vk_user_id:
         return _error_page("У вас нет доступа к этой группе")
 
-    sections_html = ""
+    # Group settings into tabs
+    TAB_MAP = {
+        "Искусственный интеллект": "ai",
+        "ИИ-профиль группы": "ai",
+        "Модерация": "ai",
+        "Автопостинг": "content",
+        "Приветствие новых участников": "content",
+        "Контент-план": "content",
+        "Виджет-лидерборд": "widget",
+        "Telegram кросс-постинг": "integrations",
+    }
+    tab_sections = {"ai": "", "content": "", "widget": "", "integrations": ""}
+
     for section in SETTINGS_SCHEMA:
         items_html = ""
         for s in section["settings"]:
@@ -622,12 +646,14 @@ async def miniapp_group_settings(request: Request, group_id: int):
             </div>
             """
 
-        sections_html += f"""
+        card = f"""
         <div class="card">
             <div class="card-title">{section['icon']} {section['title']}</div>
             {items_html}
         </div>
         """
+        tab_key = TAB_MAP.get(section["title"], "ai")
+        tab_sections[tab_key] += card
 
     # Content sources
     sources = await get_content_sources(group_id)
@@ -841,21 +867,52 @@ async def miniapp_group_settings(request: Request, group_id: int):
     """
 
     name = escape(group.group_name or f"Группа {group_id}")
-    back_html = f'<a href="/miniapp?token={token}" class="back">← Назад</a>'
+    nav = _bottom_nav("settings", token, group_id, True)
 
     content = f"""
-    {back_html}
     <div class="card" style="background: linear-gradient(135deg, #2688EB, #1f7ad8); color: white;">
-        <h2 style="font-size: 1rem; font-weight: 700;">{name}</h2>
-        <p style="opacity: 0.85; font-size: 0.8rem;">ID: {group_id} · <span class="badge badge-green" style="font-size:0.7rem;">Работает</span></p>
+        <h2 style="font-size: 1rem; font-weight: 700;">⚙️ {name}</h2>
+        <p style="opacity: 0.85; font-size: 0.8rem;">ID: {group_id} · Настройки</p>
     </div>
-    {sections_html}
-    {sources_html}
-    {tasks_html}
-    {widget_html}
-    {ai_refresh_html}
+
+    <div class="settings-tabs">
+        <button class="settings-tab active" onclick="switchTab('ai')">🤖 ИИ</button>
+        <button class="settings-tab" onclick="switchTab('content')">📝 Контент</button>
+        <button class="settings-tab" onclick="switchTab('widget')">🏆 Виджет</button>
+        <button class="settings-tab" onclick="switchTab('integrations')">🔗 Связи</button>
+    </div>
+
+    <div id="tab-ai" class="tab-content active">
+        {tab_sections["ai"]}
+        {ai_refresh_html}
+    </div>
+
+    <div id="tab-content" class="tab-content">
+        {tab_sections["content"]}
+        {sources_html}
+        {tasks_html}
+    </div>
+
+    <div id="tab-widget" class="tab-content">
+        {tab_sections["widget"]}
+        {widget_html}
+    </div>
+
+    <div id="tab-integrations" class="tab-content">
+        {tab_sections["integrations"]}
+    </div>
+
+    <script>
+    function switchTab(name) {{
+        document.querySelectorAll('.tab-content').forEach(function(el) {{ el.classList.remove('active'); }});
+        document.querySelectorAll('.settings-tab').forEach(function(el) {{ el.classList.remove('active'); }});
+        document.getElementById('tab-' + name).classList.add('active');
+        event.target.classList.add('active');
+    }}
+    </script>
+    {nav}
     """
-    return HTMLResponse(_miniapp_html(name, content, token))
+    return HTMLResponse(_miniapp_html(name, content, token, body_class="has-nav"))
 
 
 def _render_miniapp_control(group_id: int, setting: dict, current_value: str, token: str) -> str:
