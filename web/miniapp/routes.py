@@ -535,6 +535,491 @@ async def miniapp_shop(request: Request):
     return HTMLResponse(_miniapp_html("Магазин", content, token, body_class="has-nav"))
 
 
+# ─── Admin pages ─────────────────────────────────────────────────────────────
+
+def _admin_check(auth: dict | None, group) -> str | None:
+    """Return error HTML or None if admin access is OK."""
+    if not auth:
+        return "Сессия истекла"
+    if not group:
+        return "Группа не найдена"
+    if group.admin_vk_id != auth["uid"]:
+        return "Нет доступа"
+    return None
+
+
+@router.get("/miniapp/admin/analytics")
+async def miniapp_analytics(request: Request):
+    """Analytics dashboard for admins."""
+    auth = _get_auth(request)
+    token = request.query_params.get("token", request.query_params.get("t", ""))
+    group_id = int(request.query_params.get("gid", auth.get("gid", 0) if auth else 0))
+
+    group = await get_group(group_id) if group_id else None
+    err = _admin_check(auth, group)
+    if err:
+        return _error_page(err)
+
+    from database.service import get_post_analytics, get_top_users, get_pending_suggestions
+
+    posts = await get_post_analytics(group_id, limit=20)
+    top = await get_top_users(group_id, order_by="xp", limit=5)
+    pending = await get_pending_suggestions(group_id, limit=100)
+
+    # Summary stats
+    total_likes = sum(p.likes for p in posts)
+    total_views = sum(p.views for p in posts)
+    total_reposts = sum(p.reposts for p in posts)
+    total_comments = sum(p.comments for p in posts)
+    avg_likes = total_likes // len(posts) if posts else 0
+    avg_views = total_views // len(posts) if posts else 0
+
+    # Post rows
+    posts_html = ""
+    if posts:
+        for p in posts:
+            date = p.published_at.strftime("%d.%m %H:%M") if p.published_at else "—"
+            posts_html += f"""
+            <div class="lb-row">
+                <div style="flex:1;">
+                    <div style="font-size:0.85rem;font-weight:600;">Пост #{p.vk_post_id}</div>
+                    <div style="font-size:0.72rem;color:#888;">{date}</div>
+                </div>
+                <div style="display:flex;gap:10px;font-size:0.8rem;color:#555;">
+                    <span>👍 {p.likes}</span>
+                    <span>🔁 {p.reposts}</span>
+                    <span>💬 {p.comments}</span>
+                    <span>👁 {p.views}</span>
+                </div>
+            </div>
+            """
+    else:
+        posts_html = '<p style="text-align:center;color:#aaa;padding:20px;">Нет данных. Аналитика собирается каждые 6 часов.</p>'
+
+    # Top users mini
+    top_html = ""
+    for i, u in enumerate(top, 1):
+        top_html += f'<div style="display:flex;justify-content:space-between;padding:4px 0;font-size:0.85rem;"><span>{i}. id{u.vk_id}</span><span style="color:#2688EB;font-weight:600;">{u.xp} XP</span></div>'
+
+    nav = _bottom_nav("settings", token, group_id, True)
+
+    content = f"""
+    <a href="/miniapp/group/{group_id}?token={token}" class="back">← Настройки</a>
+    <div class="card" style="background:linear-gradient(135deg,#1976d2,#0d47a1);color:white;">
+        <div class="card-title" style="color:white;">📊 Аналитика</div>
+        <p style="opacity:0.85;font-size:0.8rem;">Последние {len(posts)} постов</p>
+    </div>
+
+    <div class="stat-grid">
+        <div class="stat-item">
+            <div class="stat-value">{total_likes}</div>
+            <div class="stat-label">Лайков</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-value">{total_views}</div>
+            <div class="stat-label">Просмотров</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-value">{total_reposts}</div>
+            <div class="stat-label">Репостов</div>
+        </div>
+        <div class="stat-item">
+            <div class="stat-value">{total_comments}</div>
+            <div class="stat-label">Комментариев</div>
+        </div>
+    </div>
+
+    <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+            <div class="card-title" style="margin:0;">Среднее на пост</div>
+        </div>
+        <div style="display:flex;gap:16px;font-size:0.9rem;">
+            <span>👍 {avg_likes}</span>
+            <span>👁 {avg_views}</span>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-title">📈 Посты</div>
+        <div style="margin:0 -12px;">{posts_html}</div>
+    </div>
+
+    <div class="card">
+        <div class="card-title">🏆 Топ-5 участников</div>
+        {top_html if top_html else '<p style="color:#aaa;font-size:0.85rem;">Нет данных</p>'}
+    </div>
+
+    <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span style="font-size:0.9rem;">📝 Предложений на модерации</span>
+            <span style="font-size:1.2rem;font-weight:700;">{len(pending)}</span>
+        </div>
+        {'<a href="/miniapp/admin/suggestions?token=' + token + '&gid=' + str(group_id) + '" class="btn btn-sm" style="margin-top:8px;display:block;text-align:center;">Открыть предложку</a>' if pending else ''}
+    </div>
+    {nav}
+    """
+    return HTMLResponse(_miniapp_html("Аналитика", content, token, body_class="has-nav"))
+
+
+@router.get("/miniapp/admin/create-post")
+async def miniapp_create_post_page(request: Request):
+    """Create post page — AI generation or manual text."""
+    auth = _get_auth(request)
+    token = request.query_params.get("token", request.query_params.get("t", ""))
+    group_id = int(request.query_params.get("gid", auth.get("gid", 0) if auth else 0))
+
+    group = await get_group(group_id) if group_id else None
+    err = _admin_check(auth, group)
+    if err:
+        return _error_page(err)
+
+    nav = _bottom_nav("settings", token, group_id, True)
+
+    content = f"""
+    <a href="/miniapp/group/{group_id}?token={token}" class="back">← Настройки</a>
+    <div class="card">
+        <div class="card-title">✏️ Создать пост</div>
+
+        <div style="margin-bottom:16px;">
+            <div class="filter-tabs">
+                <button class="filter-tab active" onclick="showPostMode('ai')">🤖 AI-генерация</button>
+                <button class="filter-tab" onclick="showPostMode('manual')">📝 Вручную</button>
+                <button class="filter-tab" onclick="showPostMode('url')">🔗 Из URL</button>
+            </div>
+        </div>
+
+        <div id="mode-ai" class="tab-content active">
+            <label style="font-size:0.85rem;font-weight:500;">Тема поста</label>
+            <input type="text" id="ai-topic" placeholder="Оставьте пустым для случайной темы" style="margin-bottom:10px;">
+            <button class="btn" onclick="generatePost()" id="btn-generate" style="width:100%;">Сгенерировать</button>
+        </div>
+
+        <div id="mode-manual" class="tab-content">
+            <label style="font-size:0.85rem;font-weight:500;">Текст поста</label>
+            <textarea id="manual-text" rows="6" placeholder="Напишите текст поста..."></textarea>
+        </div>
+
+        <div id="mode-url" class="tab-content">
+            <label style="font-size:0.85rem;font-weight:500;">URL источника</label>
+            <input type="text" id="url-source" placeholder="https://..." style="margin-bottom:8px;">
+            <label style="font-size:0.85rem;font-weight:500;">Инструкция (необязательно)</label>
+            <input type="text" id="url-instruction" placeholder="Напиши краткий пересказ..." style="margin-bottom:10px;">
+            <button class="btn" onclick="generateFromUrl()" id="btn-from-url" style="width:100%;">Написать статью</button>
+        </div>
+    </div>
+
+    <div id="preview-card" class="card" style="display:none;">
+        <div class="card-title">👁 Превью</div>
+        <div id="preview-text" style="font-size:0.88rem;line-height:1.6;white-space:pre-wrap;max-height:300px;overflow-y:auto;"></div>
+        <div style="display:flex;gap:8px;margin-top:12px;">
+            <button class="btn" onclick="publishPost()" id="btn-publish" style="flex:1;">Опубликовать</button>
+            <button class="btn" onclick="schedulePost()" style="flex:1;background:#7b1fa2;">Запланировать</button>
+        </div>
+        <div id="schedule-row" style="display:none;margin-top:8px;">
+            <input type="datetime-local" id="schedule-time" style="width:100%;">
+            <button class="btn btn-sm" onclick="confirmSchedule()" style="margin-top:6px;width:100%;">Подтвердить</button>
+        </div>
+    </div>
+
+    <div id="post-status" style="text-align:center;padding:8px;font-size:0.85rem;color:#888;"></div>
+
+    <script>
+    var currentText = '';
+    var currentMode = 'ai';
+
+    function showPostMode(mode) {{
+        currentMode = mode;
+        document.querySelectorAll('#mode-ai,#mode-manual,#mode-url').forEach(function(el){{ el.classList.remove('active'); }});
+        document.getElementById('mode-' + mode).classList.add('active');
+        document.querySelectorAll('.filter-tab').forEach(function(el){{ el.classList.remove('active'); }});
+        event.target.classList.add('active');
+    }}
+
+    function setStatus(msg) {{ document.getElementById('post-status').textContent = msg; }}
+    function showPreview(text) {{
+        currentText = text;
+        document.getElementById('preview-text').textContent = text;
+        document.getElementById('preview-card').style.display = 'block';
+        document.getElementById('preview-card').scrollIntoView({{behavior:'smooth'}});
+    }}
+
+    function generatePost() {{
+        var topic = document.getElementById('ai-topic').value;
+        var btn = document.getElementById('btn-generate');
+        btn.disabled = true; btn.textContent = 'Генерация...';
+        setStatus('ИИ пишет пост...');
+        fetch('/miniapp/admin/api/generate?token={token}&gid={group_id}&topic=' + encodeURIComponent(topic))
+            .then(function(r){{ return r.json(); }})
+            .then(function(data) {{
+                btn.disabled = false; btn.textContent = 'Сгенерировать';
+                if (data.text) {{ showPreview(data.text); setStatus(''); }}
+                else {{ setStatus('Ошибка: ' + (data.error || 'не удалось')); }}
+            }}).catch(function(){{ btn.disabled=false; btn.textContent='Сгенерировать'; setStatus('Ошибка сети'); }});
+    }}
+
+    function generateFromUrl() {{
+        var url = document.getElementById('url-source').value;
+        var instr = document.getElementById('url-instruction').value;
+        if (!url) {{ setStatus('Введите URL'); return; }}
+        var btn = document.getElementById('btn-from-url');
+        btn.disabled = true; btn.textContent = 'Генерация...';
+        setStatus('ИИ пишет статью...');
+        fetch('/miniapp/admin/api/generate-from-url?token={token}&gid={group_id}&url=' + encodeURIComponent(url) + '&instruction=' + encodeURIComponent(instr))
+            .then(function(r){{ return r.json(); }})
+            .then(function(data) {{
+                btn.disabled = false; btn.textContent = 'Написать статью';
+                if (data.text) {{ showPreview(data.text); setStatus(''); }}
+                else {{ setStatus('Ошибка: ' + (data.error || 'не удалось')); }}
+            }}).catch(function(){{ btn.disabled=false; btn.textContent='Написать статью'; setStatus('Ошибка сети'); }});
+    }}
+
+    function publishPost() {{
+        var text = currentMode === 'manual' ? document.getElementById('manual-text').value : currentText;
+        if (!text) {{ setStatus('Нет текста'); return; }}
+        var btn = document.getElementById('btn-publish');
+        btn.disabled = true; btn.textContent = 'Публикация...';
+        fetch('/miniapp/admin/api/publish?token={token}&gid={group_id}', {{
+            method:'POST', headers:{{'Content-Type':'application/json'}},
+            body: JSON.stringify({{text: text}})
+        }}).then(function(r){{ return r.json(); }})
+        .then(function(data) {{
+            btn.disabled=false; btn.textContent='Опубликовать';
+            if (data.ok) {{ showToast('Опубликовано!'); setStatus('Пост #' + data.vk_post_id + ' на стене'); }}
+            else {{ setStatus('Ошибка: ' + (data.error||'?')); }}
+        }}).catch(function(){{ btn.disabled=false; btn.textContent='Опубликовать'; setStatus('Ошибка сети'); }});
+    }}
+
+    function schedulePost() {{
+        document.getElementById('schedule-row').style.display = 'block';
+    }}
+
+    function confirmSchedule() {{
+        var text = currentMode === 'manual' ? document.getElementById('manual-text').value : currentText;
+        var dt = document.getElementById('schedule-time').value;
+        if (!text || !dt) {{ setStatus('Введите текст и время'); return; }}
+        fetch('/miniapp/admin/api/schedule?token={token}&gid={group_id}', {{
+            method:'POST', headers:{{'Content-Type':'application/json'}},
+            body: JSON.stringify({{text: text, scheduled_at: dt}})
+        }}).then(function(r){{ return r.json(); }})
+        .then(function(data) {{
+            if (data.ok) {{ showToast('Запланировано!'); setStatus('Пост запланирован на ' + dt); }}
+            else {{ setStatus('Ошибка: ' + (data.error||'?')); }}
+        }}).catch(function(){{ setStatus('Ошибка сети'); }});
+    }}
+    </script>
+    {nav}
+    """
+    return HTMLResponse(_miniapp_html("Создать пост", content, token, body_class="has-nav"))
+
+
+@router.get("/miniapp/admin/suggestions")
+async def miniapp_suggestions(request: Request):
+    """Suggestions review page."""
+    auth = _get_auth(request)
+    token = request.query_params.get("token", request.query_params.get("t", ""))
+    group_id = int(request.query_params.get("gid", auth.get("gid", 0) if auth else 0))
+
+    group = await get_group(group_id) if group_id else None
+    err = _admin_check(auth, group)
+    if err:
+        return _error_page(err)
+
+    from database.service import get_pending_suggestions
+
+    pending = await get_pending_suggestions(group_id, limit=50)
+    nav = _bottom_nav("settings", token, group_id, True)
+
+    items_html = ""
+    if not pending:
+        items_html = '<p style="text-align:center;color:#aaa;padding:24px;">Нет предложений на модерации</p>'
+    else:
+        for s in pending:
+            date = s.created_at.strftime("%d.%m %H:%M") if s.created_at else ""
+            text_preview = escape(s.text[:200]) + ("..." if len(s.text) > 200 else "")
+            items_html += f"""
+            <div class="card" id="suggestion-{s.id}">
+                <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                    <span style="font-size:0.8rem;color:#888;">от id{s.from_vk_id} · {date}</span>
+                    <span style="font-size:0.8rem;color:#2688EB;">#{s.id}</span>
+                </div>
+                <div style="font-size:0.88rem;line-height:1.5;margin-bottom:10px;white-space:pre-wrap;">{text_preview}</div>
+                <div style="display:flex;gap:8px;">
+                    <button class="btn btn-sm" style="flex:1;" onclick="reviewSuggestion({s.id},'approve')">✓ Принять</button>
+                    <button class="btn btn-sm btn-danger" style="flex:1;" onclick="reviewSuggestion({s.id},'reject')">✕ Отклонить</button>
+                </div>
+            </div>
+            """
+
+    content = f"""
+    <a href="/miniapp/group/{group_id}?token={token}" class="back">← Настройки</a>
+    <div class="card" style="background:linear-gradient(135deg,#ff9800,#f57c00);color:white;">
+        <div class="card-title" style="color:white;">📝 Предложка</div>
+        <p style="opacity:0.85;font-size:0.8rem;">{len(pending)} на модерации</p>
+    </div>
+    {items_html}
+
+    <script>
+    function reviewSuggestion(id, action) {{
+        fetch('/miniapp/admin/api/review-suggestion?token={token}&gid={group_id}', {{
+            method:'POST', headers:{{'Content-Type':'application/json'}},
+            body: JSON.stringify({{suggestion_id: id, action: action}})
+        }}).then(function(r){{ return r.json(); }})
+        .then(function(data) {{
+            if (data.ok) {{
+                showToast(action === 'approve' ? 'Опубликовано!' : 'Отклонено');
+                document.getElementById('suggestion-'+id).style.display='none';
+            }} else {{ showToast('Ошибка: ' + (data.error||'?')); }}
+        }}).catch(function(){{ showToast('Ошибка сети'); }});
+    }}
+    </script>
+    {nav}
+    """
+    return HTMLResponse(_miniapp_html("Предложка", content, token, body_class="has-nav"))
+
+
+# ─── Admin API endpoints ──────────────────────────────────────────────────────
+
+@router.get("/miniapp/admin/api/generate")
+async def api_generate_post(request: Request):
+    """Generate a post via AI."""
+    auth = _get_auth(request)
+    group_id = int(request.query_params.get("gid", 0))
+    group = await get_group(group_id) if group_id else None
+    err = _admin_check(auth, group)
+    if err:
+        return JSONResponse({"error": err}, status_code=403)
+
+    topic = request.query_params.get("topic", "")
+    from core.ai_brain import generate_post
+    try:
+        text = await generate_post(group_id=group_id, topic=topic)
+        return JSONResponse({"text": text})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@router.get("/miniapp/admin/api/generate-from-url")
+async def api_generate_from_url(request: Request):
+    """Generate article from URL."""
+    auth = _get_auth(request)
+    group_id = int(request.query_params.get("gid", 0))
+    group = await get_group(group_id) if group_id else None
+    err = _admin_check(auth, group)
+    if err:
+        return JSONResponse({"error": err}, status_code=403)
+
+    url = request.query_params.get("url", "")
+    instruction = request.query_params.get("instruction", "")
+    if not url:
+        return JSONResponse({"error": "URL не указан"}, status_code=400)
+
+    from core.content_writer import write_from_url
+    try:
+        text = await write_from_url(group_id=group_id, url=url, instruction=instruction)
+        return JSONResponse({"text": text})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@router.post("/miniapp/admin/api/publish")
+async def api_publish_post(request: Request):
+    """Publish post to VK wall."""
+    auth = _get_auth(request)
+    group_id = int(request.query_params.get("gid", 0))
+    group = await get_group(group_id) if group_id else None
+    err = _admin_check(auth, group)
+    if err:
+        return JSONResponse({"error": err}, status_code=403)
+
+    data = await request.json()
+    text = data.get("text", "").strip()
+    if not text:
+        return JSONResponse({"error": "Пустой текст"}, status_code=400)
+
+    from core.crypto import decrypt_token
+    from core.telegram import send_to_telegram
+    from vkbottle import API
+
+    try:
+        token = decrypt_token(group.access_token)
+        api = API(token=token)
+        result = await api.wall.post(owner_id=-group_id, message=text)
+        vk_post_id = result.post_id if result else 0
+        await send_to_telegram(group_id, text, vk_post_id)
+        return JSONResponse({"ok": True, "vk_post_id": vk_post_id})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@router.post("/miniapp/admin/api/schedule")
+async def api_schedule_post(request: Request):
+    """Schedule a post for later."""
+    auth = _get_auth(request)
+    group_id = int(request.query_params.get("gid", 0))
+    group = await get_group(group_id) if group_id else None
+    err = _admin_check(auth, group)
+    if err:
+        return JSONResponse({"error": err}, status_code=403)
+
+    data = await request.json()
+    text = data.get("text", "").strip()
+    scheduled_at_str = data.get("scheduled_at", "")
+    if not text or not scheduled_at_str:
+        return JSONResponse({"error": "Укажите текст и время"}, status_code=400)
+
+    from datetime import datetime, timezone
+    from database.service import create_scheduled_post
+
+    try:
+        scheduled_at = datetime.fromisoformat(scheduled_at_str).replace(tzinfo=timezone.utc)
+        post = await create_scheduled_post(group_id, text, scheduled_at, source="manual")
+        return JSONResponse({"ok": True, "post_id": post.id})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@router.post("/miniapp/admin/api/review-suggestion")
+async def api_review_suggestion(request: Request):
+    """Approve or reject a suggestion."""
+    auth = _get_auth(request)
+    group_id = int(request.query_params.get("gid", 0))
+    group = await get_group(group_id) if group_id else None
+    err = _admin_check(auth, group)
+    if err:
+        return JSONResponse({"error": err}, status_code=403)
+
+    data = await request.json()
+    suggestion_id = data.get("suggestion_id", 0)
+    action = data.get("action", "")
+
+    from database.service import get_suggestion, review_suggestion
+
+    suggestion = await get_suggestion(suggestion_id)
+    if not suggestion or suggestion.group_id != group_id:
+        return JSONResponse({"error": "Не найдено"}, status_code=404)
+
+    if action == "approve":
+        from core.crypto import decrypt_token
+        from core.telegram import send_to_telegram
+        from vkbottle import API
+
+        try:
+            vk_token = decrypt_token(group.access_token)
+            api = API(token=vk_token)
+            result = await api.wall.post(owner_id=-group_id, message=suggestion.text)
+            vk_post_id = result.post_id if result else 0
+            await review_suggestion(suggestion_id, "published", auth["uid"])
+            await send_to_telegram(group_id, suggestion.text, vk_post_id)
+            return JSONResponse({"ok": True, "vk_post_id": vk_post_id})
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+    elif action == "reject":
+        await review_suggestion(suggestion_id, "rejected", auth["uid"])
+        return JSONResponse({"ok": True})
+    else:
+        return JSONResponse({"error": "Неизвестное действие"}, status_code=400)
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 @router.get("/miniapp")
@@ -873,6 +1358,12 @@ async def miniapp_group_settings(request: Request, group_id: int):
     <div class="card" style="background: linear-gradient(135deg, #2688EB, #1f7ad8); color: white;">
         <h2 style="font-size: 1rem; font-weight: 700;">⚙️ {name}</h2>
         <p style="opacity: 0.85; font-size: 0.8rem;">ID: {group_id} · Настройки</p>
+    </div>
+
+    <div style="display:flex;gap:6px;margin-bottom:8px;overflow-x:auto;">
+        <a href="/miniapp/admin/create-post?token={token}&gid={group_id}" class="btn btn-sm" style="white-space:nowrap;">✏️ Создать пост</a>
+        <a href="/miniapp/admin/analytics?token={token}&gid={group_id}" class="btn btn-sm" style="white-space:nowrap;background:#0d47a1;">📊 Аналитика</a>
+        <a href="/miniapp/admin/suggestions?token={token}&gid={group_id}" class="btn btn-sm" style="white-space:nowrap;background:#f57c00;">📝 Предложка</a>
     </div>
 
     <div class="settings-tabs">
