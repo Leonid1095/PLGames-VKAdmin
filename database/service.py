@@ -31,6 +31,11 @@ DEFAULT_SETTINGS = {
     "content_parse_interval_hours": ("4", "Интервал парсинга контента в часах"),
     "autoplan_enabled": ("false", "Авто-генерация контент-плана: true / false"),
     "autoplan_times": ("09:00,13:00,18:00", "Времена публикаций для контент-плана (через запятую)"),
+    "banned_words": ("", "Запрещённые слова для авто-удаления (через запятую)"),
+    "xp_per_like": ("2", "XP за лайк"),
+    "xp_per_repost": ("5", "XP за репост"),
+    "xp_cooldown_sec": ("60", "Cooldown между начислением XP (секунды)"),
+    "image_search_enabled": ("true", "Искать тематические картинки для постов: true / false"),
 }
 
 # ─── Group CRUD ──────────────────────────────────────────────────────────────
@@ -231,6 +236,8 @@ async def get_user_stats(group_id: int, vk_id: int) -> UserStatsDTO:
 
 
 async def check_and_increment_limit(group_id: int, vk_id: int) -> bool:
+    from sqlalchemy import case
+
     async with async_session() as session:
         result = await session.execute(
             select(UserStats).where(
@@ -241,19 +248,34 @@ async def check_and_increment_limit(group_id: int, vk_id: int) -> bool:
         if not stats:
             stats = UserStats(group_id=group_id, vk_id=vk_id)
             session.add(stats)
+            await session.commit()
 
         now = datetime.now(timezone.utc)
-        if not stats.last_request_date or stats.last_request_date.date() < now.date():
-            stats.daily_requests = 0
-
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         max_daily = 1000000 if stats.is_vip else 10
-        if stats.daily_requests >= max_daily:
-            return False
 
-        stats.daily_requests += 1
-        stats.last_request_date = now
+        # Effective counter: reset to 0 if last request was before today
+        effective_count = case(
+            (UserStats.last_request_date == None, 0),
+            (UserStats.last_request_date < today_start, 0),
+            else_=UserStats.daily_requests,
+        )
+
+        # Atomic UPDATE: increment only if under limit
+        result = await session.execute(
+            update(UserStats)
+            .where(
+                UserStats.group_id == group_id,
+                UserStats.vk_id == vk_id,
+                effective_count < max_daily,
+            )
+            .values(
+                daily_requests=effective_count + 1,
+                last_request_date=now,
+            )
+        )
         await session.commit()
-        return True
+        return result.rowcount > 0
 
 
 async def grant_vip(group_id: int, vk_id: int, days: int) -> None:

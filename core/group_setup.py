@@ -46,9 +46,11 @@ async def setup_group_ai(group_id: int, access_token: str) -> bool:
 
 async def _fetch_group_info(group_id: int, token: str) -> dict | None:
     """Fetch extended group info from VK API."""
+    from core.http_retry import http_request_with_retry
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
+            resp = await http_request_with_retry(
+                client, "GET",
                 "https://api.vk.com/method/groups.getById",
                 params={
                     "group_id": group_id,
@@ -70,9 +72,11 @@ async def _fetch_group_info(group_id: int, token: str) -> dict | None:
 
 async def _fetch_recent_posts(group_id: int, token: str, count: int = 10) -> list[str]:
     """Fetch recent wall posts text for tone/topic analysis."""
+    from core.http_retry import http_request_with_retry
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
+            resp = await http_request_with_retry(
+                client, "GET",
                 "https://api.vk.com/method/wall.get",
                 params={
                     "owner_id": -group_id,

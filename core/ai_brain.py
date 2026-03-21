@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import datetime, timezone
 from openai import AsyncOpenAI
@@ -25,22 +26,28 @@ async def _call_llm(messages: list[dict], model: str = None, group_id: int = Non
         else:
             model = settings.DEFAULT_MODEL
     client = _get_client()
-    try:
-        response = await client.chat.completions.create(
-            model=model,
-            messages=messages,
-            extra_headers={
-                "HTTP-Referer": "https://github.com/vk-ai-admin",
-                "X-Title": "VK AI Admin Bot",
-            }
-        )
-        content = response.choices[0].message.content
-        if content is None:
-            return "ИИ вернул пустой ответ."
-        return content
-    except Exception as e:
-        logger.error(f"AI provider error: {e}")
-        return "Извините, произошла ошибка при обращении к ИИ. Попробуйте позже."
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                extra_headers={
+                    "HTTP-Referer": "https://github.com/vk-ai-admin",
+                    "X-Title": "VK AI Admin Bot",
+                }
+            )
+            content = response.choices[0].message.content
+            if content is None:
+                return "ИИ вернул пустой ответ."
+            return content
+        except Exception as e:
+            logger.warning(f"AI provider error (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 ** attempt)
+            else:
+                logger.error(f"AI provider failed after {max_retries} attempts: {e}")
+                return "Извините, произошла ошибка при обращении к ИИ. Попробуйте позже."
 
 # ─── Group context helper ────────────────────────────────────────────────────
 
@@ -185,12 +192,16 @@ async def generate_post(group_id: int, topic: str = "") -> str:
         "Напиши пост для стены. Можно использовать эмодзи. Без хэштегов. "
         "Пиши грамотным русским языком, каждое предложение должно нести смысл. "
         "Пиши 10-15 предложений, раскрой тему с конкретикой и фактами. "
-        "Не лей воду, не повторяйся."
+        "Не лей воду, не повторяйся. "
+        "ВАЖНО: каждый пост должен быть УНИКАЛЬНЫМ. Не используй шаблонные вступления вроде "
+        "'Друзья!', 'Сегодня поговорим о...', 'Привет, подписчики!'. "
+        "Начинай сразу с сути — с интересного факта, вопроса или утверждения."
     )
     return await generate_response(
-        prompt=f"Напиши содержательный пост на тему: {topics}. "
-               "Включи конкретные факты, примеры или советы. "
-               "Не пиши общие фразы — давай полезную информацию.",
+        prompt=f"Напиши содержательный и УНИКАЛЬНЫЙ пост на тему: {topics}. "
+               "Включи конкретные факты, примеры или практические советы. "
+               "Не пиши общие фразы — давай полезную информацию. "
+               "Придумай нестандартный заход — не начинай с приветствия.",
         system_prompt=system_prompt,
         group_id=group_id,
     )

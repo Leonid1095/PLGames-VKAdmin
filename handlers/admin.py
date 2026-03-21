@@ -92,7 +92,16 @@ async def cmd_post(ctx, from_id, parts, peer_id) -> str:
     topic = parts[1] if len(parts) > 1 else ""
     post_text = await generate_post(group_id=ctx.group_id, topic=topic)
     try:
-        result = await ctx.api.wall.post(owner_id=-ctx.group_id, message=post_text)
+        post_kwargs = {"owner_id": -ctx.group_id, "message": post_text}
+        # Attach a thematic image
+        try:
+            from core.images import find_and_upload_image
+            attachment = await find_and_upload_image(ctx.api, ctx.group_id, post_text=post_text)
+            if attachment:
+                post_kwargs["attachments"] = attachment
+        except Exception:
+            pass
+        result = await ctx.api.wall.post(**post_kwargs)
         vk_post_id = result.post_id if result else 0
         await send_to_telegram(ctx.group_id, post_text, vk_post_id)
         return f"Пост опубликован!\n\n{post_text}"
@@ -499,7 +508,16 @@ async def cmd_article(ctx, from_id, parts, peer_id) -> str:
         return text
 
     try:
-        result = await ctx.api.wall.post(owner_id=-ctx.group_id, message=text)
+        post_kwargs = {"owner_id": -ctx.group_id, "message": text}
+        # Attach a thematic image
+        try:
+            from core.images import find_and_upload_image
+            attachment = await find_and_upload_image(ctx.api, ctx.group_id, post_text=text)
+            if attachment:
+                post_kwargs["attachments"] = attachment
+        except Exception:
+            pass
+        result = await ctx.api.wall.post(**post_kwargs)
         vk_post_id = result.post_id if result else 0
         await send_to_telegram(ctx.group_id, text, vk_post_id)
         return f"Статья опубликована!\n\n{text[:500]}..."
@@ -573,7 +591,7 @@ async def cmd_patch_notes(ctx, from_id, parts, peer_id) -> str:
         post_kwargs = {"owner_id": -ctx.group_id, "message": text}
         try:
             from core.images import find_and_upload_image
-            attachment = await find_and_upload_image(ctx.api, ctx.group_id, post_type="patch_notes")
+            attachment = await find_and_upload_image(ctx.api, ctx.group_id, query="software update", post_text=text)
             if attachment:
                 post_kwargs["attachments"] = attachment
         except Exception:
@@ -749,10 +767,10 @@ async def cmd_widget(ctx, from_id, parts, peer_id) -> str:
             "/настройка widget_enabled true"
         )
 
-    ok = await update_widget_for_group(ctx.group_id)
-    if ok:
-        return "Виджет топ-участников обновлён!"
-    return "Не удалось обновить виджет. Проверьте логи и права токена."
+    success, message = await update_widget_for_group(ctx.group_id)
+    if success:
+        return f"Виджет топ-участников обновлён! {message}"
+    return f"Не удалось обновить виджет: {message}"
 
 
 # ─── Command dispatch table ──────────────────────────────────────────────────

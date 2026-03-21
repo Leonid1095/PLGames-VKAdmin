@@ -1,48 +1,107 @@
-"""Image helpers — find relevant images and upload to VK."""
+"""Image helpers — find relevant images and upload to VK.
+
+Image sourcing priority:
+1. Image from source content (RSS/VK/API) — passed directly as bytes
+2. Pexels keyword search (free API, 200 req/hr) — thematic images
+3. No image — post goes without attachment (better than random/placeholder)
+"""
 
 import io
 import logging
+import random
+
 import httpx
+
+from core.config import settings
 
 logger = logging.getLogger(__name__)
 
 
-_COVER_STYLES = {
-    "patch_notes": {"bg": "1976d2", "fg": "ffffff", "icon": "🚀", "label": "Обновление"},
-    "article": {"bg": "2e7d32", "fg": "ffffff", "icon": "📝", "label": "Статья"},
-    "digest": {"bg": "7b1fa2", "fg": "ffffff", "icon": "📰", "label": "Дайджест"},
-    "default": {"bg": "455a64", "fg": "ffffff", "icon": "📌", "label": "Новый пост"},
-}
-
-
-async def find_and_download_image(query: str, post_type: str = "default") -> bytes | None:
+async def search_image(query: str) -> bytes | None:
     """
-    Generate a cover image for a post.
-    Uses placehold.co to create a branded cover with text.
+    Search for a thematic image by keywords.
+    Uses Pexels API (free, 200 requests/hour).
     Returns image bytes or None.
     """
-    from urllib.parse import quote
+    if not settings.PEXELS_API_KEY:
+        return None
 
-    style = _COVER_STYLES.get(post_type, _COVER_STYLES["default"])
-    text = f"{style['icon']}  {style['label']}"
-    encoded_text = quote(text)
+    return await _search_pexels(query)
 
-    url = f"https://placehold.co/800x400/{style['bg']}/{style['fg']}.jpg?text={encoded_text}&font=roboto"
 
+async def _search_pexels(query: str) -> bytes | None:
+    """Search Pexels for a photo matching the query."""
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            # Search for photos
+            resp = await client.get(
+                "https://api.pexels.com/v1/search",
+                params={
+                    "query": query,
+                    "per_page": 15,
+                    "orientation": "landscape",
+                    "size": "medium",
+                },
+                headers={"Authorization": settings.PEXELS_API_KEY},
+            )
+            if resp.status_code != 200:
+                logger.warning(f"Pexels search failed: HTTP {resp.status_code}")
+                return None
+
+            data = resp.json()
+            photos = data.get("photos", [])
+            if not photos:
+                logger.info(f"Pexels: no results for '{query}'")
+                return None
+
+            # Pick a random photo from results
+            photo = random.choice(photos)
+            image_url = photo.get("src", {}).get("large", "")
+            if not image_url:
+                return None
+
+            # Download the image
+            img_resp = await client.get(image_url)
+            if img_resp.status_code == 200 and len(img_resp.content) > 5000:
+                logger.info(f"Pexels image fetched for '{query}': {len(img_resp.content)} bytes")
+                return img_resp.content
+
+    except Exception as e:
+        logger.warning(f"Pexels search failed for '{query}': {e}")
+    return None
+
+
+async def extract_topic_keywords(post_text: str) -> str:
+    """
+    Extract 2-3 keyword topic from post text for image search.
+    Simple heuristic: take first meaningful words from post.
+    """
+    # Remove emoji and special chars
+    import re
+    clean = re.sub(r'[^\w\s]', '', post_text)
+    words = [w for w in clean.split() if len(w) > 3]
+    # Take 2-3 keywords from the beginning (topic is usually there)
+    keywords = words[:3]
+    return " ".join(keywords) if keywords else ""
+
+
+async def download_image_from_url(url: str) -> bytes | None:
+    """Download an image from URL. Returns bytes or None."""
+    if not url:
+        return None
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             resp = await client.get(url, headers={
                 "User-Agent": "Mozilla/5.0 (compatible; VKAdminBot/1.0)",
             })
             if resp.status_code == 200 and len(resp.content) > 1000:
-                logger.info(f"Cover image generated: {len(resp.content)} bytes ({post_type})")
-                return resp.content
-
-        logger.warning(f"Cover generation failed: HTTP {resp.status_code}")
-        return None
+                content_type = resp.headers.get("content-type", "")
+                ext = url.split("?")[0].split(".")[-1].lower()
+                if "image" in content_type or ext in ("jpg", "jpeg", "png", "webp", "gif"):
+                    return resp.content
     except Exception as e:
-        logger.warning(f"Cover generation failed: {e}")
-        return None
+        logger.warning(f"Image download failed {url}: {e}")
+    return None
 
 
 async def upload_photo_to_vk(api, group_id: int, image_bytes: bytes) -> str | None:
@@ -87,12 +146,35 @@ async def upload_photo_to_vk(api, group_id: int, image_bytes: bytes) -> str | No
         return None
 
 
-async def find_and_upload_image(api, group_id: int, query: str = "", post_type: str = "default") -> str | None:
+async def find_and_upload_image(
+    api,
+    group_id: int,
+    query: str = "",
+    post_type: str = "default",
+    post_text: str = "",
+) -> str | None:
     """
-    Generate a cover image, upload to VK.
+    Find a thematic image and upload to VK.
     Returns VK attachment string or None.
+
+    Priority:
+    1. Pexels search by query/post_text keywords
+    2. None (no image is better than a random/ugly placeholder)
     """
-    image_bytes = await find_and_download_image(query, post_type)
+    # Check if image search is enabled for this group
+    from database.service import get_setting
+    enabled = (await get_setting(group_id, "image_search_enabled", "true")).lower()
+    if enabled != "true":
+        return None
+
+    # Build search query
+    search_query = query
+    if not search_query and post_text:
+        search_query = await extract_topic_keywords(post_text)
+    if not search_query:
+        return None
+
+    image_bytes = await search_image(search_query)
     if not image_bytes:
         return None
 

@@ -77,11 +77,11 @@ def verify_vk_launch_params(query_params: dict) -> VKLaunchParams | None:
 
 
 def create_miniapp_token(vk_user_id: int, vk_group_id: int = 0) -> str:
-    """Create a signed JWT-like token for Mini App session (1 hour)."""
+    """Create a signed JWT-like token for Mini App session (24 hours)."""
     payload = {
         "uid": vk_user_id,
         "gid": vk_group_id,
-        "exp": int(time.time()) + 3600,
+        "exp": int(time.time()) + 86400,
     }
     data = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
     sig = hmac.new(

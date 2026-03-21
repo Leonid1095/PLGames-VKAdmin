@@ -58,6 +58,8 @@ async def _migrate_legacy_group():
 async def lifespan(app: FastAPI):
     """Startup and shutdown logic."""
     logger.info("Starting VKAdmin...")
+    from core.config import validate_critical_settings
+    validate_critical_settings()
     await init_db()
     await _migrate_legacy_group()
     await start_scheduler()

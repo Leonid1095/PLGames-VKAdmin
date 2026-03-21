@@ -6,6 +6,7 @@ from html import escape
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
+from core.config import settings
 from core.vk_auth import verify_vk_launch_params, create_miniapp_token, verify_miniapp_token
 from database.service import (
     get_group, get_groups_by_admin, get_setting, set_setting,
@@ -32,8 +33,19 @@ def _get_auth(request: Request) -> dict | None:
 
 
 def _error_page(msg: str) -> HTMLResponse:
+    reopen = ""
+    if "истекла" in msg.lower() or "сессия" in msg.lower():
+        reopen = """
+        <div style="text-align:center;margin-top:12px;">
+            <button class="btn" onclick="window.location.reload()">Обновить страницу</button>
+        </div>
+        """
     return HTMLResponse(_miniapp_html("Ошибка", f"""
-        <div class="card"><p style="color:#d32f2f;">{msg}</p></div>
+        <div class="card" style="text-align:center;padding:24px;">
+            <div style="font-size:2rem;margin-bottom:8px;">⚠️</div>
+            <p style="color:#d32f2f;font-size:0.95rem;">{msg}</p>
+            {reopen}
+        </div>
     """, ""), status_code=403)
 
 
@@ -43,24 +55,19 @@ def _miniapp_html(title: str, content: str, token: str, body_class: str = "") ->
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
-<script src="https://unpkg.com/@vkontakte/vk-bridge@2/dist/browser.min.js"></script>
+<script src="https://unpkg.com/@vkontakte/vk-bridge/dist/browser.min.js"></script>
 <script>
 (function() {{
+    var attempts = 0;
     function initBridge() {{
+        attempts++;
         if (typeof vkBridge !== 'undefined') {{
-            vkBridge.send('VKWebAppInit')
-                .then(function() {{ console.log('VK Bridge initialized'); }})
-                .catch(function(e) {{ console.warn('VK Bridge init error:', e); }});
-        }} else {{
-            console.warn('vkBridge not loaded, retrying...');
-            setTimeout(initBridge, 100);
+            vkBridge.send('VKWebAppInit').catch(function() {{}});
+        }} else if (attempts < 30) {{
+            setTimeout(initBridge, 200);
         }}
     }}
-    if (document.readyState === 'loading') {{
-        document.addEventListener('DOMContentLoaded', initBridge);
-    }} else {{
-        initBridge();
-    }}
+    initBridge();
 }})();
 </script>
 <style>
@@ -1637,46 +1644,68 @@ async def miniapp_group_settings(request: Request, group_id: int):
     <script>
     function installWidget() {{
         var statusEl = document.getElementById('widget-status');
-        statusEl.textContent = 'Подготовка виджета...';
+        statusEl.textContent = 'Запрос прав на виджет...';
 
-        // 1. Get widget code from server
-        fetch('/miniapp/group/{group_id}/widget/code?token={token}')
-            .then(function(r) {{ return r.json(); }})
-            .then(function(data) {{
-                if (data.error) {{
-                    statusEl.textContent = 'Ошибка: ' + data.error;
-                    return;
-                }}
-                // 2. Show VK widget preview dialog
-                statusEl.textContent = 'Открытие диалога VK...';
-                return vkBridge.send('VKWebAppShowCommunityWidgetPreviewBox', {{
-                    group_id: {group_id},
-                    type: 'table',
-                    code: data.code
-                }});
-            }})
-            .then(function(result) {{
-                if (result) {{
-                    statusEl.innerHTML = '<span style="color:#2e7d32;">✓ Виджет установлен!</span>';
-                    // Enable widget in settings
-                    var fd = new FormData();
-                    fd.append('key', 'widget_enabled');
-                    fd.append('value', 'true');
-                    fetch('/miniapp/group/{group_id}/settings?token={token}', {{
-                        method: 'POST', body: fd,
-                        headers: {{'X-Requested-With': 'XMLHttpRequest'}}
-                    }});
-                    showToast('Виджет установлен!');
-                }}
-            }})
-            .catch(function(e) {{
-                console.error('Widget install error:', e);
-                if (e && e.error_data && e.error_data.error_code === 4) {{
-                    statusEl.textContent = 'Отменено пользователем';
-                }} else {{
-                    statusEl.textContent = 'Ошибка: ' + (e.error_data ? e.error_data.error_reason : (e.message || 'неизвестная'));
-                }}
+        // 1. Get widget token with app_widget scope via VK Bridge
+        vkBridge.send('VKWebAppGetCommunityToken', {{
+            app_id: {settings.VK_MINIAPP_ID or 0},
+            group_id: {group_id},
+            scope: 'app_widget'
+        }})
+        .then(function(tokenResult) {{
+            var widgetToken = tokenResult.access_token;
+            statusEl.textContent = 'Сохранение токена...';
+
+            // 2. Save widget token on server
+            var fd = new FormData();
+            fd.append('widget_token', widgetToken);
+            return fetch('/miniapp/group/{group_id}/widget/save-token?token={token}', {{
+                method: 'POST', body: fd,
+                headers: {{'X-Requested-With': 'XMLHttpRequest'}}
+            }}).then(function(r) {{ return r.json(); }});
+        }})
+        .then(function(saveResult) {{
+            statusEl.textContent = 'Подготовка виджета...';
+
+            // 3. Get widget code from server
+            return fetch('/miniapp/group/{group_id}/widget/code?token={token}')
+                .then(function(r) {{ return r.json(); }});
+        }})
+        .then(function(data) {{
+            if (data.error) {{
+                statusEl.textContent = 'Ошибка: ' + data.error;
+                return;
+            }}
+            // 4. Show VK widget preview dialog
+            statusEl.textContent = 'Открытие диалога VK...';
+            return vkBridge.send('VKWebAppShowCommunityWidgetPreviewBox', {{
+                group_id: {group_id},
+                type: 'table',
+                code: data.code
             }});
+        }})
+        .then(function(result) {{
+            if (result) {{
+                statusEl.innerHTML = '<span style="color:#2e7d32;">✓ Виджет установлен!</span>';
+                // Enable widget in settings
+                var fd = new FormData();
+                fd.append('key', 'widget_enabled');
+                fd.append('value', 'true');
+                fetch('/miniapp/group/{group_id}/settings?token={token}', {{
+                    method: 'POST', body: fd,
+                    headers: {{'X-Requested-With': 'XMLHttpRequest'}}
+                }});
+                showToast('Виджет установлен!');
+            }}
+        }})
+        .catch(function(e) {{
+            console.error('Widget install error:', e);
+            if (e && e.error_data && e.error_data.error_code === 4) {{
+                statusEl.textContent = 'Отменено пользователем';
+            }} else {{
+                statusEl.textContent = 'Ошибка: ' + (e.error_data ? e.error_data.error_reason : (e.message || 'неизвестная'));
+            }}
+        }});
     }}
 
     function refreshWidget() {{
@@ -1686,10 +1715,10 @@ async def miniapp_group_settings(request: Request, group_id: int):
             .then(function(r) {{ return r.json(); }})
             .then(function(data) {{
                 if (data.ok) {{
-                    statusEl.innerHTML = '<span style="color:#2e7d32;">✓ Виджет обновлён (' + data.users + ' участников)</span>';
+                    statusEl.innerHTML = '<span style="color:#2e7d32;">✓ ' + (data.message || 'Виджет обновлён') + '</span>';
                     showToast('Виджет обновлён!');
                 }} else {{
-                    statusEl.textContent = 'Ошибка: ' + (data.error || 'не удалось обновить');
+                    statusEl.innerHTML = '<span style="color:#c62828;">' + (data.error || 'Не удалось обновить') + '</span>';
                 }}
             }})
             .catch(function() {{ statusEl.textContent = 'Ошибка сети'; }});
@@ -1955,6 +1984,27 @@ async def miniapp_delete_source(request: Request, group_id: int):
 
 # ─── Widget API ────────────────────────────────────────────────────────────
 
+@router.post("/miniapp/group/{group_id}/widget/save-token")
+async def miniapp_widget_save_token(request: Request, group_id: int):
+    """Save the widget token (app_widget scope) obtained via VKWebAppGetCommunityToken."""
+    auth = _get_auth(request)
+    if not auth:
+        return JSONResponse({"error": "Сессия истекла"}, status_code=401)
+
+    group = await get_group(group_id)
+    if not group or group.admin_vk_id != auth["uid"]:
+        return JSONResponse({"error": "Нет доступа"}, status_code=403)
+
+    form = await request.form()
+    widget_token = str(form.get("widget_token", "")).strip()
+    if not widget_token:
+        return JSONResponse({"error": "Токен не передан"}, status_code=400)
+
+    await set_setting(group_id, "widget_token", widget_token)
+    logger.info(f"Widget token saved for group {group_id}")
+    return JSONResponse({"ok": True})
+
+
 @router.get("/miniapp/group/{group_id}/widget/code")
 async def miniapp_widget_code(request: Request, group_id: int):
     """Return VKScript code for the widget preview dialog."""
@@ -2002,9 +2052,11 @@ async def miniapp_widget_code(request: Request, group_id: int):
             "name": names.get(u.vk_id, f"id{u.vk_id}"),
             "level": u.level,
             "xp": u.xp,
+            "messages": u.messages_count,
+            "reputation": u.reputation,
         })
 
-    code = _build_table_widget_code(rows)
+    code = _build_table_widget_code(rows, sort_by=widget_sort)
     return JSONResponse({"code": code})
 
 
@@ -2022,12 +2074,9 @@ async def miniapp_widget_refresh(request: Request, group_id: int):
     await set_setting(group_id, "widget_enabled", "true")
 
     from core.widgets import update_widget_for_group
-    success = await update_widget_for_group(group_id)
+    success, message = await update_widget_for_group(group_id)
 
     if success:
-        from database.service import get_top_users
-        widget_count = int(await get_setting(group_id, "widget_top_count", "10"))
-        top = await get_top_users(group_id, limit=widget_count)
-        return JSONResponse({"ok": True, "users": len(top)})
+        return JSONResponse({"ok": True, "message": message})
 
-    return JSONResponse({"ok": False, "error": "Нет данных об участниках или ошибка VK API"})
+    return JSONResponse({"ok": False, "error": message})

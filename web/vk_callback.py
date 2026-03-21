@@ -108,14 +108,34 @@ async def _process_group_join(ctx: GroupContext, obj: dict):
     if not welcome_msg and not use_ai:
         return
 
+    # Resolve user name for placeholders and AI
+    try:
+        users = await ctx.api.users.get(user_ids=[user_id])
+        first_name = users[0].first_name if users else "друг"
+        last_name = users[0].last_name if users else ""
+    except Exception:
+        first_name = "друг"
+        last_name = ""
+
+    # Support placeholders in static welcome message
+    if welcome_msg and not use_ai:
+        try:
+            members_resp = await ctx.api.groups.get_members(group_id=ctx.group_id, count=0)
+            member_count = str(members_resp.count) if members_resp else "?"
+        except Exception:
+            member_count = "?"
+        welcome_msg = (
+            welcome_msg
+            .replace("{name}", first_name)
+            .replace("{username}", first_name)
+            .replace("{first_name}", first_name)
+            .replace("{last_name}", last_name)
+            .replace("{member_count}", member_count)
+        )
+
     if use_ai:
         from core.ai_brain import generate_response
-        try:
-            # Get user name for personalized greeting
-            users = await ctx.api.users.get(user_ids=[user_id])
-            name = users[0].first_name if users else "друг"
-        except Exception:
-            name = "друг"
+        name = first_name
 
         # Use group-aware prompt for welcome
         from core.ai_brain import _get_group_ai_context

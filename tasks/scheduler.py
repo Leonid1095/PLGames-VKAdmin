@@ -200,7 +200,7 @@ async def _content_tasks_job():
                     if group:
                         token = decrypt_token(group.access_token)
                         api = API(token=token)
-                        attachment = await find_and_upload_image(api, task.group_id, post_type=task.task_type) or ""
+                        attachment = await find_and_upload_image(api, task.group_id, post_text=text) or ""
                 except Exception as img_err:
                     logger.warning(f"Image upload failed for task #{task.id}: {img_err}")
 

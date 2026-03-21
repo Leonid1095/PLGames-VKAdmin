@@ -1,9 +1,15 @@
 import logging
+import time
 from core.ai_brain import analyze_toxicity, generate_response
 from core.group_context import GroupContext
 from database.service import get_setting, add_xp, add_warning, clear_warnings, modify_reputation
 
 logger = logging.getLogger(__name__)
+
+# XP cooldown: prevent XP farming via comment spam
+# Key: (group_id, user_id) -> last_xp_time (monotonic)
+_xp_cooldowns: dict[tuple[int, int], float] = {}
+_XP_COOLDOWN_SEC = 60  # 1 XP award per 60 seconds per user
 
 
 async def handle_wall_comment(ctx: GroupContext, event_object: dict) -> None:
@@ -47,8 +53,17 @@ async def handle_wall_comment(ctx: GroupContext, event_object: dict) -> None:
                 logger.warning(f"Failed to reply about rep-: {e}")
             return
 
-    # ── Moderation & Strikes ──
-    is_toxic = await analyze_toxicity(ctx.group_id, stripped)
+    # ── Moderation: keyword pre-filter + AI ──
+    # Quick keyword check before expensive AI call
+    banned_words_str = await get_setting(ctx.group_id, "banned_words", "")
+    is_toxic = False
+    if banned_words_str:
+        banned_words = [w.strip().lower() for w in banned_words_str.split(",") if w.strip()]
+        text_lower = stripped.lower()
+        if any(bw in text_lower for bw in banned_words):
+            is_toxic = True
+    if not is_toxic:
+        is_toxic = await analyze_toxicity(ctx.group_id, stripped)
     if is_toxic:
         logger.info(f"[MODERATE] Deleting comment {comment_id} from {from_id}")
         try:
@@ -72,9 +87,23 @@ async def handle_wall_comment(ctx: GroupContext, event_object: dict) -> None:
             logger.error(f"Failed to issue warning/ban for {from_id}: {e}")
         return
 
-    # ── Gamification: Award XP ──
-    xp_gained = min(5, max(1, len(stripped) // 20))
-    new_level, leveled_up = await add_xp(ctx.group_id, from_id, xp_gained)
+    # ── Gamification: Award XP (with cooldown) ──
+    cooldown_sec = int(await get_setting(ctx.group_id, "xp_cooldown_sec", "60"))
+    cooldown_key = (ctx.group_id, from_id)
+    now = time.monotonic()
+    last_xp = _xp_cooldowns.get(cooldown_key, 0)
+    if cooldown_sec > 0 and now - last_xp < cooldown_sec:
+        # Cooldown active — no XP, but still process AI reply below
+        leveled_up = False
+        new_level = 0
+    else:
+        _xp_cooldowns[cooldown_key] = now
+        xp_gained = min(5, max(1, len(stripped) // 20))
+        new_level, leveled_up = await add_xp(ctx.group_id, from_id, xp_gained)
+        # Cleanup old entries periodically
+        if len(_xp_cooldowns) > 5000:
+            cutoff = now - _XP_COOLDOWN_SEC * 2
+            _xp_cooldowns.clear()  # simple cleanup
 
     if leveled_up:
         try:

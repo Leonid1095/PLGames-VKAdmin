@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     JWT_SECRET: str = "change-me-to-random-secret"
     API_KEY: str = ""  # API key for public API endpoints
 
+    # Image search (free, 200 req/hr)
+    PEXELS_API_KEY: str = ""
+
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )
@@ -41,11 +44,17 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-# Validate critical settings at import time
-if not settings.ENCRYPTION_KEY:
-    import warnings
-    warnings.warn(
-        "ENCRYPTION_KEY is not set! Token encryption will fail. "
-        "Generate one with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\"",
-        stacklevel=1,
-    )
+
+def validate_critical_settings() -> None:
+    """Validate that critical settings are present. Called during startup."""
+    if not settings.ENCRYPTION_KEY:
+        raise RuntimeError(
+            "ENCRYPTION_KEY is not set! Token encryption will fail.\n"
+            "Generate one with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+        )
+    if settings.JWT_SECRET == "change-me-to-random-secret":
+        import warnings
+        warnings.warn(
+            "JWT_SECRET is set to the default value. Change it to a random secret.",
+            stacklevel=2,
+        )

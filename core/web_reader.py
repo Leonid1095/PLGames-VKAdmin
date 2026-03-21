@@ -48,12 +48,12 @@ async def _read_webpage(url: str) -> str:
             })
             resp.raise_for_status()
 
-        html = resp.text
+        raw_html = resp.text
 
         # Remove script/style tags
-        html = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", "", html, flags=re.DOTALL | re.IGNORECASE)
+        raw_html = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", "", raw_html, flags=re.DOTALL | re.IGNORECASE)
         # Remove HTML tags
-        text = re.sub(r"<[^>]+>", " ", html)
+        text = re.sub(r"<[^>]+>", " ", raw_html)
         # Clean up whitespace
         text = re.sub(r"\s+", " ", text).strip()
         # Decode HTML entities

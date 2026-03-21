@@ -60,18 +60,17 @@ async def send_to_telegram(
                 "disable_web_page_preview": False,
             })
 
-        data = resp.json()
-        if data.get("ok"):
-            logger.info(f"Telegram: sent to {chat_id} for group {group_id}")
-            return True
-        else:
+            data = resp.json()
+            if data.get("ok"):
+                logger.info(f"Telegram: sent to {chat_id} for group {group_id}")
+                return True
+
             # Retry without HTML parse mode (in case text has unescaped HTML)
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.post(url, json={
-                    "chat_id": chat_id,
-                    "text": message,
-                    "disable_web_page_preview": False,
-                })
+            resp = await client.post(url, json={
+                "chat_id": chat_id,
+                "text": message,
+                "disable_web_page_preview": False,
+            })
             data = resp.json()
             if data.get("ok"):
                 logger.info(f"Telegram: sent to {chat_id} (no HTML) for group {group_id}")
