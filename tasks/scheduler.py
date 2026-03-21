@@ -1,7 +1,7 @@
 """Scheduler — all periodic background jobs."""
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from vkbottle import API
@@ -25,9 +25,10 @@ scheduler = AsyncIOScheduler()
 async def _autopost_job():
     """
     Auto-posting: fetch content from group sources, then write a real post.
-    Never generates from nothing — always uses source material.
+    If no new source content — generate a themed post (max once per 24h).
     """
-    from database.service import get_content_sources
+    import random
+    from database.service import get_content_sources, create_scheduled_post
 
     groups = await get_all_active_groups()
 
@@ -49,21 +50,71 @@ async def _autopost_job():
                 except ValueError:
                     pass
 
-            # Check if group has content sources
+            # Try to fetch content from sources first
             sources = await get_content_sources(group.group_id)
-            if not sources:
-                logger.info(f"Auto-post: group {group.group_id} has no content sources, skipping")
-                continue
-
-            # Fetch real content from sources and schedule post
-            logger.info(f"Auto-post: fetching sources for group {group.group_id}...")
-            count = await fetch_and_schedule(group.group_id)
+            count = 0
+            if sources:
+                logger.info(f"Auto-post: fetching sources for group {group.group_id}...")
+                count = await fetch_and_schedule(group.group_id)
 
             if count > 0:
                 await set_setting(group.group_id, "_last_autopost", datetime.now(timezone.utc).isoformat())
                 logger.info(f"Auto-post: scheduled {count} posts for group {group.group_id}")
-            else:
-                logger.info(f"Auto-post: no new content from sources for group {group.group_id}")
+                continue
+
+            # No new source content — generate themed post (max once per 24h)
+            last_gen_str = await get_setting(group.group_id, "_last_generated_post", "")
+            if last_gen_str:
+                try:
+                    last_gen_time = datetime.fromisoformat(last_gen_str)
+                    gen_elapsed = (datetime.now(timezone.utc) - last_gen_time).total_seconds() / 3600
+                    if gen_elapsed < 24:
+                        logger.info(f"Auto-post: no new content and generated post <24h ago, skipping group {group.group_id}")
+                        continue
+                except ValueError:
+                    pass
+
+            # Pick a random topic from group's content topics
+            topics_str = await get_setting(group.group_id, "ai_content_topics", "")
+            if not topics_str:
+                topics_str = await get_setting(group.group_id, "autopost_topics", "интересные факты")
+
+            topics = [t.strip() for t in topics_str.split(",") if t.strip()]
+            if not topics:
+                continue
+
+            topic = random.choice(topics)
+            logger.info(f"Auto-post: generating themed post for group {group.group_id}, topic: {topic}")
+
+            post_text = await generate_post(group_id=group.group_id, topic=topic)
+            if not post_text or post_text.startswith("Извините") or len(post_text.strip()) < 50:
+                logger.warning(f"Auto-post: failed to generate post for group {group.group_id}")
+                continue
+
+            # Upload thematic image
+            attachment = ""
+            try:
+                from core.images import find_and_upload_image
+                token = decrypt_token(group.access_token)
+                api = API(token=token)
+                attachment = await find_and_upload_image(api, group.group_id, post_text=post_text) or ""
+            except Exception:
+                pass
+
+            # Schedule 1-3 hours from now
+            delay_hours = random.randint(1, 3)
+            scheduled_at = datetime.now(timezone.utc) + timedelta(hours=delay_hours)
+
+            await create_scheduled_post(
+                group_id=group.group_id, text=post_text,
+                scheduled_at=scheduled_at, source="ai",
+                attachments=attachment,
+            )
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+            await set_setting(group.group_id, "_last_autopost", now_iso)
+            await set_setting(group.group_id, "_last_generated_post", now_iso)
+            logger.info(f"Auto-post: generated themed post for group {group.group_id}")
 
         except Exception as e:
             logger.error(f"Auto-post failed for group {group.group_id}: {e}")
