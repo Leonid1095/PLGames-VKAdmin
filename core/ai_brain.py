@@ -128,19 +128,31 @@ async def generate_response(prompt: str, system_prompt: str = "", model: str = N
 
 # ─── Public: Moderation ───────────────────────────────────────────────────────
 
-_MODERATION_PROMPTS = {
-    "low":    "Удаляй только явный мат и прямые угрозы. Во всём остальном отвечай НЕТ.",
-    "medium": "Удаляй мат, оскорбления, спам и ссылки на сторонние ресурсы.",
-    "high":   "Удаляй мат, оскорбления, спам, ссылки, жалобы, негатив любого рода и рекламу.",
+# Moderation level 1-5 (simple scale for users)
+_MODERATION_LEVEL_PROMPTS = {
+    1: "Удаляй только явный мат и прямые угрозы насилия. Во всём остальном отвечай НЕТ.",
+    2: "Удаляй мат и прямые оскорбления. Спам и ссылки оставляй.",
+    3: "Удаляй мат, оскорбления, спам и подозрительные ссылки.",
+    4: "Удаляй мат, оскорбления, спам, ссылки и агрессивный негатив.",
+    5: "Удаляй мат, оскорбления, спам, ссылки, негатив любого рода, жалобы и рекламу.",
 }
+
+# Backward compat: old string values -> numeric
+_LEGACY_MODERATION_MAP = {"low": "2", "medium": "3", "high": "4"}
 
 async def analyze_toxicity(group_id: int, text: str) -> bool:
     """Returns True if the comment should be deleted. Uses group-specific rules."""
     from database.service import get_setting
 
     ctx = await _get_group_ai_context(group_id)
-    aggressiveness = await get_setting(group_id, "moderation_aggressiveness", "medium")
-    extra = _MODERATION_PROMPTS.get(aggressiveness, _MODERATION_PROMPTS["medium"])
+    raw_level = await get_setting(group_id, "moderation_level", "3")
+    # Support legacy string values
+    raw_level = _LEGACY_MODERATION_MAP.get(raw_level, raw_level)
+    try:
+        level = max(1, min(5, int(raw_level)))
+    except ValueError:
+        level = 3
+    extra = _MODERATION_LEVEL_PROMPTS[level]
 
     # Add group-specific moderation rules
     group_rules = ""
@@ -172,7 +184,8 @@ async def generate_post(group_id: int, topic: str = "") -> str:
     elif ctx["ai_content_topics"]:
         topics = ctx["ai_content_topics"]
     else:
-        topics = await get_setting(group_id, "autopost_topics", "интересные факты")
+        # No topic and no group-level topic list — refuse rather than fabricate.
+        return ""
 
     group_context = ""
     if ctx["ai_group_description"]:

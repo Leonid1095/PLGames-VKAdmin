@@ -13,29 +13,38 @@ from database.models import (
 logger = logging.getLogger(__name__)
 
 # ─── Default settings seeded per group ───────────────────────────────────────
+#
+# 3 user-facing settings (simple for group owners):
+#   - group_description: what the group is about (or auto-detected)
+#   - moderation_level: 1-5 scale (1=minimal, 5=strict)
+#   - autopost_enabled: true/false
+#
+# Everything else is internal (set by AI agent or kept as defaults).
 
 DEFAULT_SETTINGS = {
-    "active_model": ("plgames-ai", "Активная AI-модель"),
+    # === User-facing (simple) ===
+    "group_description": ("", "О чём эта группа (заполняется при онбординге)"),
+    "moderation_level": ("3", "Уровень модерации от 1 (мягкий) до 5 (строгий)"),
+    "autopost_enabled": ("false", "Автопостинг: true / false"),
+
+    # === Internal (managed by AI agent) ===
+    "active_model": ("plgames-ai", "internal"),
     "system_prompt": (
         "Ты вежливый и отзывчивый помощник-администратор группы ВКонтакте. "
         "Отвечай по делу и дружелюбно. Помни контекст диалога.",
-        "Системный промпт для ИИ при ответах на сообщения"
+        "internal"
     ),
-    "moderation_aggressiveness": ("medium", "Агрессивность модерации: low / medium / high"),
-    "autopost_enabled": ("false", "Включить автопостинг: true / false"),
-    "autopost_interval_hours": ("6", "Интервал автопостинга в часах"),
-    "autopost_topics": ("новости технологий, интересные факты, советы дня", "Темы для генерации постов"),
-    "reply_to_comments": ("true", "Отвечать ли ИИ на комментарии: true / false"),
-    "welcome_message": ("", "Приветственное сообщение для новых участников (пусто = выкл)"),
-    "welcome_ai": ("false", "Генерировать приветствие через ИИ: true / false"),
-    "content_parse_interval_hours": ("4", "Интервал парсинга контента в часах"),
-    "autoplan_enabled": ("false", "Авто-генерация контент-плана: true / false"),
-    "autoplan_times": ("09:00,13:00,18:00", "Времена публикаций для контент-плана (через запятую)"),
-    "banned_words": ("", "Запрещённые слова для авто-удаления (через запятую)"),
-    "xp_per_like": ("2", "XP за лайк"),
-    "xp_per_repost": ("5", "XP за репост"),
-    "xp_cooldown_sec": ("60", "Cooldown между начислением XP (секунды)"),
-    "image_search_enabled": ("true", "Искать тематические картинки для постов: true / false"),
+    "autopost_interval_hours": ("6", "internal"),
+    "reply_to_comments": ("true", "internal"),
+    "welcome_ai": ("true", "internal"),
+    "content_parse_interval_hours": ("4", "internal"),
+    "banned_words": ("", "internal"),
+    "image_search_enabled": ("true", "internal"),
+    "gamification_enabled": ("false", "internal"),
+    "xp_per_like": ("2", "internal"),
+    "xp_per_repost": ("5", "internal"),
+    "xp_cooldown_sec": ("60", "internal"),
+    "onboarding_complete": ("false", "internal"),
 }
 
 # ─── Group CRUD ──────────────────────────────────────────────────────────────
@@ -419,6 +428,7 @@ async def clear_warnings(group_id: int, vk_id: int) -> None:
 async def get_top_users(group_id: int, order_by: str = "xp", limit: int = 10) -> list[UserStatsDTO]:
     col_map = {
         "xp": UserStats.xp, "rep": UserStats.reputation,
+        "reputation": UserStats.reputation,
         "messages": UserStats.messages_count, "level": UserStats.level,
     }
     col = col_map.get(order_by, UserStats.xp)

@@ -30,9 +30,9 @@ async def handle_suggestion(ctx: GroupContext, from_id: int, text: str, peer_id:
                 f"Новое предложение для стены (#{post.id}):\n\n"
                 f"От: vk.com/id{from_id}\n"
                 f"Текст: {content[:500]}\n\n"
-                f"Ответьте:\n"
-                f"/принять {post.id} — опубликовать\n"
-                f"/отклонить {post.id} причина — отклонить"
+                f"Чтобы ответить, просто напишите мне:\n"
+                f"«одобри #{post.id}» — опубликовать\n"
+                f"«отклони #{post.id} причина» — отклонить"
             ),
             random_id=0,
         )

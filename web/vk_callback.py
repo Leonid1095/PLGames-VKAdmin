@@ -10,9 +10,9 @@ from vkbottle import API
 
 from core.group_context import GroupContext
 from core.crypto import decrypt_token
+from core.agent import run_agent
+from core.onboarding import is_onboarding_needed, run_onboarding
 from database.service import get_group, get_setting, add_xp_activity
-from handlers.admin import handle_admin_command
-from handlers.messages import handle_message
 from handlers.comments import handle_wall_comment
 
 logger = logging.getLogger(__name__)
@@ -81,9 +81,19 @@ async def _process_message(ctx: GroupContext, obj: dict):
     if not text.strip():
         return
 
-    reply = await handle_admin_command(ctx, from_id, text, peer_id)
-    if reply is None:
-        reply = await handle_message(ctx, from_id, text, peer_id)
+    is_admin = (from_id == ctx.admin_vk_id)
+
+    # Onboarding: admin's first messages go through setup dialog
+    if is_admin and await is_onboarding_needed(ctx.group_id):
+        reply = await run_onboarding(ctx, from_id, text.strip())
+        if reply:
+            try:
+                await ctx.api.messages.send(peer_id=peer_id, message=reply, random_id=0)
+            except Exception as e:
+                logger.error(f"Failed to send onboarding message to {peer_id}: {e}")
+            return
+
+    reply = await run_agent(ctx, user_id=from_id, text=text.strip(), is_admin=is_admin)
 
     if reply:
         try:
@@ -169,7 +179,9 @@ async def _process_group_join(ctx: GroupContext, obj: dict):
 
 
 async def _process_like(ctx: GroupContext, obj: dict):
-    """Award XP when someone likes a post."""
+    """Award XP when someone likes a post (only if gamification enabled)."""
+    if (await get_setting(ctx.group_id, "gamification_enabled", "false")).lower() != "true":
+        return
     liker_id = obj.get("liker_id", 0)
     if not liker_id or liker_id < 0:
         return
@@ -179,7 +191,9 @@ async def _process_like(ctx: GroupContext, obj: dict):
 
 
 async def _process_repost(ctx: GroupContext, obj: dict):
-    """Award XP when someone reposts."""
+    """Award XP when someone reposts (only if gamification enabled)."""
+    if (await get_setting(ctx.group_id, "gamification_enabled", "false")).lower() != "true":
+        return
     from_id = obj.get("from_id", 0)
     if not from_id or from_id < 0:
         return

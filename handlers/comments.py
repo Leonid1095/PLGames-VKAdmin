@@ -30,8 +30,9 @@ async def handle_wall_comment(ctx: GroupContext, event_object: dict) -> None:
 
     logger.info(f"[COMMENT] group={ctx.group_id} post={post_id} from={from_id}: {stripped[:80]}")
 
-    # ── Reputation (+ / -) ──
-    if reply_to_user and reply_to_user > 0 and from_id != reply_to_user:
+    # ── Reputation (+ / -) — only if gamification enabled ──
+    gamification_on = (await get_setting(ctx.group_id, "gamification_enabled", "false")).lower() == "true"
+    if gamification_on and reply_to_user and reply_to_user > 0 and from_id != reply_to_user:
         if stripped == "+":
             new_rep = await modify_reputation(ctx.group_id, reply_to_user, 1)
             try:
@@ -87,34 +88,28 @@ async def handle_wall_comment(ctx: GroupContext, event_object: dict) -> None:
             logger.error(f"Failed to issue warning/ban for {from_id}: {e}")
         return
 
-    # ── Gamification: Award XP (with cooldown) ──
-    cooldown_sec = int(await get_setting(ctx.group_id, "xp_cooldown_sec", "60"))
-    cooldown_key = (ctx.group_id, from_id)
-    now = time.monotonic()
-    last_xp = _xp_cooldowns.get(cooldown_key, 0)
-    if cooldown_sec > 0 and now - last_xp < cooldown_sec:
-        # Cooldown active — no XP, but still process AI reply below
-        leveled_up = False
-        new_level = 0
-    else:
-        _xp_cooldowns[cooldown_key] = now
-        xp_gained = min(5, max(1, len(stripped) // 20))
-        new_level, leveled_up = await add_xp(ctx.group_id, from_id, xp_gained)
-        # Cleanup old entries periodically
-        if len(_xp_cooldowns) > 5000:
-            cutoff = now - _XP_COOLDOWN_SEC * 2
-            _xp_cooldowns.clear()  # simple cleanup
-
-    if leveled_up:
-        try:
-            await ctx.api.wall.create_comment(
-                owner_id=owner_id,
-                post_id=post_id,
-                reply_to_comment=comment_id,
-                message=f"Уровень повышен! Текущий уровень: {new_level}.",
-            )
-        except Exception as e:
-            logger.warning(f"Failed to congratulate level-up: {e}")
+    # ── Gamification: Award XP (only if enabled) ──
+    if gamification_on:
+        cooldown_sec = int(await get_setting(ctx.group_id, "xp_cooldown_sec", "60"))
+        cooldown_key = (ctx.group_id, from_id)
+        now = time.monotonic()
+        last_xp = _xp_cooldowns.get(cooldown_key, 0)
+        if cooldown_sec > 0 and now - last_xp < cooldown_sec:
+            pass  # Cooldown active
+        else:
+            _xp_cooldowns[cooldown_key] = now
+            xp_gained = min(5, max(1, len(stripped) // 20))
+            new_level, leveled_up = await add_xp(ctx.group_id, from_id, xp_gained)
+            if len(_xp_cooldowns) > 5000:
+                _xp_cooldowns.clear()
+            if leveled_up:
+                try:
+                    await ctx.api.wall.create_comment(
+                        owner_id=owner_id, post_id=post_id, reply_to_comment=comment_id,
+                        message=f"Уровень повышен! Текущий уровень: {new_level}.",
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to congratulate level-up: {e}")
 
     # ── Optional: AI reply ──
     should_reply = (await get_setting(ctx.group_id, "reply_to_comments", "true")).lower() == "true"

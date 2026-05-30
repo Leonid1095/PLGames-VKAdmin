@@ -5,16 +5,13 @@ from html import escape
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-from core.config import settings as app_settings
 from core.auth import (
     is_authenticated, set_auth_cookie, clear_auth_cookie, get_dashboard_password,
     get_csrf_token, set_csrf_cookie, verify_csrf_token,
 )
 from database.service import (
     get_all_active_groups, get_group, get_setting, set_setting,
-    deactivate_group, get_content_sources, add_content_source,
-    delete_content_source, get_content_tasks, create_content_task,
-    delete_content_task,
+    deactivate_group, get_content_sources,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,332 +31,45 @@ def _csrf_field(request: Request) -> str:
     return f'<input type="hidden" name="_csrf" value="{token}">'
 
 
-# ─── Settings schema: grouped, with human-readable labels and input types ────
+# ─── Simplified settings: 3 user-facing settings ───────────────────────────
+#
+# The old SETTINGS_SCHEMA had 7 sections with 25+ fields.
+# Now: 3 simple settings that any group owner can understand.
+# Everything else is managed by the AI agent through chat.
 
 SETTINGS_SCHEMA = [
     {
-        "title": "Искусственный интеллект",
-        "icon": "🤖",
+        "title": "Основные настройки",
+        "icon": "",
         "settings": [
             {
-                "key": "active_model",
-                "label": "Модель ИИ",
-                "description": "Какая модель отвечает на сообщения и генерирует контент",
-                "type": "select",
-                "options": [
-                    ("plgames-ai", "PLGames AI (свой сервер)"),
-                    ("openai/gpt-4o-mini", "GPT-4o Mini (через OpenRouter)"),
-                    ("openai/gpt-4o", "GPT-4o (через OpenRouter)"),
-                    ("anthropic/claude-3.5-sonnet", "Claude 3.5 Sonnet (через OpenRouter)"),
-                    ("google/gemini-pro-1.5", "Gemini Pro 1.5 (через OpenRouter)"),
-                ],
-                "default": "plgames-ai",
-            },
-            {
-                "key": "system_prompt",
-                "label": "Характер бота (ручной)",
-                "description": "Ручная настройка — переопределяет автоматический профиль",
+                "key": "group_description",
+                "label": "О чём группа",
+                "description": "Бот подстраивает свой стиль, контент и модерацию под тематику группы",
                 "type": "textarea",
                 "default": "",
-                "placeholder": "Оставьте пустым для автоматического профиля (рекомендуется)",
-            },
-        ],
-    },
-    {
-        "title": "ИИ-профиль группы",
-        "icon": "🧠",
-        "settings": [
-            {
-                "key": "ai_group_description",
-                "label": "Описание группы",
-                "description": "Автоматически сгенерировано. Бот использует это для понимания контекста",
-                "type": "textarea",
-                "default": "",
-                "placeholder": "Нажмите 'Обновить ИИ' внизу страницы для автогенерации",
+                "placeholder": "Например: Игровое сообщество по Minecraft для русскоязычных игроков",
             },
             {
-                "key": "ai_system_prompt",
-                "label": "ИИ-промпт (автоматический)",
-                "description": "Как бот общается — сгенерировано на основе анализа группы",
-                "type": "textarea",
-                "default": "",
-                "placeholder": "Генерируется автоматически при подключении группы",
-            },
-            {
-                "key": "ai_moderation_rules",
-                "label": "Правила модерации ИИ",
-                "description": "Контекстные правила модерации для этой группы",
-                "type": "textarea",
-                "default": "",
-                "placeholder": "Генерируется автоматически",
-            },
-            {
-                "key": "ai_content_topics",
-                "label": "Темы для контента",
-                "description": "ИИ использует эти темы при генерации постов и подборе контента",
-                "type": "textarea",
-                "default": "",
-                "placeholder": "Генерируется автоматически",
-            },
-            {
-                "key": "ai_tone",
-                "label": "Стиль общения",
-                "description": "Тон, в котором бот пишет посты и общается",
-                "type": "select",
-                "options": [
-                    ("friendly", "Дружелюбный"),
-                    ("casual", "Неформальный"),
-                    ("gaming", "Геймерский"),
-                    ("professional", "Профессиональный"),
-                    ("formal", "Деловой"),
-                ],
-                "default": "friendly",
-            },
-        ],
-    },
-    {
-        "title": "Модерация",
-        "icon": "🛡",
-        "settings": [
-            {
-                "key": "moderation_aggressiveness",
-                "label": "Жёсткость модерации",
+                "key": "moderation_level",
+                "label": "Уровень модерации",
                 "description": "Насколько строго бот удаляет комментарии",
                 "type": "select",
                 "options": [
-                    ("low", "Мягкая — только мат и угрозы"),
-                    ("medium", "Средняя — мат, оскорбления, спам"),
-                    ("high", "Жёсткая — любой негатив и реклама"),
+                    ("1", "1 — Минимальный (только мат и угрозы)"),
+                    ("2", "2 — Легкий (мат и оскорбления)"),
+                    ("3", "3 — Средний (+ спам и ссылки)"),
+                    ("4", "4 — Строгий (+ негатив)"),
+                    ("5", "5 — Максимальный (всё подозрительное)"),
                 ],
-                "default": "medium",
+                "default": "3",
             },
-            {
-                "key": "reply_to_comments",
-                "label": "Отвечать на комментарии",
-                "description": "Бот будет автоматически отвечать на комментарии под постами",
-                "type": "toggle",
-                "default": "true",
-            },
-            {
-                "key": "banned_words",
-                "label": "Запрещённые слова",
-                "description": "Комментарии с этими словами удаляются мгновенно (без AI). Через запятую",
-                "type": "textarea",
-                "default": "",
-                "placeholder": "спам, реклама, казино, ставки",
-            },
-        ],
-    },
-    {
-        "title": "Автопостинг",
-        "icon": "📝",
-        "settings": [
             {
                 "key": "autopost_enabled",
-                "label": "Автопостинг включён",
-                "description": "Бот берёт контент из источников (RSS, сайты) и публикует. Добавьте источники ниже!",
+                "label": "Автопостинг",
+                "description": "Бот сам находит контент и публикует посты по теме группы",
                 "type": "toggle",
                 "default": "false",
-            },
-            {
-                "key": "autopost_interval_hours",
-                "label": "Интервал (часы)",
-                "description": "Как часто публиковать автопосты",
-                "type": "select",
-                "options": [
-                    ("2", "Каждые 2 часа"),
-                    ("4", "Каждые 4 часа"),
-                    ("6", "Каждые 6 часов"),
-                    ("12", "Каждые 12 часов"),
-                    ("24", "Раз в сутки"),
-                ],
-                "default": "6",
-            },
-            {
-                "key": "autopost_topics",
-                "label": "Темы для постов",
-                "description": "О чём бот будет писать (через запятую)",
-                "type": "text",
-                "default": "новости технологий, интересные факты, советы дня",
-                "placeholder": "игры, кино, музыка, технологии...",
-            },
-            {
-                "key": "image_search_enabled",
-                "label": "Картинки к постам",
-                "description": "Искать и прикреплять тематические изображения к автопостам (Pexels)",
-                "type": "toggle",
-                "default": "true",
-            },
-        ],
-    },
-    {
-        "title": "Приветствие новых участников",
-        "icon": "👋",
-        "settings": [
-            {
-                "key": "welcome_message",
-                "label": "Текст приветствия",
-                "description": "Сообщение новому участнику в ЛС. Плейсхолдеры: {name}, {first_name}, {last_name}, {member_count}. Пусто = не отправлять",
-                "type": "textarea",
-                "default": "",
-                "placeholder": "Привет, {name}! Добро пожаловать! Ты {member_count}-й участник нашей группы!",
-            },
-            {
-                "key": "welcome_ai",
-                "label": "ИИ-приветствие",
-                "description": "Генерировать персональное приветствие через ИИ (вместо шаблона выше)",
-                "type": "toggle",
-                "default": "false",
-            },
-        ],
-    },
-    {
-        "title": "Контент-план",
-        "icon": "📅",
-        "settings": [
-            {
-                "key": "autoplan_enabled",
-                "label": "Автоматический контент-план",
-                "description": "ИИ сам составит план постов на день и опубликует по расписанию",
-                "type": "toggle",
-                "default": "false",
-            },
-            {
-                "key": "autoplan_times",
-                "label": "Время публикаций",
-                "description": "В какое время публиковать посты (через запятую, UTC)",
-                "type": "text",
-                "default": "09:00,13:00,18:00",
-                "placeholder": "09:00,13:00,18:00",
-            },
-            {
-                "key": "content_parse_interval_hours",
-                "label": "Парсинг источников (часы)",
-                "description": "Как часто проверять RSS и другие источники контента",
-                "type": "select",
-                "options": [
-                    ("2", "Каждые 2 часа"),
-                    ("4", "Каждые 4 часа"),
-                    ("6", "Каждые 6 часов"),
-                    ("12", "Каждые 12 часов"),
-                ],
-                "default": "4",
-            },
-        ],
-    },
-    {
-        "title": "Виджет-лидерборд",
-        "icon": "🏆",
-        "settings": [
-            {
-                "key": "widget_enabled",
-                "label": "Виджет топ-участников",
-                "description": "Показывает таблицу лучших участников в виджете сообщества (как Coliseum)",
-                "type": "toggle",
-                "default": "false",
-            },
-            {
-                "key": "widget_sort_by",
-                "label": "Сортировка",
-                "description": "По какому показателю строить рейтинг",
-                "type": "select",
-                "options": [
-                    ("xp", "Опыт (XP)"),
-                    ("level", "Уровень"),
-                    ("messages", "Сообщения"),
-                    ("rep", "Репутация"),
-                ],
-                "default": "xp",
-            },
-            {
-                "key": "widget_top_count",
-                "label": "Количество в топе",
-                "description": "Сколько участников показывать в виджете",
-                "type": "select",
-                "options": [
-                    ("5", "5"),
-                    ("10", "10"),
-                    ("15", "15"),
-                    ("20", "20"),
-                ],
-                "default": "10",
-            },
-            {
-                "key": "xp_per_like",
-                "label": "XP за лайк",
-                "description": "Сколько опыта получает пользователь за лайк поста в группе",
-                "type": "select",
-                "options": [
-                    ("0", "Отключено"),
-                    ("1", "1 XP"),
-                    ("2", "2 XP"),
-                    ("3", "3 XP"),
-                    ("5", "5 XP"),
-                ],
-                "default": "2",
-            },
-            {
-                "key": "xp_per_repost",
-                "label": "XP за репост",
-                "description": "Сколько опыта получает пользователь за репост",
-                "type": "select",
-                "options": [
-                    ("0", "Отключено"),
-                    ("3", "3 XP"),
-                    ("5", "5 XP"),
-                    ("10", "10 XP"),
-                ],
-                "default": "5",
-            },
-            {
-                "key": "xp_cooldown_sec",
-                "label": "Кулдаун XP (сек)",
-                "description": "Минимальный интервал между начислениями XP за комментарии (анти-фарм)",
-                "type": "select",
-                "options": [
-                    ("0", "Без кулдауна"),
-                    ("30", "30 секунд"),
-                    ("60", "1 минута"),
-                    ("120", "2 минуты"),
-                    ("300", "5 минут"),
-                ],
-                "default": "60",
-            },
-        ],
-    },
-    {
-        "title": "Telegram кросс-постинг",
-        "icon": "📨",
-        "settings": [
-            {
-                "key": "telegram_enabled",
-                "label": "Кросс-постинг в Telegram",
-                "description": "Автоматически дублировать посты из VK в Telegram-канал",
-                "type": "toggle",
-                "default": "false",
-            },
-            {
-                "key": "telegram_bot_token",
-                "label": "Токен бота",
-                "description": "Токен Telegram-бота (получите у @BotFather). Если пусто — используется глобальный из .env",
-                "type": "text",
-                "default": "",
-                "placeholder": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
-            },
-            {
-                "key": "telegram_chat_id",
-                "label": "Chat ID / канал",
-                "description": "ID чата или @username канала, куда отправлять посты",
-                "type": "text",
-                "default": "",
-                "placeholder": "@mychannel или -1001234567890",
-            },
-            {
-                "key": "telegram_add_vk_link",
-                "label": "Добавлять ссылку на VK",
-                "description": "Добавлять ссылку на оригинальный пост VK в конец сообщения",
-                "type": "toggle",
-                "default": "true",
             },
         ],
     },
@@ -657,6 +367,7 @@ async def group_settings_page(request: Request, group_id: int):
     csrf = _csrf_field(request)
     csrf_token = get_csrf_token(request)
 
+    # ── 3 simple settings ──
     sections_html = ""
     for section in SETTINGS_SCHEMA:
         items_html = ""
@@ -685,175 +396,63 @@ async def group_settings_page(request: Request, group_id: int):
         </div>
         """
 
-    # ── Content sources section ──
-    sources = await get_content_sources(group_id)
-    sources_rows = ""
-    if sources:
-        for s in sources:
-            type_class = {"rss": "rss", "vk_group": "vk", "api": "api", "web": "web"}.get(s.source_type, "api")
-            type_label = {"rss": "RSS", "vk_group": "VK группа", "api": "API", "web": "Сайт"}.get(s.source_type, s.source_type)
-            fetched = s.last_fetched_at.strftime("%d.%m %H:%M") if s.last_fetched_at else "ещё не запускался"
-            keywords = s.filter_keywords or "—"
-            sources_rows += f"""
-            <tr>
-                <td><span class="source-type source-type-{type_class}">{type_label}</span></td>
-                <td><span class="source-url">{escape(s.source_url)}</span></td>
-                <td><span class="source-fetched">{fetched}</span></td>
-                <td>
-                    <form method="POST" action="/dashboard/group/{group_id}/sources/delete"
-                          onsubmit="return confirm('Удалить этот источник?');">
-                        {csrf}
-                        <input type="hidden" name="source_id" value="{s.id}">
-                        <button type="submit" class="btn-delete">Удалить</button>
-                    </form>
-                </td>
-            </tr>
-            """
-        sources_table = f"""
-        <table class="source-table">
-            <thead><tr><th>Тип</th><th>Адрес</th><th>Последний парсинг</th><th></th></tr></thead>
-            <tbody>{sources_rows}</tbody>
-        </table>
-        """
-    else:
-        sources_table = '<p class="source-empty">Нет подключённых источников. Добавьте RSS-ленту или группу ВК, чтобы бот брал оттуда контент.</p>'
-
-    sources_html = f"""
-    <div class="card">
-        <div class="card-title">📡 Источники контента</div>
-        <div class="setting-desc" style="margin-bottom:8px;">
-            Бот будет парсить эти источники, переписывать контент через ИИ и публиковать в вашей группе
-        </div>
-        {sources_table}
-        <form method="POST" action="/dashboard/group/{group_id}/sources/add" class="source-add">
-            {csrf}
-            <div class="form-group">
-                <label style="font-size:0.85rem;">Тип</label>
-                <select name="source_type" style="width:140px;">
-                    <option value="rss">RSS-лента</option>
-                    <option value="web">Сайт (URL)</option>
-                    <option value="vk_group">VK группа</option>
-                    <option value="api">API (JSON)</option>
-                </select>
-            </div>
-            <div class="form-group" style="flex:1;">
-                <label style="font-size:0.85rem;">Адрес</label>
-                <input type="text" name="source_url" placeholder="https://example.com/rss или короткое имя группы ВК" required>
-            </div>
-            <div class="form-group">
-                <label style="font-size:0.85rem;">Фильтр (необязательно)</label>
-                <input type="text" name="filter_keywords" placeholder="ключевые слова через запятую" style="width:220px;">
-            </div>
-            <button type="submit" class="btn btn-sm">Добавить</button>
-        </form>
-        <p class="hint">
-            RSS — вставьте ссылку на RSS-ленту сайта (обычно /rss или /feed).<br>
-            VK группа — вставьте короткое имя группы (например durov) или числовой ID.<br>
-            API — URL, возвращающий JSON со списком статей.
-        </p>
-    </div>
-    """
-
-    # ── Content tasks section ──
-    tasks = await get_content_tasks(group_id)
-    tasks_rows = ""
-    if tasks:
-        for t in tasks:
-            last = t.last_run_at.strftime("%d.%m %H:%M") if t.last_run_at else "ещё не запускалась"
-            type_labels = {"patch_notes": "Патч-ноты", "article": "Статья", "digest": "Дайджест"}
-            type_label = type_labels.get(t.task_type, t.task_type)
-            tasks_rows += f"""
-            <tr>
-                <td><span class="source-type source-type-api">{type_label}</span></td>
-                <td><span class="source-url">{escape(t.source_url or '—')}</span></td>
-                <td><code style="font-size:0.82rem;">{escape(t.schedule_cron)}</code></td>
-                <td><span class="source-fetched">{last}</span></td>
-                <td>
-                    <form method="POST" action="/dashboard/group/{group_id}/tasks/delete"
-                          onsubmit="return confirm('Удалить задачу?');">
-                        {csrf}
-                        <input type="hidden" name="task_id" value="{t.id}">
-                        <button type="submit" class="btn-delete">Удалить</button>
-                    </form>
-                </td>
-            </tr>
-            """
-        tasks_table = f"""
-        <table class="source-table">
-            <thead><tr><th>Тип</th><th>Источник</th><th>Расписание</th><th>Последний запуск</th><th></th></tr></thead>
-            <tbody>{tasks_rows}</tbody>
-        </table>
-        """
-    else:
-        tasks_table = '<p class="source-empty">Нет контент-задач. Добавьте, чтобы бот сам писал статьи по расписанию.</p>'
-
-    tasks_html = f"""
-    <div class="card">
-        <div class="card-title">📋 Контент-задачи</div>
-        <div class="setting-desc" style="margin-bottom:8px;">
-            Бот автоматически создаёт контент по расписанию: патч-ноты из GitHub, статьи с сайтов, дайджесты
-        </div>
-        {tasks_table}
-        <form method="POST" action="/dashboard/group/{group_id}/tasks/add" class="source-add">
-            {csrf}
-            <div class="form-group">
-                <label style="font-size:0.85rem;">Тип</label>
-                <select name="task_type" style="width:140px;">
-                    <option value="patch_notes">Патч-ноты</option>
-                    <option value="article">Статья</option>
-                    <option value="digest">Дайджест</option>
-                </select>
-            </div>
-            <div class="form-group" style="flex:1;">
-                <label style="font-size:0.85rem;">Источник (URL)</label>
-                <input type="text" name="source_url" placeholder="https://github.com/user/repo">
-            </div>
-            <div class="form-group">
-                <label style="font-size:0.85rem;">Расписание (cron)</label>
-                <input type="text" name="schedule_cron" placeholder="0 18 * * 5" style="width:140px;" required>
-            </div>
-            <button type="submit" class="btn btn-sm">Добавить</button>
-        </form>
-        <p class="hint">
-            Cron формат: минута час день месяц день_недели.<br>
-            Примеры: <code>0 18 * * 5</code> = пятница 18:00 UTC, <code>0 10 * * 1</code> = понедельник 10:00 UTC
-        </p>
-    </div>
-    """
-
-    # ── AI refresh section ──
+    # ── Status card ──
+    onboarding = await get_setting(group_id, "onboarding_complete", "false")
     ai_desc = await get_setting(group_id, "ai_group_description", "")
-    if ai_desc:
-        ai_status = f'<span style="color:#2e7d32;">✓ Настроен: {escape(ai_desc[:100])}</span>'
-    else:
-        ai_status = '<span style="color:#d32f2f;">✗ Не настроен — нажмите кнопку ниже</span>'
+    sources = await get_content_sources(group_id)
+    autopost = (await get_setting(group_id, "autopost_enabled", "false")).lower() == "true"
 
-    ai_refresh_html = f"""
+    status_items = []
+    if onboarding == "true":
+        status_items.append('<span style="color:#2e7d32;">Онбординг пройден</span>')
+    else:
+        status_items.append('<span style="color:#e65100;">Напишите боту в ЛС для настройки</span>')
+    if ai_desc:
+        status_items.append(f'<span style="color:#2e7d32;">ИИ настроен</span>')
+    else:
+        status_items.append('<span style="color:#999;">ИИ: ожидает настройки</span>')
+    status_items.append(f'Источников контента: {len(sources)}')
+    status_items.append(f'Автопостинг: {"включён" if autopost else "выключен"}')
+
+    status_html = f"""
     <div class="card">
-        <div class="card-title">🔄 ИИ-профиль группы</div>
-        <p style="font-size:0.9rem;margin-bottom:8px;">{ai_status}</p>
-        <p style="font-size:0.82rem;color:#888;margin-bottom:14px;">
-            Бот сканирует группу (описание, последние посты) и автоматически настраивает свою личность,
-            правила модерации и темы контента под тематику группы.
+        <div class="card-title">Статус бота</div>
+        <div style="display:flex;flex-direction:column;gap:6px;font-size:0.9rem;">
+            {''.join(f'<div>{item}</div>' for item in status_items)}
+        </div>
+    </div>
+    """
+
+    # ── Hint card ──
+    hint_html = """
+    <div class="card" style="background:#f8f9fa;border:1px dashed #ccc;">
+        <div class="card-title" style="font-size:0.95rem;">Как управлять ботом</div>
+        <p style="font-size:0.88rem;color:#666;line-height:1.6;">
+            Напишите боту в личные сообщения группы на обычном языке:
         </p>
-        <form method="POST" action="/dashboard/group/{group_id}/ai-refresh">
-            {csrf}
-            <button type="submit" class="btn">Обновить ИИ-профиль</button>
-        </form>
+        <ul style="font-size:0.88rem;color:#555;margin:8px 0 0 20px;line-height:1.8;">
+            <li>«Напиши пост про обновление игры»</li>
+            <li>«Забань спамера 12345»</li>
+            <li>«Следи за этим RSS: https://...»</li>
+            <li>«Как дела в группе?» — статистика</li>
+            <li>«Публикуй патчноты каждую пятницу»</li>
+        </ul>
+        <p style="font-size:0.82rem;color:#999;margin-top:10px;">
+            Бот понимает естественный язык. Не нужно запоминать команды.
+        </p>
     </div>
     """
 
     name = escape(group.group_name or f"Группа {group_id}")
     content = f"""
-    <a href="/dashboard" class="back">← Назад</a>
+    <a href="/dashboard" class="back">&larr; Назад</a>
     <div class="header">
         <h1>{name}</h1>
-        <p>ID: {group_id} &nbsp; <span class="badge badge-green" style="font-size:0.75rem;">Работает</span></p>
+        <p>ID: {group_id}</p>
     </div>
+    {status_html}
     {sections_html}
-    {sources_html}
-    {tasks_html}
-    {ai_refresh_html}
+    {hint_html}
     """
     response = HTMLResponse(_base_html(name, content))
     set_csrf_cookie(response, csrf_token)
@@ -944,101 +543,6 @@ async def update_group_setting(request: Request, group_id: int):
 
     if request.headers.get("X-Requested-With") == "XMLHttpRequest":
         return JSONResponse({"ok": True})
-
-    return RedirectResponse(f"/dashboard/group/{group_id}?msg=saved", status_code=303)
-
-
-@router.post("/dashboard/group/{group_id}/sources/add")
-async def add_source(request: Request, group_id: int):
-    redirect = _require_auth(request)
-    if redirect:
-        return redirect
-    if not await verify_csrf_token(request):
-        return RedirectResponse(f"/dashboard/group/{group_id}", status_code=303)
-    form = await request.form()
-    source_type = str(form.get("source_type", "rss")).strip()
-    source_url = str(form.get("source_url", "")).strip()
-    filter_keywords = str(form.get("filter_keywords", "")).strip()
-
-    if source_url:
-        await add_content_source(group_id, source_type, source_url, filter_keywords)
-
-    return RedirectResponse(f"/dashboard/group/{group_id}?msg=saved", status_code=303)
-
-
-@router.post("/dashboard/group/{group_id}/sources/delete")
-async def remove_source(request: Request, group_id: int):
-    redirect = _require_auth(request)
-    if redirect:
-        return redirect
-    if not await verify_csrf_token(request):
-        return RedirectResponse(f"/dashboard/group/{group_id}", status_code=303)
-    form = await request.form()
-    source_id = int(form.get("source_id", 0))
-    if source_id:
-        await delete_content_source(source_id)
-
-    return RedirectResponse(f"/dashboard/group/{group_id}?msg=saved", status_code=303)
-
-
-@router.post("/dashboard/group/{group_id}/tasks/add")
-async def add_task(request: Request, group_id: int):
-    redirect = _require_auth(request)
-    if redirect:
-        return redirect
-    if not await verify_csrf_token(request):
-        return RedirectResponse(f"/dashboard/group/{group_id}", status_code=303)
-    form = await request.form()
-    task_type = str(form.get("task_type", "article")).strip()
-    source_url = str(form.get("source_url", "")).strip()
-    schedule_cron = str(form.get("schedule_cron", "")).strip()
-
-    if schedule_cron:
-        try:
-            from croniter import croniter
-            croniter(schedule_cron)
-        except Exception:
-            pass  # let it fail at runtime
-        name = f"{task_type}_{source_url.split('/')[-1] if source_url else 'manual'}"
-        await create_content_task(
-            group_id=group_id, name=name, task_type=task_type,
-            schedule_cron=schedule_cron, source_url=source_url,
-        )
-
-    return RedirectResponse(f"/dashboard/group/{group_id}?msg=saved", status_code=303)
-
-
-@router.post("/dashboard/group/{group_id}/tasks/delete")
-async def remove_task(request: Request, group_id: int):
-    redirect = _require_auth(request)
-    if redirect:
-        return redirect
-    if not await verify_csrf_token(request):
-        return RedirectResponse(f"/dashboard/group/{group_id}", status_code=303)
-    form = await request.form()
-    task_id = int(form.get("task_id", 0))
-    if task_id:
-        await delete_content_task(task_id)
-    return RedirectResponse(f"/dashboard/group/{group_id}?msg=saved", status_code=303)
-
-
-@router.post("/dashboard/group/{group_id}/ai-refresh")
-async def ai_refresh(request: Request, group_id: int):
-    redirect = _require_auth(request)
-    if redirect:
-        return redirect
-    if not await verify_csrf_token(request):
-        return RedirectResponse(f"/dashboard/group/{group_id}", status_code=303)
-
-    group = await get_group(group_id)
-    if group:
-        from core.crypto import decrypt_token
-        from core.group_setup import setup_group_ai
-        try:
-            token = decrypt_token(group.access_token)
-            await setup_group_ai(group_id, token)
-        except Exception as e:
-            logger.error(f"AI refresh failed for group {group_id}: {e}")
 
     return RedirectResponse(f"/dashboard/group/{group_id}?msg=saved", status_code=303)
 
