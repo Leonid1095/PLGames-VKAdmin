@@ -31,7 +31,12 @@ class Settings(BaseSettings):
 
     # Security
     ENCRYPTION_KEY: str = ""  # Fernet key for encrypting tokens
+    # JWT_SECRET = cryptographic signing root for Mini App session tokens.
+    # Keep it high-entropy and secret. The dashboard password and the session
+    # cookie seed are now SEPARATE settings (below) so one leak ≠ all leaked.
     JWT_SECRET: str = "change-me-to-random-secret"
+    DASHBOARD_PASSWORD: str = ""  # dashboard login password (falls back to JWT_SECRET if unset)
+    SESSION_SECRET: str = ""  # seed for the dashboard session cookie (falls back to JWT_SECRET)
     API_KEY: str = ""  # API key for public API endpoints
 
     # Image search (free, 200 req/hr)
@@ -44,6 +49,8 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
+DEFAULT_JWT_SECRET = "change-me-to-random-secret"
+
 
 def validate_critical_settings() -> None:
     """Validate that critical settings are present. Called during startup."""
@@ -52,9 +59,18 @@ def validate_critical_settings() -> None:
             "ENCRYPTION_KEY is not set! Token encryption will fail.\n"
             "Generate one with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
         )
-    if settings.JWT_SECRET == "change-me-to-random-secret":
+    # Fatal: a known/empty JWT_SECRET lets anyone forge Mini App admin sessions
+    # (see core/vk_auth.py). Refuse to start rather than run wide open.
+    if not settings.JWT_SECRET or settings.JWT_SECRET == DEFAULT_JWT_SECRET:
+        raise RuntimeError(
+            "JWT_SECRET is not set or still the default placeholder.\n"
+            "It signs Mini App session tokens — a known value lets anyone forge an admin session.\n"
+            "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(48))\""
+        )
+    if not settings.DASHBOARD_PASSWORD:
         import warnings
         warnings.warn(
-            "JWT_SECRET is set to the default value. Change it to a random secret.",
+            "DASHBOARD_PASSWORD is not set — the dashboard login falls back to JWT_SECRET. "
+            "Set a separate DASHBOARD_PASSWORD so the typed password isn't your signing secret.",
             stacklevel=2,
         )

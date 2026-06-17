@@ -63,8 +63,14 @@ async def oauth_callback(request: Request, code: str = "", error: str = "", erro
     Step 2: VK redirects back with an authorization code.
     Exchange it for a group access token.
     """
-    # Log all query params for debugging
-    logger.info(f"OAuth callback params: {dict(request.query_params)}")
+    # Log param keys for debugging, but never the values — they can carry the
+    # authorization code or access token (secret-in-logs leak).
+    _sensitive = {"code", "access_token", "token", "secret"}
+    _safe = {
+        k: ("<redacted>" if k in _sensitive else v)
+        for k, v in request.query_params.items()
+    }
+    logger.info(f"OAuth callback params: {_safe}")
 
     if error:
         from html import escape

@@ -89,7 +89,7 @@ async def run_onboarding(ctx: GroupContext, user_id: int, text: str) -> str | No
 
         # Now auto-configure AI based on the group description
         group_desc = await get_setting(ctx.group_id, "group_description", "")
-        await _auto_configure_ai(ctx, group_desc)
+        ai_ok = await _auto_configure_ai(ctx, group_desc)
 
         await set_setting(ctx.group_id, "onboarding_complete", "true")
         # Clean up temp step
@@ -102,8 +102,18 @@ async def run_onboarding(ctx: GroupContext, user_id: int, text: str) -> str | No
             "Автопостинг выключен. Когда захотите — просто скажите."
         )
 
+        # Be honest: only claim "настроился под группу" if AI config actually succeeded.
+        if ai_ok:
+            head = "Готово! Я настроился под вашу группу."
+        else:
+            head = (
+                "Базовая настройка завершена — я уже работаю.\n"
+                "⚠️ Но дообучить меня под тематику группы прямо сейчас не вышло "
+                "(возможно, ИИ временно недоступен). Позже скажите «обнови ИИ» — и я повторю."
+            )
+
         return (
-            f"Готово! Я настроился под вашу группу.\n\n"
+            f"{head}\n\n"
             f"{autopost_msg}\n\n"
             "Что я умею:\n"
             "— Писать и публиковать посты (просто попросите)\n"
@@ -119,12 +129,16 @@ async def run_onboarding(ctx: GroupContext, user_id: int, text: str) -> str | No
     return None
 
 
-async def _auto_configure_ai(ctx: GroupContext, group_description: str):
-    """Use AI to generate personality and settings from group description."""
+async def _auto_configure_ai(ctx: GroupContext, group_description: str) -> bool:
+    """Use AI to generate personality and settings from group description.
+
+    Returns True only if the bot's personality was actually configured (so the
+    onboarding finish message doesn't over-promise when the LLM is unavailable).
+    """
     from database.service import set_setting
 
     if not group_description:
-        return
+        return False
 
     # First try full group_setup if token is available
     try:
@@ -138,7 +152,7 @@ async def _auto_configure_ai(ctx: GroupContext, group_description: str):
             ok = await setup_group_ai(ctx.group_id, token)
             if ok:
                 logger.info(f"[ONBOARDING] Full AI setup complete for group {ctx.group_id}")
-                return
+                return True
     except Exception as e:
         logger.warning(f"[ONBOARDING] Full setup failed, falling back to description-based: {e}")
 
@@ -158,3 +172,6 @@ async def _auto_configure_ai(ctx: GroupContext, group_description: str):
         await set_setting(ctx.group_id, "ai_system_prompt", system_prompt)
         await set_setting(ctx.group_id, "ai_group_description", group_description)
         logger.info(f"[ONBOARDING] AI configured from description for group {ctx.group_id}")
+        return True
+
+    return False

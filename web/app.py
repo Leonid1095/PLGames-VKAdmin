@@ -63,6 +63,20 @@ async def lifespan(app: FastAPI):
     await init_db()
     await _migrate_legacy_group()
     await start_scheduler()
+
+    # Probe the AI provider so a dead key surfaces at startup instead of
+    # masquerading as a generic "Произошла ошибка" in every chat reply.
+    from core.agent import check_llm_health
+    from core.config import settings
+    ok, detail = await check_llm_health()
+    if ok:
+        logger.info("LLM health-check OK (model=%s)", settings.DEFAULT_MODEL)
+    else:
+        logger.error(
+            "LLM HEALTH-CHECK FAILED — AI replies will NOT work until fixed: %s",
+            detail,
+        )
+
     logger.info("VKAdmin is ready!")
     yield
     logger.info("Shutting down VKAdmin...")
@@ -109,3 +123,12 @@ async def root():
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/api/health/llm")
+async def health_llm():
+    """Live probe of the AI provider — distinguishes a rejected key from an
+    unreachable provider. Does a real (tiny) call, so don't poll it hard."""
+    from core.agent import check_llm_health
+    ok, detail = await check_llm_health()
+    return {"status": "ok" if ok else "error", "detail": detail}

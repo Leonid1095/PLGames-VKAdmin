@@ -475,10 +475,13 @@ async def get_suggestion(suggestion_id: int) -> SuggestedPost | None:
         return result.scalar_one_or_none()
 
 
-async def review_suggestion(suggestion_id: int, status: str, reviewed_by: int, reject_reason: str = "") -> None:
+async def review_suggestion(suggestion_id: int, group_id: int, status: str, reviewed_by: int, reject_reason: str = "") -> None:
     async with async_session() as session:
         result = await session.execute(
-            select(SuggestedPost).where(SuggestedPost.id == suggestion_id)
+            select(SuggestedPost).where(
+                SuggestedPost.id == suggestion_id,
+                SuggestedPost.group_id == group_id,
+            )
         )
         post = result.scalar_one_or_none()
         if post:
@@ -514,10 +517,13 @@ async def get_content_sources(group_id: int) -> list[ContentSource]:
         return list(result.scalars().all())
 
 
-async def delete_content_source(source_id: int) -> bool:
+async def delete_content_source(source_id: int, group_id: int) -> bool:
     async with async_session() as session:
         result = await session.execute(
-            select(ContentSource).where(ContentSource.id == source_id)
+            select(ContentSource).where(
+                ContentSource.id == source_id,
+                ContentSource.group_id == group_id,
+            )
         )
         src = result.scalar_one_or_none()
         if src:
@@ -758,10 +764,13 @@ async def update_content_task_run(task_id: int) -> None:
             await session.commit()
 
 
-async def delete_content_task(task_id: int) -> bool:
+async def delete_content_task(task_id: int, group_id: int) -> bool:
     async with async_session() as session:
         result = await session.execute(
-            select(ContentTask).where(ContentTask.id == task_id)
+            select(ContentTask).where(
+                ContentTask.id == task_id,
+                ContentTask.group_id == group_id,
+            )
         )
         task = result.scalar_one_or_none()
         if task:

@@ -1,5 +1,6 @@
 """Admin dashboard — web panel for managing connected groups."""
 
+import hmac
 import logging
 from html import escape
 from fastapi import APIRouter, Request
@@ -253,7 +254,7 @@ async def login_submit(request: Request):
     form = await request.form()
     password = str(form.get("password", ""))
 
-    if password == get_dashboard_password():
+    if hmac.compare_digest(password, get_dashboard_password()):
         response = RedirectResponse("/dashboard", status_code=303)
         set_auth_cookie(response)
         return response

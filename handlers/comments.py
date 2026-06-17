@@ -90,7 +90,10 @@ async def handle_wall_comment(ctx: GroupContext, event_object: dict) -> None:
 
     # ── Gamification: Award XP (only if enabled) ──
     if gamification_on:
-        cooldown_sec = int(await get_setting(ctx.group_id, "xp_cooldown_sec", "60"))
+        try:
+            cooldown_sec = int(await get_setting(ctx.group_id, "xp_cooldown_sec", "60"))
+        except ValueError:
+            cooldown_sec = 60
         cooldown_key = (ctx.group_id, from_id)
         now = time.monotonic()
         last_xp = _xp_cooldowns.get(cooldown_key, 0)
@@ -137,6 +140,10 @@ async def handle_wall_comment(ctx: GroupContext, event_object: dict) -> None:
         system_prompt=system_prompt,
         group_id=ctx.group_id,
     )
+
+    # Don't post an LLM error string as a public comment.
+    if not reply_text or reply_text.startswith("Извините"):
+        return
 
     try:
         await ctx.api.wall.create_comment(

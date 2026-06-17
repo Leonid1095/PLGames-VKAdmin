@@ -8,7 +8,13 @@ import json
 import logging
 from datetime import datetime, timezone, timedelta
 
-from openai import AsyncOpenAI
+from openai import (
+    AsyncOpenAI,
+    APIConnectionError,
+    APIStatusError,
+    AuthenticationError,
+    PermissionDeniedError,
+)
 from core.config import settings
 from core.group_context import GroupContext
 
@@ -504,12 +510,12 @@ async def _exec_review_suggestion(ctx: GroupContext, args: dict) -> str:
         return f"Предложение уже обработано ({suggestion.status})."
 
     if action == "accept":
-        await review_suggestion(sid, "approved", ctx.admin_vk_id)
+        await review_suggestion(sid, ctx.group_id, "approved", ctx.admin_vk_id)
         try:
             result = await ctx.api.wall.post(owner_id=-ctx.group_id, message=suggestion.text)
             vk_post_id = result.post_id if result else 0
             await send_to_telegram(ctx.group_id, suggestion.text, vk_post_id)
-            await review_suggestion(sid, "published", ctx.admin_vk_id)
+            await review_suggestion(sid, ctx.group_id, "published", ctx.admin_vk_id)
             try:
                 await ctx.api.messages.send(
                     user_id=suggestion.from_vk_id,
@@ -522,7 +528,7 @@ async def _exec_review_suggestion(ctx: GroupContext, args: dict) -> str:
         except Exception as e:
             return f"Ошибка публикации: {e}"
     else:
-        await review_suggestion(sid, "rejected", ctx.admin_vk_id, reason)
+        await review_suggestion(sid, ctx.group_id, "rejected", ctx.admin_vk_id, reason)
         try:
             msg = f"Ваше предложение #{sid} отклонено."
             if reason:
@@ -561,7 +567,7 @@ async def _exec_remove_content_source(ctx: GroupContext, args: dict) -> str:
     from database.service import delete_content_source
 
     sid = args["source_id"]
-    ok = await delete_content_source(sid)
+    ok = await delete_content_source(sid, ctx.group_id)
     return f"Источник #{sid} удалён." if ok else "Источник не найден."
 
 
@@ -631,11 +637,50 @@ async def _exec_send_newsletter(ctx: GroupContext, args: dict) -> str:
     return f"Рассылка запущена для {total} участников."
 
 
+# Keys the admin may change via natural language. Internal/control keys
+# (anything starting with "_", onboarding_*, confirmation/secret) are NOT here,
+# so a hallucinated tool call can't corrupt bot state.
+_SETTABLE_KEYS = {
+    "moderation_level", "autopost_enabled", "autopost_interval_hours",
+    "welcome_ai", "welcome_message", "gamification_enabled", "reply_to_comments",
+    "ai_tone", "ai_system_prompt", "ai_moderation_rules", "ai_content_topics",
+    "ai_group_description", "active_model", "banned_words",
+    "xp_per_like", "xp_per_repost", "xp_cooldown_sec",
+}
+_BOOL_SETTING_KEYS = {"autopost_enabled", "welcome_ai", "gamification_enabled", "reply_to_comments"}
+_INT_SETTING_KEYS = {"moderation_level", "autopost_interval_hours", "xp_per_like", "xp_per_repost", "xp_cooldown_sec"}
+_TRUE_WORDS = {"true", "да", "вкл", "включить", "on", "1", "yes"}
+_FALSE_WORDS = {"false", "нет", "выкл", "выключить", "off", "0", "no"}
+
+
 async def _exec_change_setting(ctx: GroupContext, args: dict) -> str:
     from database.service import set_setting
 
-    key = args["key"]
-    value = args["value"]
+    key = (args.get("key") or "").strip()
+    value = (args.get("value") or "").strip()
+
+    if key not in _SETTABLE_KEYS:
+        return (
+            f"Настройку «{key}» менять нельзя (или такой нет). "
+            f"Доступные: {', '.join(sorted(_SETTABLE_KEYS))}."
+        )
+
+    if key in _BOOL_SETTING_KEYS:
+        v = value.lower()
+        if v in _TRUE_WORDS:
+            value = "true"
+        elif v in _FALSE_WORDS:
+            value = "false"
+        else:
+            return f"Для «{key}» нужно значение вкл/выкл (true/false)."
+    elif key in _INT_SETTING_KEYS:
+        try:
+            iv = int(value)
+        except ValueError:
+            return f"Для «{key}» нужно число."
+        iv = max(1, min(5, iv)) if key == "moderation_level" else max(0, iv)
+        value = str(iv)
+
     await set_setting(ctx.group_id, key, value)
     return f"Настройка обновлена: {key} = {value}"
 
@@ -828,6 +873,44 @@ def _get_client() -> AsyncOpenAI:
     )
 
 
+async def check_llm_health() -> tuple[bool, str]:
+    """Ping the LLM provider with a minimal request.
+
+    Returns (ok, detail). Distinguishes a rejected key (config problem the
+    operator must fix) from an unreachable provider or a transient error, so a
+    dead key surfaces clearly instead of masquerading as a generic failure.
+    """
+    if not settings.OPENROUTER_API_KEY:
+        return False, "OPENROUTER_API_KEY is empty — set it in .env"
+
+    client = AsyncOpenAI(
+        base_url=settings.OPENROUTER_BASE_URL,
+        api_key=settings.OPENROUTER_API_KEY,
+        timeout=40.0,  # generous: gateway may route to a cold local model
+    )
+    try:
+        await client.chat.completions.create(
+            model=settings.DEFAULT_MODEL,
+            messages=[{"role": "user", "content": "ping"}],
+            max_tokens=5,
+        )
+        return True, "ok"
+    except (AuthenticationError, PermissionDeniedError) as e:
+        code = getattr(e, "status_code", "?")
+        return False, (
+            f"provider rejected the key (HTTP {code}) at {settings.OPENROUTER_BASE_URL} "
+            f"for model {settings.DEFAULT_MODEL!r} — OPENROUTER_API_KEY is invalid "
+            f"or not authorized"
+        )
+    except APIConnectionError as e:
+        return False, f"cannot reach provider at {settings.OPENROUTER_BASE_URL}: {e}"
+    except APIStatusError as e:
+        code = getattr(e, "status_code", "?")
+        return False, f"provider returned HTTP {code} for model {settings.DEFAULT_MODEL!r}: {e}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
 async def _build_system_prompt(ctx: GroupContext, is_admin: bool) -> str:
     """Build agent system prompt with group context."""
     from core.ai_brain import _get_group_ai_context
@@ -905,6 +988,15 @@ async def run_agent(
                 "X-Title": "VK AI Admin Bot",
             },
         )
+    except (AuthenticationError, PermissionDeniedError) as e:
+        code = getattr(e, "status_code", "?")
+        logger.error(
+            "Agent LLM call REJECTED (auth, HTTP %s): the AI provider refused the key. "
+            "No AI feature can work until this is fixed. "
+            "Check OPENROUTER_API_KEY / model access. base_url=%s model=%s",
+            code, settings.OPENROUTER_BASE_URL, model,
+        )
+        return "Произошла ошибка. Попробуйте позже."
     except Exception as e:
         logger.error(f"Agent LLM call failed: {e}")
         return "Произошла ошибка. Попробуйте позже."

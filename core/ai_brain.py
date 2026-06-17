@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, AuthenticationError, PermissionDeniedError
 from core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -41,6 +41,12 @@ async def _call_llm(messages: list[dict], model: str = None, group_id: int = Non
             if content is None:
                 return "ИИ вернул пустой ответ."
             return content
+        except (AuthenticationError, PermissionDeniedError) as e:
+            # Auth/permission errors are not transient — retrying just wastes
+            # time and quota. Surface immediately (the startup health-check and
+            # /api/health/llm explain the root cause to the operator).
+            logger.error(f"AI provider rejected the key (no retry): {e}")
+            return "Извините, произошла ошибка при обращении к ИИ. Попробуйте позже."
         except Exception as e:
             logger.warning(f"AI provider error (attempt {attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
@@ -166,7 +172,13 @@ async def analyze_toxicity(group_id: int, text: str) -> bool:
         "Ответь ТОЛЬКО одним словом: ДА (если надо удалить) или НЕТ (если оставить)."
     )
     result = await generate_response(prompt=text, system_prompt=system_prompt, group_id=group_id)
-    return bool(result and "ДА" in result.strip().upper())
+    # The model is instructed to answer ONE word (ДА/НЕТ). Compare the first
+    # token exactly — a substring check matched any word containing «да»
+    # (e.g. «вода»→«ВОДА», «правда»→«ПРАВДА»), causing false deletions/auto-bans.
+    # On an LLM error the reply starts with «Извините…» → not «ДА» → fail-safe (keep).
+    tokens = (result or "").strip().upper().split()
+    first = tokens[0].strip(".!?,:;»«\"'()") if tokens else ""
+    return first == "ДА"
 
 # ─── Public: Post generation ──────────────────────────────────────────────────
 

@@ -76,17 +76,31 @@ def verify_vk_launch_params(query_params: dict) -> VKLaunchParams | None:
     )
 
 
+def _miniapp_signing_key() -> bytes:
+    """Domain-separated signing key derived from JWT_SECRET.
+
+    Not the raw secret, so the Mini App key is independent of the dashboard
+    session cookie / password even though they share JWT_SECRET as a root.
+    """
+    return hmac.new(
+        settings.JWT_SECRET.encode(), b"miniapp-token-v1", hashlib.sha256
+    ).digest()
+
+
+def _sign_miniapp(data: str) -> str:
+    """Full-length (256-bit) HMAC-SHA256 over the token payload."""
+    return hmac.new(_miniapp_signing_key(), data.encode(), hashlib.sha256).hexdigest()
+
+
 def create_miniapp_token(vk_user_id: int, vk_group_id: int = 0) -> str:
-    """Create a signed JWT-like token for Mini App session (24 hours)."""
+    """Create a signed token for a Mini App session (24 hours)."""
     payload = {
         "uid": vk_user_id,
         "gid": vk_group_id,
         "exp": int(time.time()) + 86400,
     }
     data = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
-    sig = hmac.new(
-        settings.JWT_SECRET.encode(), data.encode(), hashlib.sha256
-    ).hexdigest()[:16]
+    sig = _sign_miniapp(data)
     return f"{data}.{sig}"
 
 
@@ -96,9 +110,7 @@ def verify_miniapp_token(token: str) -> dict | None:
         return None
     try:
         data, sig = token.rsplit(".", 1)
-        expected_sig = hmac.new(
-            settings.JWT_SECRET.encode(), data.encode(), hashlib.sha256
-        ).hexdigest()[:16]
+        expected_sig = _sign_miniapp(data)
         if not hmac.compare_digest(sig, expected_sig):
             return None
         payload = json.loads(base64.urlsafe_b64decode(data + "=="))

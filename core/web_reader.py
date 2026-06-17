@@ -2,6 +2,8 @@
 
 import html
 import re
+import socket
+import ipaddress
 import logging
 from urllib.parse import urlparse
 
@@ -12,6 +14,36 @@ from core.config import settings
 logger = logging.getLogger(__name__)
 
 _GITHUB_API = "https://api.github.com"
+
+
+def is_safe_public_url(url: str) -> bool:
+    """SSRF guard: allow only http(s) URLs that resolve to public IPs.
+
+    Blocks loopback/private/link-local/reserved ranges so an admin-supplied
+    (or forged-token-supplied) URL can't reach 127.0.0.1, 169.254.169.254
+    (cloud metadata), or internal services. Note: this validates the *input*
+    host; redirect-based SSRF is a residual risk (callers keep follow_redirects
+    for legitimate http→https feeds).
+    """
+    try:
+        p = urlparse(url)
+    except Exception:
+        return False
+    if p.scheme not in ("http", "https") or not p.hostname:
+        return False
+    try:
+        infos = socket.getaddrinfo(p.hostname, None)
+    except Exception:
+        return False
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+            return False
+    return True
 
 
 def _github_headers() -> dict:
@@ -41,6 +73,9 @@ async def read_url(url: str) -> str:
 
 async def _read_webpage(url: str) -> str:
     """Fetch a web page and extract readable text."""
+    if not is_safe_public_url(url):
+        logger.warning(f"Blocked non-public/unsafe URL fetch: {url}")
+        return "Ошибка: ссылка недоступна (недопустимый или внутренний адрес)."
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             resp = await client.get(url, headers={

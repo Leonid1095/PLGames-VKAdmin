@@ -11,7 +11,7 @@ import httpx
 
 from core.config import settings
 from core.content_writer import write_from_source, write_from_multiple_sources
-from core.web_reader import read_url
+from core.web_reader import read_url, is_safe_public_url
 from database.service import (
     get_content_sources, update_source_fetched,
     create_scheduled_post, get_setting, set_setting,
@@ -35,16 +35,26 @@ async def _get_used_hashes(group_id: int) -> set[str]:
 
 
 async def _save_used_hash(group_id: int, h: str) -> None:
-    """Append a hash to the used set (keep last 200)."""
-    existing = await _get_used_hashes(group_id)
-    existing.add(h)
-    # Keep only last 200 hashes
-    trimmed = list(existing)[-200:]
+    """Append a hash to the used list, preserving insertion order (keep last 200).
+
+    Must stay ordered: a set loses order, so trimming could evict the hash we
+    just added and let the same item be re-posted. We read the raw ordered CSV,
+    move/append the new hash to the end, then drop the oldest beyond 200.
+    """
+    raw = await get_setting(group_id, "_used_content_hashes", "")
+    hashes = [x for x in raw.split(",") if x] if raw else []
+    if h in hashes:
+        hashes.remove(h)  # re-add at the end so the freshest stays newest
+    hashes.append(h)
+    trimmed = hashes[-200:]
     await set_setting(group_id, "_used_content_hashes", ",".join(trimmed))
 
 
 async def parse_rss(url: str) -> list[dict]:
     """Fetch and parse an RSS feed. Returns list of {title, text, link, image_url}."""
+    if not is_safe_public_url(url):
+        logger.warning(f"Blocked non-public RSS URL: {url}")
+        return []
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             resp = await client.get(url, headers={
@@ -131,6 +141,9 @@ async def parse_vk_group(source_url: str) -> list[dict]:
 
 async def parse_api(url: str) -> list[dict]:
     """Fetch news from a JSON API."""
+    if not is_safe_public_url(url):
+        logger.warning(f"Blocked non-public API URL: {url}")
+        return []
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(url)
@@ -168,6 +181,9 @@ async def parse_web(url: str) -> list[dict]:
 async def _download_image(url: str) -> bytes | None:
     """Download an image from URL, return bytes or None."""
     if not url:
+        return None
+    if not is_safe_public_url(url):
+        logger.warning(f"Blocked non-public image URL: {url}")
         return None
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
@@ -238,9 +254,7 @@ async def fetch_and_schedule(group_id: int) -> int:
         # Pick from top 3 longest items randomly
         candidates = fresh_items[:min(3, len(fresh_items))]
         chosen = random.choice(candidates)
-
-        # Mark as used
-        await _save_used_hash(group_id, _item_hash(chosen))
+        chosen_hash = _item_hash(chosen)
 
         # If item has a link and text is short — fetch full content from link
         source_text = chosen.get("text", "")
@@ -315,6 +329,9 @@ async def fetch_and_schedule(group_id: int) -> int:
             scheduled_at=scheduled_at, source="parsed",
             attachments=attachment,
         )
+        # Mark used only AFTER the post is actually scheduled, so a failed
+        # fetch/generation doesn't permanently burn the item (B1).
+        await _save_used_hash(group_id, chosen_hash)
         scheduled += 1
         logger.info(f"Scheduled post from source #{source.id} for group {group_id} (image: {'yes' if attachment else 'no'})")
 

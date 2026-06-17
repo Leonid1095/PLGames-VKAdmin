@@ -11,29 +11,33 @@ logger = logging.getLogger(__name__)
 
 COOKIE_NAME = "vkadmin_session"
 CSRF_COOKIE_NAME = "vkadmin_csrf"
-# Dashboard password — derived from JWT_SECRET
-# Admin sets JWT_SECRET in .env, that's the dashboard password
 _SESSION_TOKEN = None
 
 
 def _get_session_token() -> str:
-    """Derive a session token from JWT_SECRET."""
+    """Server-side session cookie value.
+
+    Derived from SESSION_SECRET (falls back to JWT_SECRET) via a domain-separated
+    HMAC, so the cookie value is not equal to the signing secret or the password.
+    """
     global _SESSION_TOKEN
     if _SESSION_TOKEN is None:
-        secret = settings.JWT_SECRET
-        _SESSION_TOKEN = hashlib.sha256(f"vkadmin:{secret}".encode()).hexdigest()[:32]
+        seed = settings.SESSION_SECRET or settings.JWT_SECRET
+        _SESSION_TOKEN = hmac.new(
+            seed.encode(), b"vkadmin-dashboard-session-v1", hashlib.sha256
+        ).hexdigest()[:32]
     return _SESSION_TOKEN
 
 
 def get_dashboard_password() -> str:
-    """The password to enter dashboard = JWT_SECRET from .env."""
-    return settings.JWT_SECRET
+    """Dashboard login password — DASHBOARD_PASSWORD, or JWT_SECRET if unset."""
+    return settings.DASHBOARD_PASSWORD or settings.JWT_SECRET
 
 
 def is_authenticated(request: Request) -> bool:
     """Check if the request has a valid session cookie."""
     cookie = request.cookies.get(COOKIE_NAME, "")
-    return cookie == _get_session_token()
+    return hmac.compare_digest(cookie, _get_session_token())
 
 
 def set_auth_cookie(response: Response) -> Response:

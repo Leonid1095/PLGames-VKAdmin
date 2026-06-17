@@ -1051,13 +1051,13 @@ async def api_review_suggestion(request: Request):
             api = API(token=vk_token)
             result = await api.wall.post(owner_id=-group_id, message=suggestion.text)
             vk_post_id = result.post_id if result else 0
-            await review_suggestion(suggestion_id, "published", auth["uid"])
+            await review_suggestion(suggestion_id, group_id, "published", auth["uid"])
             await send_to_telegram(group_id, suggestion.text, vk_post_id)
             return JSONResponse({"ok": True, "vk_post_id": vk_post_id})
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
     elif action == "reject":
-        await review_suggestion(suggestion_id, "rejected", auth["uid"])
+        await review_suggestion(suggestion_id, group_id, "rejected", auth["uid"])
         return JSONResponse({"ok": True})
     else:
         return JSONResponse({"error": "Неизвестное действие"}, status_code=400)
@@ -1236,13 +1236,32 @@ async def api_send_newsletter(request: Request):
 
     data = await request.json()
     text = data.get("text", "").strip()
-    if not text:
-        return JSONResponse({"error": "Пустой текст"}, status_code=400)
+    if len(text) < 10:
+        return JSONResponse({"error": "Текст рассылки слишком короткий (мин. 10 символов)."}, status_code=400)
 
     import asyncio
+    from datetime import datetime, timezone
     from core.crypto import decrypt_token
     from vkbottle import API
-    from database.service import create_newsletter, update_newsletter_progress
+    from database.service import (
+        create_newsletter, update_newsletter_progress, get_setting, set_setting,
+    )
+
+    # Daily cap: 1 newsletter / 24h (matches core/agent.py) to prevent spam abuse
+    # and getting the group's VK token rate-limited.
+    last_sent_str = await get_setting(group_id, "_last_newsletter_at", "")
+    if last_sent_str:
+        try:
+            last_sent = datetime.fromisoformat(last_sent_str)
+            hours_since = (datetime.now(timezone.utc) - last_sent).total_seconds() / 3600
+            if hours_since < 24:
+                return JSONResponse(
+                    {"error": f"Рассылка уже отправлялась сегодня (лимит 1 раз в 24ч). "
+                              f"Осталось ~{24 - hours_since:.1f} ч."},
+                    status_code=429,
+                )
+        except ValueError:
+            pass
 
     try:
         vk_token = decrypt_token(group.access_token)
@@ -1254,6 +1273,7 @@ async def api_send_newsletter(request: Request):
             return JSONResponse({"error": "Нет участников"}, status_code=400)
 
         nl = await create_newsletter(group_id, text, auth["uid"], total)
+        await set_setting(group_id, "_last_newsletter_at", datetime.now(timezone.utc).isoformat())
 
         # Send in background
         async def _send():
@@ -1935,7 +1955,7 @@ async def miniapp_delete_task(request: Request, group_id: int):
     form = await request.form()
     task_id = int(form.get("task_id", 0))
     if task_id:
-        await delete_content_task(task_id)
+        await delete_content_task(task_id, group_id)
 
     return RedirectResponse(f"/miniapp/group/{group_id}?token={token}&msg=saved", status_code=303)
 
@@ -1977,7 +1997,7 @@ async def miniapp_delete_source(request: Request, group_id: int):
     form = await request.form()
     source_id = int(form.get("source_id", 0))
     if source_id:
-        await delete_content_source(source_id)
+        await delete_content_source(source_id, group_id)
 
     return RedirectResponse(f"/miniapp/group/{group_id}?token={token}&msg=saved", status_code=303)
 

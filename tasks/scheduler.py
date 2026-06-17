@@ -37,7 +37,10 @@ async def _autopost_job():
             if enabled != "true":
                 continue
 
-            interval_hours = int(await get_setting(group.group_id, "autopost_interval_hours", "6"))
+            try:
+                interval_hours = int(await get_setting(group.group_id, "autopost_interval_hours", "6"))
+            except ValueError:
+                interval_hours = 6
             last_post_str = await get_setting(group.group_id, "_last_autopost", "")
 
             if last_post_str:

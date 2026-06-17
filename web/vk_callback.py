@@ -22,6 +22,10 @@ router = APIRouter()
 _processed_events: OrderedDict[str, None] = OrderedDict()
 _MAX_EVENTS_CACHE = 10000
 
+# Strong refs to in-flight handlers so they aren't garbage-collected mid-run
+# (asyncio only holds a weak ref to tasks). Discarded when each task finishes.
+_background_tasks: set[asyncio.Task] = set()
+
 # Basic rate limiting: max events per group per window
 _RATE_LIMIT_WINDOW = 60  # seconds
 _RATE_LIMIT_MAX = 120  # max events per group per window
@@ -42,9 +46,13 @@ def _check_rate_limit(group_id: int) -> bool:
     return False
 
 
+def _event_key(group_id: int, event_id: str) -> str:
+    return f"{group_id}:{event_id}"
+
+
 def _check_and_add_event(group_id: int, event_id: str) -> bool:
     """Returns True if event is duplicate (already seen)."""
-    key = f"{group_id}:{event_id}"
+    key = _event_key(group_id, event_id)
     if key in _processed_events:
         _processed_events.move_to_end(key)
         return True
@@ -52,6 +60,32 @@ def _check_and_add_event(group_id: int, event_id: str) -> bool:
     while len(_processed_events) > _MAX_EVENTS_CACHE:
         _processed_events.popitem(last=False)
     return False
+
+
+def _spawn(coro, event_key: str | None) -> None:
+    """Run an event handler in the background without losing it or its errors.
+
+    Keeps a strong ref (avoid GC), logs any exception (no silent swallowing),
+    and on failure un-marks the event from the dedup cache so a VK redelivery
+    of the same event_id is reprocessed instead of being dropped.
+    """
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+
+    def _done(t: asyncio.Task) -> None:
+        _background_tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.error(
+                "Background event handler failed (event=%s): %r",
+                event_key, exc, exc_info=exc,
+            )
+            if event_key is not None:
+                _processed_events.pop(event_key, None)
+
+    task.add_done_callback(_done)
 
 
 async def _build_context(group_id: int) -> GroupContext | None:
@@ -170,7 +204,9 @@ async def _process_group_join(ctx: GroupContext, obj: dict):
             group_id=ctx.group_id,
         )
 
-    if welcome_msg:
+    # Never send an LLM error string as a welcome. If AI generation failed,
+    # stay silent rather than greeting newcomers with "Извините, произошла ошибка".
+    if welcome_msg and not welcome_msg.startswith("Извините"):
         try:
             await ctx.api.messages.send(user_id=user_id, message=welcome_msg, random_id=0)
             logger.info(f"Welcome message sent to {user_id} in group {ctx.group_id}")
@@ -185,7 +221,10 @@ async def _process_like(ctx: GroupContext, obj: dict):
     liker_id = obj.get("liker_id", 0)
     if not liker_id or liker_id < 0:
         return
-    xp = int(await get_setting(ctx.group_id, "xp_per_like", "2"))
+    try:
+        xp = int(await get_setting(ctx.group_id, "xp_per_like", "2"))
+    except ValueError:
+        xp = 2
     if xp > 0:
         await add_xp_activity(ctx.group_id, liker_id, xp)
 
@@ -197,7 +236,10 @@ async def _process_repost(ctx: GroupContext, obj: dict):
     from_id = obj.get("from_id", 0)
     if not from_id or from_id < 0:
         return
-    xp = int(await get_setting(ctx.group_id, "xp_per_repost", "5"))
+    try:
+        xp = int(await get_setting(ctx.group_id, "xp_per_repost", "5"))
+    except ValueError:
+        xp = 5
     if xp > 0:
         await add_xp_activity(ctx.group_id, from_id, xp)
 
@@ -252,19 +294,20 @@ async def vk_callback(request: Request):
         return PlainTextResponse("ok")
 
     obj = data.get("object", {})
+    event_key = _event_key(group_id, event_id) if event_id else None
 
     # ── Dispatch event ──
     if event_type == "message_new":
-        asyncio.create_task(_process_message(ctx, obj))
+        _spawn(_process_message(ctx, obj), event_key)
     elif event_type == "wall_reply_new":
-        asyncio.create_task(_process_wall_reply(ctx, obj))
+        _spawn(_process_wall_reply(ctx, obj), event_key)
     elif event_type == "group_join":
-        asyncio.create_task(_process_group_join(ctx, obj))
+        _spawn(_process_group_join(ctx, obj), event_key)
     elif event_type == "group_leave":
-        asyncio.create_task(_process_group_leave(ctx, obj))
+        _spawn(_process_group_leave(ctx, obj), event_key)
     elif event_type == "like_add":
-        asyncio.create_task(_process_like(ctx, obj))
+        _spawn(_process_like(ctx, obj), event_key)
     elif event_type == "wall_repost":
-        asyncio.create_task(_process_repost(ctx, obj))
+        _spawn(_process_repost(ctx, obj), event_key)
 
     return PlainTextResponse("ok")
