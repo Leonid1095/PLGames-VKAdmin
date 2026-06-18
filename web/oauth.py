@@ -14,6 +14,59 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+async def _setup_callback_api(token: str, gid: int, secret_key: str) -> None:
+    """Idempotently register/refresh this group's Callback API server.
+
+    VK has no upsert: ``addCallbackServer`` creates a NEW server on every call, so
+    reconnecting a group used to pile up duplicate "VKAdmin Bot" servers (and a
+    duplicate could end up the one VK delivers to, with the wrong/empty secret).
+    Here we reuse the existing server that points at our events URL — and editing
+    it also re-validates a server VK had marked ``failed`` — instead of adding one.
+    Enables exactly the event types ``web/vk_callback.py`` dispatches.
+    """
+    callback_url = f"{settings.BASE_URL}/api/vk/events"
+    common = {"access_token": token, "v": "5.199"}
+    async with httpx.AsyncClient() as client:
+        servers_resp = await client.get(
+            "https://api.vk.com/method/groups.getCallbackServers",
+            params={"group_id": gid, **common},
+        )
+        items = servers_resp.json().get("response", {}).get("items", [])
+        server_id = next((s["id"] for s in items if s.get("url") == callback_url), None)
+
+        if server_id:
+            # Refresh url/title/secret on the existing server; this re-checks the
+            # endpoint, flipping a previously-failed server back to "ok".
+            await client.get(
+                "https://api.vk.com/method/groups.editCallbackServer",
+                params={
+                    "group_id": gid, "server_id": server_id, "url": callback_url,
+                    "title": "VKAdmin Bot", "secret_key": secret_key, **common,
+                },
+            )
+        else:
+            add_resp = await client.get(
+                "https://api.vk.com/method/groups.addCallbackServer",
+                params={
+                    "group_id": gid, "url": callback_url,
+                    "title": "VKAdmin Bot", "secret_key": secret_key, **common,
+                },
+            )
+            server_id = add_resp.json().get("response", {}).get("server_id")
+
+        if server_id:
+            await client.get(
+                "https://api.vk.com/method/groups.setCallbackSettings",
+                params={
+                    "group_id": gid, "server_id": server_id,
+                    "message_new": 1, "wall_reply_new": 1,
+                    "group_join": 1, "group_leave": 1,
+                    "like_add": 1, "wall_repost": 1, **common,
+                },
+            )
+            logger.info(f"Callback API configured for group {gid} (server_id={server_id})")
+
+
 @router.get("/api/vk/oauth")
 async def start_oauth(request: Request, group_ids: str = ""):
     """
@@ -222,42 +275,9 @@ async def oauth_callback(request: Request, code: str = "", error: str = "", erro
             except Exception as e:
                 logger.warning(f"AI setup failed for group {gid}, will use defaults: {e}")
 
-            # Set up Callback API server for this group
+            # Set up Callback API server for this group (idempotent)
             try:
-                callback_url = f"{settings.BASE_URL}/api/vk/events"
-                async with httpx.AsyncClient() as client:
-                    # Add callback server
-                    add_resp = await client.get(
-                        "https://api.vk.com/method/groups.addCallbackServer",
-                        params={
-                            "group_id": gid,
-                            "url": callback_url,
-                            "title": "VKAdmin Bot",
-                            "secret_key": secret_key,
-                            "access_token": token,
-                            "v": "5.199",
-                        },
-                    )
-                    add_data = add_resp.json()
-                    server_id = add_data.get("response", {}).get("server_id")
-
-                    if server_id:
-                        # Enable message_new and wall_reply_new events
-                        await client.get(
-                            "https://api.vk.com/method/groups.setCallbackSettings",
-                            params={
-                                "group_id": gid,
-                                "server_id": server_id,
-                                "message_new": 1,
-                                "wall_reply_new": 1,
-                                "wall_post_new": 1,
-                                "group_join": 1,
-                                "group_leave": 1,
-                                "access_token": token,
-                                "v": "5.199",
-                            },
-                        )
-                        logger.info(f"Callback API configured for group {gid}")
+                await _setup_callback_api(token, gid, secret_key)
             except Exception as e:
                 logger.error(f"Failed to setup Callback API for {gid}: {e}")
 
@@ -358,30 +378,9 @@ async def oauth_token_callback(request: Request):
             except Exception as e:
                 logger.warning(f"AI setup failed for group {gid}: {e}")
 
-            # Setup Callback API
+            # Setup Callback API (idempotent)
             try:
-                callback_url = f"{settings.BASE_URL}/api/vk/events"
-                async with httpx.AsyncClient() as client:
-                    add_resp = await client.get(
-                        "https://api.vk.com/method/groups.addCallbackServer",
-                        params={
-                            "group_id": gid, "url": callback_url,
-                            "title": "VKAdmin Bot", "secret_key": secret_key,
-                            "access_token": token, "v": "5.199",
-                        },
-                    )
-                    add_data = add_resp.json()
-                    server_id = add_data.get("response", {}).get("server_id")
-                    if server_id:
-                        await client.get(
-                            "https://api.vk.com/method/groups.setCallbackSettings",
-                            params={
-                                "group_id": gid, "server_id": server_id,
-                                "message_new": 1, "wall_reply_new": 1,
-                                "access_token": token, "v": "5.199",
-                            },
-                        )
-                        logger.info(f"Callback API configured for group {gid}")
+                await _setup_callback_api(token, gid, secret_key)
             except Exception as e:
                 logger.error(f"Failed to setup Callback API for {gid}: {e}")
 
