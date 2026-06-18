@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from datetime import datetime, timezone
 from openai import AsyncOpenAI, AuthenticationError, PermissionDeniedError
 from core.config import settings
 
@@ -68,59 +67,6 @@ async def _get_group_ai_context(group_id: int) -> dict:
         "ai_group_description": await get_setting(group_id, "ai_group_description", ""),
         "ai_tone": await get_setting(group_id, "ai_tone", "friendly"),
     }
-
-# ─── Public: Chat with memory ─────────────────────────────────────────────────
-
-async def chat_with_memory(group_id: int, vk_id: int, user_text: str) -> str:
-    """Main chat function with per-group memory and group-aware personality."""
-    from database.service import (
-        get_setting, get_user_history, save_user_history,
-        check_and_increment_limit, get_user_stats,
-    )
-
-    can_request = await check_and_increment_limit(group_id, vk_id)
-    if not can_request:
-        return (
-            "Ох, сервера устали! Мой начальник выдал мне лимит на бесплатные "
-            "беседы, и на сегодня он исчерпан (10 запросов). "
-            "Подключи VIP (напиши !купить), и мы сможем общаться без остановки!"
-        )
-
-    stats = await get_user_stats(group_id, vk_id)
-    ctx = await _get_group_ai_context(group_id)
-
-    # Use group-specific AI prompt if available, fallback to generic system_prompt
-    if ctx["ai_system_prompt"]:
-        system_prompt = ctx["ai_system_prompt"]
-    else:
-        system_prompt = await get_setting(
-            group_id, "system_prompt",
-            "Ты вежливый и отзывчивый помощник-администратор группы ВКонтакте."
-        )
-
-    is_vip_active = stats.is_vip and (
-        not stats.vip_expires or stats.vip_expires > datetime.now(timezone.utc)
-    )
-    if is_vip_active:
-        system_prompt += (
-            "\nВАЖНО: Ты общаешься с пользователем со статусом VIP. "
-            "Будь к нему максимально почтителен и услужлив."
-        )
-
-    model = await get_setting(group_id, "active_model", settings.DEFAULT_MODEL)
-
-    history = await get_user_history(group_id, vk_id)
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history)
-    messages.append({"role": "user", "content": user_text})
-
-    reply = await _call_llm(messages, model=model)
-
-    history.append({"role": "user", "content": user_text})
-    history.append({"role": "assistant", "content": reply})
-    await save_user_history(group_id, vk_id, history)
-
-    return reply
 
 # ─── Public: One-shot generation (no memory) ─────────────────────────────────
 

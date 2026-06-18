@@ -3,12 +3,22 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from sqlalchemy import select, update
-from database.engine import async_session
+from database.engine import async_session, _is_sqlite
 from database.models import (
     Group, UserContext, GroupSettings, UserStats,
     SuggestedPost, ContentSource, ScheduledPost, PostAnalytics,
     Newsletter, BanRecord, ContentTask,
 )
+
+# Dialect-aware INSERT ... ON CONFLICT. Both the sqlite and postgresql dialects
+# expose on_conflict_do_update / on_conflict_do_nothing with the same signature,
+# which lets get-or-create paths upsert atomically instead of racing on a
+# SELECT-then-INSERT (B3: two coroutines both miss the row, both insert, the
+# second hits the UNIQUE constraint and crashes).
+if _is_sqlite:
+    from sqlalchemy.dialects.sqlite import insert as _upsert
+else:
+    from sqlalchemy.dialects.postgresql import insert as _upsert
 
 logger = logging.getLogger(__name__)
 
@@ -125,16 +135,15 @@ async def get_setting(group_id: int, key: str, default: str = "") -> str:
 
 async def set_setting(group_id: int, key: str, value: str) -> None:
     async with async_session() as session:
-        result = await session.execute(
-            select(GroupSettings).where(
-                GroupSettings.group_id == group_id, GroupSettings.key == key,
+        stmt = (
+            _upsert(GroupSettings)
+            .values(group_id=group_id, key=key, value=value)
+            .on_conflict_do_update(
+                index_elements=["group_id", "key"],
+                set_={"value": value},
             )
         )
-        row = result.scalar_one_or_none()
-        if row:
-            row.value = value
-        else:
-            session.add(GroupSettings(group_id=group_id, key=key, value=value))
+        await session.execute(stmt)
         await session.commit()
 
 
@@ -228,36 +237,40 @@ def _stats_to_dto(stats: UserStats) -> UserStatsDTO:
     )
 
 
+async def _ensure_stats_row(session, group_id: int, vk_id: int) -> None:
+    """Insert a blank stats row if absent, atomically (B3). Concurrent callers
+    race here — ON CONFLICT DO NOTHING makes the loser a no-op instead of a
+    UNIQUE-constraint crash. After this the row is guaranteed to exist."""
+    await session.execute(
+        _upsert(UserStats)
+        .values(group_id=group_id, vk_id=vk_id)
+        .on_conflict_do_nothing(index_elements=["group_id", "vk_id"])
+    )
+
+
 async def get_user_stats(group_id: int, vk_id: int) -> UserStatsDTO:
     async with async_session() as session:
+        await _ensure_stats_row(session, group_id, vk_id)
         result = await session.execute(
             select(UserStats).where(
                 UserStats.group_id == group_id, UserStats.vk_id == vk_id,
             )
         )
-        stats = result.scalar_one_or_none()
-        if not stats:
-            stats = UserStats(group_id=group_id, vk_id=vk_id)
-            session.add(stats)
-            await session.commit()
-            await session.refresh(stats)
-        return _stats_to_dto(stats)
+        return _stats_to_dto(result.scalar_one())
 
 
 async def check_and_increment_limit(group_id: int, vk_id: int) -> bool:
     from sqlalchemy import case
 
     async with async_session() as session:
+        await _ensure_stats_row(session, group_id, vk_id)
+        await session.commit()
         result = await session.execute(
             select(UserStats).where(
                 UserStats.group_id == group_id, UserStats.vk_id == vk_id,
             )
         )
-        stats = result.scalar_one_or_none()
-        if not stats:
-            stats = UserStats(group_id=group_id, vk_id=vk_id)
-            session.add(stats)
-            await session.commit()
+        stats = result.scalar_one()
 
         now = datetime.now(timezone.utc)
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -290,15 +303,13 @@ async def check_and_increment_limit(group_id: int, vk_id: int) -> bool:
 async def grant_vip(group_id: int, vk_id: int, days: int) -> None:
     from datetime import timedelta
     async with async_session() as session:
+        await _ensure_stats_row(session, group_id, vk_id)
         result = await session.execute(
             select(UserStats).where(
                 UserStats.group_id == group_id, UserStats.vk_id == vk_id,
             )
         )
-        stats = result.scalar_one_or_none()
-        if not stats:
-            stats = UserStats(group_id=group_id, vk_id=vk_id)
-            session.add(stats)
+        stats = result.scalar_one()
 
         stats.is_vip = True
         now = datetime.now(timezone.utc)
@@ -311,15 +322,13 @@ async def grant_vip(group_id: int, vk_id: int, days: int) -> None:
 
 async def modify_balance(group_id: int, vk_id: int, amount: float) -> float:
     async with async_session() as session:
+        await _ensure_stats_row(session, group_id, vk_id)
         result = await session.execute(
             select(UserStats).where(
                 UserStats.group_id == group_id, UserStats.vk_id == vk_id,
             )
         )
-        stats = result.scalar_one_or_none()
-        if not stats:
-            stats = UserStats(group_id=group_id, vk_id=vk_id)
-            session.add(stats)
+        stats = result.scalar_one()
 
         stats.balance += amount
         await session.commit()
@@ -328,15 +337,13 @@ async def modify_balance(group_id: int, vk_id: int, amount: float) -> float:
 
 async def add_xp(group_id: int, vk_id: int, xp_amount: int) -> tuple[int, bool]:
     async with async_session() as session:
+        await _ensure_stats_row(session, group_id, vk_id)
         result = await session.execute(
             select(UserStats).where(
                 UserStats.group_id == group_id, UserStats.vk_id == vk_id,
             )
         )
-        stats = result.scalar_one_or_none()
-        if not stats:
-            stats = UserStats(group_id=group_id, vk_id=vk_id)
-            session.add(stats)
+        stats = result.scalar_one()
 
         stats.messages_count += 1
         stats.xp += xp_amount
@@ -355,15 +362,13 @@ async def add_xp(group_id: int, vk_id: int, xp_amount: int) -> tuple[int, bool]:
 async def add_xp_activity(group_id: int, vk_id: int, xp_amount: int) -> tuple[int, bool]:
     """Add XP for activity (likes, reposts) without incrementing messages_count."""
     async with async_session() as session:
+        await _ensure_stats_row(session, group_id, vk_id)
         result = await session.execute(
             select(UserStats).where(
                 UserStats.group_id == group_id, UserStats.vk_id == vk_id,
             )
         )
-        stats = result.scalar_one_or_none()
-        if not stats:
-            stats = UserStats(group_id=group_id, vk_id=vk_id)
-            session.add(stats)
+        stats = result.scalar_one()
 
         stats.xp += xp_amount
 
@@ -380,15 +385,13 @@ async def add_xp_activity(group_id: int, vk_id: int, xp_amount: int) -> tuple[in
 
 async def modify_reputation(group_id: int, vk_id: int, amount: int) -> int:
     async with async_session() as session:
+        await _ensure_stats_row(session, group_id, vk_id)
         result = await session.execute(
             select(UserStats).where(
                 UserStats.group_id == group_id, UserStats.vk_id == vk_id,
             )
         )
-        stats = result.scalar_one_or_none()
-        if not stats:
-            stats = UserStats(group_id=group_id, vk_id=vk_id)
-            session.add(stats)
+        stats = result.scalar_one()
 
         stats.reputation += amount
         await session.commit()
@@ -397,15 +400,13 @@ async def modify_reputation(group_id: int, vk_id: int, amount: int) -> int:
 
 async def add_warning(group_id: int, vk_id: int) -> int:
     async with async_session() as session:
+        await _ensure_stats_row(session, group_id, vk_id)
         result = await session.execute(
             select(UserStats).where(
                 UserStats.group_id == group_id, UserStats.vk_id == vk_id,
             )
         )
-        stats = result.scalar_one_or_none()
-        if not stats:
-            stats = UserStats(group_id=group_id, vk_id=vk_id)
-            session.add(stats)
+        stats = result.scalar_one()
 
         stats.warnings += 1
         await session.commit()
@@ -572,6 +573,58 @@ async def get_due_posts() -> list[ScheduledPost]:
         return list(result.scalars().all())
 
 
+async def reset_stale_publishing(older_than_minutes: int = 15) -> int:
+    """Recover posts stuck in 'publishing' — claimed but never finished (e.g. a
+    crash between the VK call and mark_post_*). Returns them to 'pending' so a
+    later tick retries them. Returns how many were recovered."""
+    from datetime import timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=older_than_minutes)
+    async with async_session() as session:
+        res = await session.execute(
+            update(ScheduledPost)
+            .where(
+                ScheduledPost.status == "publishing",
+                ScheduledPost.scheduled_at <= cutoff,
+            )
+            .values(status="pending")
+        )
+        await session.commit()
+        return res.rowcount or 0
+
+
+async def claim_due_posts(limit: int = 25) -> list[ScheduledPost]:
+    """Atomically claim due posts (pending → publishing) before publishing them.
+    A post is only ever handed to ONE caller, so an overlapping tick or a
+    re-delivery can't publish the same post twice (B6 idempotency)."""
+    now = datetime.now(timezone.utc)
+    async with async_session() as session:
+        result = await session.execute(
+            select(ScheduledPost.id)
+            .where(ScheduledPost.scheduled_at <= now, ScheduledPost.status == "pending")
+            .order_by(ScheduledPost.scheduled_at.asc())
+            .limit(limit)
+        )
+        ids = [r[0] for r in result.all()]
+        claimed: list[int] = []
+        for pid in ids:
+            res = await session.execute(
+                update(ScheduledPost)
+                .where(ScheduledPost.id == pid, ScheduledPost.status == "pending")
+                .values(status="publishing")
+            )
+            if res.rowcount == 1:
+                claimed.append(pid)
+        await session.commit()
+        if not claimed:
+            return []
+        result = await session.execute(
+            select(ScheduledPost)
+            .where(ScheduledPost.id.in_(claimed))
+            .order_by(ScheduledPost.scheduled_at.asc())
+        )
+        return list(result.scalars().all())
+
+
 async def mark_post_published(post_id: int, vk_post_id: int) -> None:
     async with async_session() as session:
         result = await session.execute(
@@ -585,14 +638,19 @@ async def mark_post_published(post_id: int, vk_post_id: int) -> None:
             await session.commit()
 
 
-async def mark_post_failed(post_id: int) -> None:
+async def mark_post_failed(post_id: int, max_attempts: int = 3) -> None:
+    """Record a failed publish attempt. Below max_attempts the post returns to
+    'pending' for a later retry; once exhausted it is marked 'failed' for good —
+    so a transient VK error no longer kills a post, and a permanent one no
+    longer leaves it stuck publishing forever."""
     async with async_session() as session:
         result = await session.execute(
             select(ScheduledPost).where(ScheduledPost.id == post_id)
         )
         post = result.scalar_one_or_none()
         if post:
-            post.status = "failed"
+            post.attempts = (post.attempts or 0) + 1
+            post.status = "failed" if post.attempts >= max_attempts else "pending"
             await session.commit()
 
 
@@ -620,24 +678,25 @@ async def upsert_post_analytics(
     published_at: datetime | None = None,
 ) -> None:
     async with async_session() as session:
-        result = await session.execute(
-            select(PostAnalytics).where(
-                PostAnalytics.group_id == group_id, PostAnalytics.vk_post_id == vk_post_id,
-            )
-        )
-        row = result.scalar_one_or_none()
-        if row:
-            row.likes = likes
-            row.reposts = reposts
-            row.comments = comments
-            row.views = views
-            row.last_checked_at = datetime.now(timezone.utc)
-        else:
-            session.add(PostAnalytics(
+        now = datetime.now(timezone.utc)
+        stmt = (
+            _upsert(PostAnalytics)
+            .values(
                 group_id=group_id, vk_post_id=vk_post_id,
                 likes=likes, reposts=reposts, comments=comments, views=views,
-                published_at=published_at,
-            ))
+                published_at=published_at, last_checked_at=now,
+            )
+            .on_conflict_do_update(
+                index_elements=["group_id", "vk_post_id"],
+                # published_at is intentionally NOT overwritten — keep the first
+                # value we recorded for the post.
+                set_={
+                    "likes": likes, "reposts": reposts, "comments": comments,
+                    "views": views, "last_checked_at": now,
+                },
+            )
+        )
+        await session.execute(stmt)
         await session.commit()
 
 

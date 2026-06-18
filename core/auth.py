@@ -13,6 +13,10 @@ COOKIE_NAME = "vkadmin_session"
 CSRF_COOKIE_NAME = "vkadmin_csrf"
 _SESSION_TOKEN = None
 
+# Mark cookies Secure when the public URL is HTTPS, so the session/CSRF cookies
+# are never sent over plaintext. Left off for local http:// dev so login works.
+_COOKIE_SECURE = settings.BASE_URL.lower().startswith("https")
+
 
 def _get_session_token() -> str:
     """Server-side session cookie value.
@@ -47,6 +51,7 @@ def set_auth_cookie(response: Response) -> Response:
         value=_get_session_token(),
         httponly=True,
         samesite="lax",
+        secure=_COOKIE_SECURE,
         max_age=60 * 60 * 24 * 30,  # 30 days
     )
     return response
@@ -75,6 +80,7 @@ def set_csrf_cookie(response: Response, token: str) -> Response:
         value=token,
         httponly=True,
         samesite="strict",
+        secure=_COOKIE_SECURE,
         max_age=60 * 60 * 24,  # 24 hours
     )
     return response

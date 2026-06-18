@@ -39,6 +39,12 @@ class Settings(BaseSettings):
     SESSION_SECRET: str = ""  # seed for the dashboard session cookie (falls back to JWT_SECRET)
     API_KEY: str = ""  # API key for public API endpoints
 
+    # Callback API hardening (S4). When True, events for a group are rejected
+    # unless the request carries the exact stored secret_key (fail-CLOSED).
+    # Keep False until VK Callback API is configured WITH a secret, otherwise
+    # legitimate events without a secret would be dropped during setup.
+    CALLBACK_REQUIRE_SECRET: bool = False
+
     # Image search (free, 200 req/hr)
     PEXELS_API_KEY: str = ""
 

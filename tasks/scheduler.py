@@ -11,7 +11,7 @@ from core.telegram import send_to_telegram
 from tasks.content_parser import fetch_and_schedule
 from database.service import (
     get_all_active_groups, get_setting, set_setting,
-    get_due_posts, mark_post_published, mark_post_failed,
+    claim_due_posts, reset_stale_publishing, mark_post_published, mark_post_failed,
 )
 
 logger = logging.getLogger(__name__)
@@ -73,7 +73,10 @@ async def _autopost_job():
 # ─── Job 2: Scheduled posts publisher ───────────────────────────────────────
 
 async def _scheduled_posts_job():
-    posts = await get_due_posts()
+    # Recover any post stuck mid-publish (crash between claim and result), then
+    # atomically claim due posts so none is ever published twice.
+    await reset_stale_publishing()
+    posts = await claim_due_posts()
     if not posts:
         return
 

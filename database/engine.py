@@ -32,9 +32,24 @@ async_session = async_sessionmaker(
 )
 
 
+def _apply_light_migrations(conn):
+    """Additive, idempotent schema upgrades that create_all() can't do on its
+    own (it never ALTERs existing tables). Safe to run on every startup."""
+    if not _is_sqlite:
+        return
+    rows = conn.exec_driver_sql("PRAGMA table_info(scheduled_posts)").fetchall()
+    cols = {r[1] for r in rows}
+    if "attempts" not in cols:
+        conn.exec_driver_sql(
+            "ALTER TABLE scheduled_posts ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+        )
+        logger.info("Migration: added scheduled_posts.attempts column.")
+
+
 async def init_db():
     """Create all tables in the database."""
     logger.info("Initializing database...")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_apply_light_migrations)
     logger.info("Database initialized.")

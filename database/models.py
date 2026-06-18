@@ -115,10 +115,11 @@ class ScheduledPost(Base):
     text = Column(Text, nullable=False)
     attachments = Column(Text, default="")
     scheduled_at = Column(DateTime, nullable=False, index=True)
-    status = Column(String, default="pending", nullable=False, index=True)  # pending / published / failed
+    status = Column(String, default="pending", nullable=False, index=True)  # pending / publishing / published / failed
     source = Column(String, default="manual")  # manual / ai / parsed / suggested
     published_at = Column(DateTime, nullable=True)
     vk_post_id = Column(BigInteger, nullable=True)
+    attempts = Column(Integer, default=0, nullable=False)  # publish retry counter (B6 idempotency)
 
 
 # ─── Post Analytics ──────────────────────────────────────────────────────────

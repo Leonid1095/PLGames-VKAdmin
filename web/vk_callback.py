@@ -289,8 +289,15 @@ async def vk_callback(request: Request):
     # ── Verify secret key ──
     secret = data.get("secret", "")
     group = await get_group(group_id)
-    if group and group.secret_key and secret != group.secret_key:
-        logger.warning(f"Invalid secret for group {group_id}")
+    if group and group.secret_key:
+        # A secret is configured → it must match (fail-closed for this group).
+        if secret != group.secret_key:
+            logger.warning(f"Invalid secret for group {group_id}")
+            return PlainTextResponse("ok")
+    elif settings.CALLBACK_REQUIRE_SECRET:
+        # S4 hardening: once enabled, refuse events for any group that has no
+        # secret configured rather than accepting them blindly (fail-closed).
+        logger.warning(f"Rejecting event for group {group_id}: no secret_key set")
         return PlainTextResponse("ok")
 
     # ── Rate limit ──

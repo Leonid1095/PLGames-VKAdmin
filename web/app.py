@@ -93,17 +93,39 @@ from starlette.requests import Request as StarletteRequest
 
 
 class VKFrameMiddleware(BaseHTTPMiddleware):
-    """Remove X-Frame-Options for VK Mini App callback so it loads in VK iframe."""
+    """Security headers. VK Mini App pages must be embeddable in the VK iframe
+    (and load vk-bridge from a CDN); everything else (dashboard) is locked down:
+    no framing, nosniff, and a CSP that still allows the inline scripts/handlers
+    the dashboard relies on."""
     async def dispatch(self, request: StarletteRequest, call_next):
         response = await call_next(request)
         path = request.url.path
+
+        # Baseline hardening applied to every response.
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+
         is_vk_frame = (
             path.startswith("/miniapp")
             or (path == "/api/vk/callback" and request.query_params.get("vk_app_id"))
         )
         if is_vk_frame:
             response.headers["X-Frame-Options"] = ""
-            response.headers["Content-Security-Policy"] = "frame-ancestors https://*.vk.com https://vk.com"
+            response.headers["Content-Security-Policy"] = (
+                "frame-ancestors https://*.vk.com https://vk.com"
+            )
+        else:
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; "
+                "script-src 'self' 'unsafe-inline'; "
+                "style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data: https:; "
+                "connect-src 'self'; "
+                "base-uri 'self'; "
+                "form-action 'self'; "
+                "frame-ancestors 'none'"
+            )
         return response
 
 app.add_middleware(VKFrameMiddleware)
