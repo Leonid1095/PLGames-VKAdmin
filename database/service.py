@@ -40,7 +40,7 @@ DEFAULT_SETTINGS = {
     "content_parse_interval_hours": ("4", "internal"),
     "banned_words": ("", "internal"),
     "image_search_enabled": ("true", "internal"),
-    "gamification_enabled": ("false", "internal"),
+    "gamification_enabled": ("true", "internal"),
     "xp_per_like": ("2", "internal"),
     "xp_per_repost": ("5", "internal"),
     "xp_cooldown_sec": ("60", "internal"),
@@ -778,3 +778,68 @@ async def delete_content_task(task_id: int, group_id: int) -> bool:
             await session.commit()
             return True
         return False
+
+
+# ─── Daily membership state (for proactive digest & public welcome) ──────────
+#
+# Membership events are bursty but low-volume, so we accumulate them in settings
+# and let the once-a-day proactive job drain them. Stored as plain settings:
+#   _pending_welcome : JSON list of {"id", "name"} for newcomers not yet greeted
+#   _joins_since_digest / _leaves_since_digest : counters for the admin digest
+
+_MAX_PENDING_WELCOME = 50
+
+
+async def record_member_join(group_id: int, vk_id: int, name: str) -> None:
+    raw = await get_setting(group_id, "_pending_welcome", "[]")
+    try:
+        pending = json.loads(raw)
+        if not isinstance(pending, list):
+            pending = []
+    except (json.JSONDecodeError, TypeError):
+        pending = []
+    if not any(p.get("id") == vk_id for p in pending):
+        pending.append({"id": vk_id, "name": name})
+        pending = pending[-_MAX_PENDING_WELCOME:]
+        await set_setting(group_id, "_pending_welcome", json.dumps(pending, ensure_ascii=False))
+
+    joins = await get_setting(group_id, "_joins_since_digest", "0")
+    try:
+        joins_n = int(joins) + 1
+    except ValueError:
+        joins_n = 1
+    await set_setting(group_id, "_joins_since_digest", str(joins_n))
+
+
+async def record_member_leave(group_id: int) -> None:
+    leaves = await get_setting(group_id, "_leaves_since_digest", "0")
+    try:
+        leaves_n = int(leaves) + 1
+    except ValueError:
+        leaves_n = 1
+    await set_setting(group_id, "_leaves_since_digest", str(leaves_n))
+
+
+async def take_daily_membership_state(group_id: int) -> dict:
+    """Read the accumulated join/leave state and reset it. Returns
+    {"welcomes": [{"id","name"}], "joins": int, "leaves": int}."""
+    raw = await get_setting(group_id, "_pending_welcome", "[]")
+    try:
+        welcomes = json.loads(raw)
+        if not isinstance(welcomes, list):
+            welcomes = []
+    except (json.JSONDecodeError, TypeError):
+        welcomes = []
+    try:
+        joins = int(await get_setting(group_id, "_joins_since_digest", "0"))
+    except ValueError:
+        joins = 0
+    try:
+        leaves = int(await get_setting(group_id, "_leaves_since_digest", "0"))
+    except ValueError:
+        leaves = 0
+
+    await set_setting(group_id, "_pending_welcome", "[]")
+    await set_setting(group_id, "_joins_since_digest", "0")
+    await set_setting(group_id, "_leaves_since_digest", "0")
+    return {"welcomes": welcomes, "joins": joins, "leaves": leaves}

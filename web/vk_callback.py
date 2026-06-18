@@ -8,11 +8,15 @@ from fastapi import APIRouter, Request
 from fastapi.responses import PlainTextResponse
 from vkbottle import API
 
+from core.config import settings
 from core.group_context import GroupContext
 from core.crypto import decrypt_token
 from core.agent import run_agent
 from core.onboarding import is_onboarding_needed, run_onboarding
-from database.service import get_group, get_setting, add_xp_activity
+from database.service import (
+    get_group, get_setting, add_xp_activity,
+    record_member_join, record_member_leave,
+)
 from handlers.comments import handle_wall_comment
 
 logger = logging.getLogger(__name__)
@@ -161,6 +165,13 @@ async def _process_group_join(ctx: GroupContext, obj: dict):
         first_name = "друг"
         last_name = ""
 
+    # Record the join so the daily proactive job can greet newcomers publicly
+    # (group→user DMs below are best-effort; VK blocks them for most non-openers).
+    try:
+        await record_member_join(ctx.group_id, user_id, first_name)
+    except Exception as e:
+        logger.warning(f"Failed to record join for {user_id} in group {ctx.group_id}: {e}")
+
     # Support placeholders in static welcome message
     if welcome_msg and not use_ai:
         try:
@@ -245,10 +256,14 @@ async def _process_repost(ctx: GroupContext, obj: dict):
 
 
 async def _process_group_leave(ctx: GroupContext, obj: dict):
-    """Log when a member leaves."""
+    """Record a leave so churn shows up in the admin's daily digest."""
     user_id = obj.get("user_id", 0)
     if user_id:
         logger.info(f"User {user_id} left group {ctx.group_id}")
+        try:
+            await record_member_leave(ctx.group_id)
+        except Exception as e:
+            logger.warning(f"Failed to record leave in group {ctx.group_id}: {e}")
 
 
 # ─── Main callback endpoint ─────────────────────────────────────────────────

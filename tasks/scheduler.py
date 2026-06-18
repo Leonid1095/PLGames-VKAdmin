@@ -238,6 +238,158 @@ async def _widget_refresh_job():
     await update_all_widgets()
 
 
+# ─── Job 7: Daily proactive summary (digest + public welcome + milestones) ──
+#
+# This is the job that makes the bot feel *alive* instead of purely reactive:
+# once a day it greets new members publicly (DMs are blocked by VK), DMs the
+# admin a digest built from collected analytics, and celebrates membership
+# milestones on the wall.
+
+_MILESTONES = [50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000]
+
+
+def _last_milestone_reached(count: int) -> int:
+    reached = 0
+    for m in _MILESTONES:
+        if count >= m:
+            reached = m
+    return reached
+
+
+async def _get_member_count(api, group_id: int) -> int | None:
+    try:
+        resp = await api.groups.get_members(group_id=group_id, count=0)
+        return resp.count if resp else None
+    except Exception as e:
+        logger.warning(f"member count fetch failed for group {group_id}: {e}")
+        return None
+
+
+async def _public_welcome(api, group_id: int, welcomes: list[dict]) -> None:
+    """Post ONE public wall post greeting newcomers (avoids per-user DM spam and
+    works around VK blocking group→user DMs for non-openers)."""
+    if not welcomes:
+        return
+    enabled = (
+        (await get_setting(group_id, "welcome_ai", "false")).lower() == "true"
+        or bool(await get_setting(group_id, "welcome_message", ""))
+    )
+    if not enabled:
+        return
+
+    mentions = ", ".join(f"[id{w['id']}|{w.get('name') or 'друг'}]" for w in welcomes[:30])
+    intro = "Рады новым участникам! 👋"
+    try:
+        from core.ai_brain import generate_response, _get_group_ai_context
+        ai_ctx = await _get_group_ai_context(group_id)
+        sys = (ai_ctx.get("ai_system_prompt") or
+               "Ты дружелюбный администратор группы ВКонтакте.")
+        text = await generate_response(
+            prompt="Напиши короткое (1-2 предложения) тёплое публичное приветствие "
+                   "для новых участников группы. Без обращения по имени — имена допишутся отдельно.",
+            system_prompt=sys, group_id=group_id,
+        )
+        if text and not text.startswith("Извините"):
+            intro = text.strip()
+    except Exception as e:
+        logger.warning(f"AI welcome generation failed for group {group_id}: {e}")
+
+    message = f"{intro}\n\n{mentions}"
+    try:
+        await api.wall.post(owner_id=-group_id, message=message)
+        logger.info(f"Public welcome posted for {len(welcomes)} newcomers in group {group_id}")
+    except Exception as e:
+        logger.warning(f"Public welcome post failed for group {group_id}: {e}")
+
+
+async def _admin_digest(api, group_id: int, admin_vk_id: int, joins: int, leaves: int) -> None:
+    from database.service import get_post_analytics
+    analytics = await get_post_analytics(group_id, limit=20)
+
+    lines = ["📊 Сводка по группе за сутки:"]
+    if analytics:
+        total_likes = sum(a.likes or 0 for a in analytics)
+        total_views = sum(a.views or 0 for a in analytics)
+        total_comments = sum(a.comments or 0 for a in analytics)
+        top = max(analytics, key=lambda a: (a.likes or 0) + (a.reposts or 0) + (a.comments or 0))
+        lines.append(
+            f"• Последние {len(analytics)} постов: 👍 {total_likes}, 💬 {total_comments}, 👁 {total_views}"
+        )
+        lines.append(
+            f"• Лучший пост: 👍 {top.likes or 0} / 💬 {top.comments or 0} / 👁 {top.views or 0}"
+        )
+    else:
+        lines.append("• Постов с аналитикой пока нет.")
+    lines.append(f"• Новых участников: +{joins}, вышло: −{leaves}")
+
+    if not analytics and joins == 0 and leaves == 0:
+        return  # nothing worth pinging the admin about
+
+    try:
+        await api.messages.send(user_id=admin_vk_id, message="\n".join(lines), random_id=0)
+        logger.info(f"Admin digest sent to {admin_vk_id} for group {group_id}")
+    except Exception as e:
+        logger.warning(f"Admin digest DM failed for group {group_id}: {e}")
+
+
+async def _milestone_post(api, group_id: int, count: int | None) -> None:
+    if not count:
+        return
+    reached = _last_milestone_reached(count)
+    if reached == 0:
+        return
+    try:
+        last_celebrated = int(await get_setting(group_id, "_last_member_milestone", "0"))
+    except ValueError:
+        last_celebrated = 0
+    if reached <= last_celebrated:
+        return
+    try:
+        await api.wall.post(
+            owner_id=-group_id,
+            message=f"🎉 Нас уже {reached}! Спасибо каждому, кто с нами. Дальше — больше! 🚀",
+        )
+        await set_setting(group_id, "_last_member_milestone", str(reached))
+        logger.info(f"Milestone {reached} celebrated for group {group_id}")
+    except Exception as e:
+        logger.warning(f"Milestone post failed for group {group_id}: {e}")
+
+
+async def _daily_summary_job():
+    from database.service import take_daily_membership_state
+
+    groups = await get_all_active_groups()
+    now = datetime.now(timezone.utc)
+
+    for group in groups:
+        try:
+            # Run at most once per ~day even though the trigger fires hourly
+            # (survives restarts without double-firing).
+            last_str = await get_setting(group.group_id, "_last_daily_summary", "")
+            if last_str:
+                try:
+                    if (now - datetime.fromisoformat(last_str)).total_seconds() < 20 * 3600:
+                        continue
+                except ValueError:
+                    pass
+
+            token = decrypt_token(group.access_token)
+            api = API(token=token)
+
+            state = await take_daily_membership_state(group.group_id)
+            await _public_welcome(api, group.group_id, state["welcomes"])
+            await _admin_digest(
+                api, group.group_id, group.admin_vk_id,
+                state["joins"], state["leaves"],
+            )
+            count = await _get_member_count(api, group.group_id)
+            await _milestone_post(api, group.group_id, count)
+
+            await set_setting(group.group_id, "_last_daily_summary", now.isoformat())
+        except Exception as e:
+            logger.error(f"Daily summary failed for group {group.group_id}: {e}")
+
+
 # ─── Note: _content_tasks_job uses croniter; install with: pip install croniter
 
 
@@ -286,8 +438,17 @@ async def start_scheduler():
         id="widget_refresh", replace_existing=True,
     )
 
+    # Daily proactive summary: trigger hourly, but each group acts once/~day
+    # (digest to admin + public welcome + membership milestones).
+    scheduler.add_job(
+        _daily_summary_job,
+        trigger=IntervalTrigger(hours=1),
+        id="daily_summary", replace_existing=True,
+    )
+
     scheduler.start()
     logger.info(
         "Scheduler started: autopost(1h), scheduled_posts(5m), "
-        "content_parser(4h), content_tasks(30m), analytics(6h), widgets(1h)"
+        "content_parser(4h), content_tasks(30m), analytics(6h), widgets(1h), "
+        "daily_summary(1h/once-a-day)"
     )
