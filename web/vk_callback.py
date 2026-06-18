@@ -318,6 +318,10 @@ async def vk_callback(request: Request):
     obj = data.get("object", {})
     event_key = _event_key(group_id, event_id) if event_id else None
 
+    # Operational visibility: every accepted event leaves a trace so we can see
+    # *what* VK actually delivers (the bare uvicorn "200 OK" hides the type).
+    logger.info(f"VK event accepted: type={event_type} group={group_id}")
+
     # ── Dispatch event ──
     if event_type == "message_new":
         _spawn(_process_message(ctx, obj), event_key)
@@ -331,5 +335,9 @@ async def vk_callback(request: Request):
         _spawn(_process_like(ctx, obj), event_key)
     elif event_type == "wall_repost":
         _spawn(_process_repost(ctx, obj), event_key)
+    else:
+        # Not silently dropped: surfaces event types enabled in VK that we don't
+        # handle yet (e.g. message_new not enabled, message_reply, wall_post_new).
+        logger.info(f"VK event has no handler, ignored: type={event_type} group={group_id}")
 
     return PlainTextResponse("ok")
