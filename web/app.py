@@ -1,9 +1,19 @@
 """FastAPI application — the main web server for multi-tenant VKAdmin."""
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
+
+# Configure logging at import time. Production runs `uvicorn web.app:app`
+# directly (see vkadmin.service), which never executes main.py — so without
+# this, app-level logs (incl. the LLM health-check failure) never reach the
+# journal and the operator is blind. basicConfig is a no-op if already set.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 
 from database.engine import init_db
 from database.service import create_group, seed_default_settings
@@ -54,6 +64,23 @@ async def _migrate_legacy_group():
     logger.info(f"Legacy group {group_id} migrated successfully.")
 
 
+async def _probe_llm_health():
+    """Background LLM probe — logs the result without blocking startup."""
+    from core.agent import check_llm_health
+    from core.config import settings
+    try:
+        ok, detail = await check_llm_health()
+    except asyncio.CancelledError:
+        return
+    if ok:
+        logger.info("LLM health-check OK (model=%s)", settings.DEFAULT_MODEL)
+    else:
+        logger.error(
+            "LLM HEALTH-CHECK FAILED — AI replies will NOT work until fixed: %s",
+            detail,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown logic."""
@@ -64,21 +91,17 @@ async def lifespan(app: FastAPI):
     await _migrate_legacy_group()
     await start_scheduler()
 
-    # Probe the AI provider so a dead key surfaces at startup instead of
+    # Probe the AI provider so a dead key surfaces in the log instead of
     # masquerading as a generic "Произошла ошибка" in every chat reply.
-    from core.agent import check_llm_health
-    from core.config import settings
-    ok, detail = await check_llm_health()
-    if ok:
-        logger.info("LLM health-check OK (model=%s)", settings.DEFAULT_MODEL)
-    else:
-        logger.error(
-            "LLM HEALTH-CHECK FAILED — AI replies will NOT work until fixed: %s",
-            detail,
-        )
+    # Run it in the BACKGROUND: the probe hits a cold local model and can take
+    # 20–40s, and blocking the lifespan here would keep the HTTP server (and
+    # the VK Callback endpoint VK pings to confirm the integration) unreachable
+    # for that whole window. Fire-and-forget so the server binds immediately.
+    health_task = asyncio.create_task(_probe_llm_health())
 
     logger.info("VKAdmin is ready!")
     yield
+    health_task.cancel()
     logger.info("Shutting down VKAdmin...")
 
 
