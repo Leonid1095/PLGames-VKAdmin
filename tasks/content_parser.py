@@ -5,6 +5,7 @@ import re
 import logging
 import random
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urljoin
 
 import feedparser
 import httpx
@@ -24,6 +25,22 @@ def _item_hash(item: dict) -> str:
     """Generate a short hash of an item for deduplication."""
     key = (item.get("title", "") + item.get("link", "") + item.get("text", "")[:200]).strip()
     return hashlib.md5(key.encode()).hexdigest()[:12]
+
+
+def _parse_date(raw) -> datetime | None:
+    """Parse an ISO-ish timestamp to an aware datetime, or None if unparseable.
+
+    Used to post the FRESHEST news first and skip stale items — a news admin
+    shouldn't resurrect a 3-week-old hotfix after the latest update.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    s = raw.strip().replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
 
 
 async def _get_used_hashes(group_id: int) -> set[str]:
@@ -88,10 +105,18 @@ async def parse_rss(url: str) -> list[dict]:
                         image_url = enc.get("href", enc.get("url", ""))
                         break
 
+            date = None
+            pub = entry.get("published_parsed") or entry.get("updated_parsed")
+            if pub:
+                try:
+                    date = datetime(*pub[:6], tzinfo=timezone.utc)
+                except (TypeError, ValueError):
+                    date = None
+
             if title:
                 items.append({
                     "title": title, "text": summary[:500],
-                    "link": link, "image_url": image_url,
+                    "link": link, "image_url": image_url, "date": date,
                 })
         return items
     except Exception as e:
@@ -158,11 +183,23 @@ async def parse_api(url: str) -> list[dict]:
             text = entry.get("text") or entry.get("text_ru") or entry.get("description") or ""
             text = re.sub(r"<[^>]+>", "", text).strip()
             link = entry.get("link") or entry.get("url") or ""
+            if link.strip().lower() in ("none", "null"):
+                link = ""  # some APIs send the literal string "None"
             image_url = entry.get("image") or entry.get("image_url") or entry.get("thumbnail") or ""
+            # Sites often return root-relative paths ("/bg/news/x.jpg"); resolve
+            # them against the API origin so the image can actually be downloaded.
+            if image_url and not image_url.startswith(("http://", "https://")):
+                image_url = urljoin(url, image_url)
+            if link and not link.startswith(("http://", "https://")):
+                link = urljoin(url, link)
+            date = _parse_date(
+                entry.get("created_at") or entry.get("published_at")
+                or entry.get("date") or entry.get("pubDate")
+            )
             if title or text:
                 items.append({
                     "title": title, "text": text[:500],
-                    "link": link, "image_url": image_url,
+                    "link": link, "image_url": image_url, "date": date,
                 })
         return items
     except Exception as e:
@@ -249,11 +286,28 @@ async def fetch_and_schedule(group_id: int) -> int:
             logger.info(f"Source #{source.id}: all {len(items)} items already used, skipping")
             continue
 
-        # Pick a random item from fresh ones (weighted towards longer content)
-        fresh_items.sort(key=lambda it: len(it.get("text", "")), reverse=True)
-        # Pick from top 3 longest items randomly
-        candidates = fresh_items[:min(3, len(fresh_items))]
-        chosen = random.choice(candidates)
+        # Freshness: skip dated items older than the cutoff so we never resurrect
+        # stale news (e.g. a 3-week-old hotfix) after a newer post. Undated items
+        # (web pages, feeds without timestamps) can't be judged, so they pass.
+        try:
+            max_age_days = int(await get_setting(group_id, "content_max_age_days", "14"))
+        except ValueError:
+            max_age_days = 14
+        if max_age_days > 0:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+            recent = [it for it in fresh_items if it.get("date") is None or it["date"] >= cutoff]
+            dropped = len(fresh_items) - len(recent)
+            if dropped:
+                logger.info(f"Source #{source.id}: skipped {dropped} stale item(s) (>{max_age_days}d old)")
+            fresh_items = recent
+            if not fresh_items:
+                continue
+
+        # Post the NEWEST item first (dated desc, undated last). News must be
+        # current — never pick by text length as before.
+        _epoch = datetime.min.replace(tzinfo=timezone.utc)
+        fresh_items.sort(key=lambda it: (it.get("date") is not None, it.get("date") or _epoch), reverse=True)
+        chosen = fresh_items[0]
         chosen_hash = _item_hash(chosen)
 
         # If item has a link and text is short — fetch full content from link

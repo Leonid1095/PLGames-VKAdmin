@@ -254,21 +254,6 @@ ADMIN_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "generate_patch_notes",
-            "description": "Generate and publish patch notes from a GitHub repository.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "github_url": {"type": "string", "description": "GitHub repository URL"},
-                    "days": {"type": "integer", "description": "Days of history to include", "default": 7}
-                },
-                "required": ["github_url"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "refresh_ai",
             "description": "Re-scan the group and update AI personality/settings. Use when admin says to reconfigure, re-learn, or update AI.",
             "parameters": {"type": "object", "properties": {}}
@@ -702,35 +687,6 @@ async def _exec_get_top_users(ctx: GroupContext, args: dict) -> str:
     return "\n".join(lines)
 
 
-async def _exec_generate_patch_notes(ctx: GroupContext, args: dict) -> str:
-    from core.content_writer import write_patch_notes
-    from core.telegram import send_to_telegram
-
-    url = args["github_url"]
-    days = args.get("days", 7)
-    if not url.startswith("http"):
-        url = f"https://github.com/{url}"
-
-    text = await write_patch_notes(group_id=ctx.group_id, github_url=url, days=days)
-    if text.startswith("Ошибка") or text.startswith("Нет коммитов") or text.startswith("Неверная"):
-        return text
-
-    post_kwargs = {"owner_id": -ctx.group_id, "message": text}
-    try:
-        from core.images import find_and_upload_image
-        attachment = await find_and_upload_image(ctx.api, ctx.group_id, query="software update", post_text=text)
-        if attachment:
-            post_kwargs["attachments"] = attachment
-    except Exception:
-        pass
-
-    try:
-        result = await ctx.api.wall.post(**post_kwargs)
-        vk_post_id = result.post_id if result else 0
-        await send_to_telegram(ctx.group_id, text, vk_post_id)
-        return f"Патч-ноты опубликованы!\n\n{text[:300]}..."
-    except Exception as e:
-        return f"Ошибка публикации: {e}\n\n{text[:500]}"
 
 
 async def _exec_refresh_ai(ctx: GroupContext, args: dict) -> str:
@@ -845,7 +801,6 @@ TOOL_EXECUTORS = {
     "change_setting": _exec_change_setting,
     "get_top_users": _exec_get_top_users,
     "toggle_gamification": _exec_toggle_gamification,
-    "generate_patch_notes": _exec_generate_patch_notes,
     "refresh_ai": _exec_refresh_ai,
     "pin_post": _exec_pin_post,
     # User tools

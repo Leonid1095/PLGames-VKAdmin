@@ -1606,14 +1606,13 @@ async def miniapp_group_settings(request: Request, group_id: int):
             <div class="form-group">
                 <label>Тип</label>
                 <select name="task_type" style="width:120px;">
-                    <option value="patch_notes">Патч-ноты</option>
                     <option value="article">Статья</option>
                     <option value="digest">Дайджест</option>
                 </select>
             </div>
             <div class="form-group" style="flex:1;">
                 <label>Источник (URL)</label>
-                <input type="text" name="source_url" placeholder="https://github.com/user/repo">
+                <input type="text" name="source_url" placeholder="https://ваш-сайт.ру/news">
             </div>
             <div class="form-group">
                 <label>Расписание (cron)</label>

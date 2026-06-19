@@ -19,6 +19,25 @@ logger = logging.getLogger(__name__)
 scheduler = AsyncIOScheduler()
 
 
+# Prefixes that mean the generator returned an error / "nothing to report"
+# placeholder rather than a real post. These must NEVER reach the wall — in the
+# past "Нет коммитов за 7 дней" and "Извините, ошибка ИИ" got published as posts.
+_FAILURE_PREFIXES = (
+    "Ошибка", "Не удалось", "Извините", "Нет коммитов",
+    "Произошла ошибка", "Не могу", "Неверная ссылка", "Unknown",
+)
+
+
+def _is_publishable(text: str | None) -> bool:
+    """True only if `text` is a real post, not an LLM error or placeholder."""
+    if not text:
+        return False
+    stripped = text.strip()
+    if len(stripped) < 50:
+        return False
+    return not any(stripped.startswith(p) for p in _FAILURE_PREFIXES)
+
+
 # ─── Job 1: Auto-post (only real content from sources) ──────────────────────
 
 async def _autopost_job():
@@ -146,7 +165,7 @@ async def _content_tasks_job():
     """Check and execute scheduled content tasks (patch notes, articles, etc.)."""
     from datetime import timedelta
     from croniter import croniter
-    from core.content_writer import write_article, write_patch_notes
+    from core.content_writer import write_article
     from core.images import find_and_upload_image
     from database.service import (
         get_all_active_content_tasks, update_content_task_run,
@@ -170,14 +189,10 @@ async def _content_tasks_job():
 
             logger.info(f"Content task #{task.id} '{task.name}' running for group {task.group_id}...")
 
-            # Generate content based on task type
-            if task.task_type == "patch_notes" and task.source_url:
-                text = await write_patch_notes(
-                    group_id=task.group_id,
-                    github_url=task.source_url,
-                    days=7,
-                )
-            elif task.task_type == "article":
+            # Generate content based on task type.
+            # patch_notes (GitHub commits) was removed — it produced "Нет коммитов"
+            # junk; the site source (content_parser) is the single content path now.
+            if task.task_type == "article":
                 text = await write_article(
                     group_id=task.group_id,
                     source_url=task.source_url,
@@ -195,7 +210,7 @@ async def _content_tasks_job():
                 logger.warning(f"Unknown task type: {task.task_type}")
                 continue
 
-            if text and not text.startswith("Ошибка") and not text.startswith("Не удалось"):
+            if _is_publishable(text):
                 # Try to find and upload a relevant image
                 attachment = ""
                 try:
@@ -219,7 +234,7 @@ async def _content_tasks_job():
                 )
                 logger.info(f"Content task #{task.id} generated post for group {task.group_id}")
             else:
-                logger.warning(f"Content task #{task.id} failed to generate: {text[:100]}")
+                logger.warning(f"Content task #{task.id} produced no publishable post: {(text or '')[:100]!r}")
 
             await update_content_task_run(task.id)
 

@@ -4,11 +4,27 @@ Core principle: NEVER write from nothing. Always have source material first.
 """
 
 import logging
+import re
 
 from core.ai_brain import generate_response, _get_group_ai_context
 from core.web_reader import read_url
 
 logger = logging.getLogger(__name__)
+
+# VK walls render PLAIN TEXT, not markdown. Strip artifacts the LLM tends to emit
+# (### headers, **bold**, __bold__, "- " bullets) so they don't show literally.
+_MD_HEADER = re.compile(r'(?m)^[ \t]{0,3}#{1,6}[ \t]*')
+_MD_BOLD = re.compile(r'(\*\*|__)(.+?)\1', re.DOTALL)
+_MD_BULLET = re.compile(r'(?m)^[ \t]*[-*][ \t]+')
+
+
+def _strip_markdown(text: str) -> str:
+    if not text:
+        return text
+    text = _MD_HEADER.sub('', text)
+    text = _MD_BOLD.sub(r'\2', text)
+    text = _MD_BULLET.sub('• ', text)
+    return text.strip()
 
 
 def _build_system_prompt(ctx: dict, instruction: str = "") -> str:
@@ -35,8 +51,10 @@ def _build_system_prompt(ctx: dict, instruction: str = "") -> str:
         "- Пиши грамотным, живым русским языком\n"
         "- Можно использовать эмодзи где уместно\n"
         "- Никогда не добавляй хэштеги\n"
+        "- ВК НЕ поддерживает markdown: НЕ пиши #, ##, ### и **жирный**/__ — эти символы "
+        "покажутся в посте как мусор. Для акцентов используй эмодзи, ЗАГЛАВНЫЕ буквы и пустые строки\n"
         "- Не лей воду, каждое предложение должно нести конкретную информацию из источника\n"
-        "- Структурируй текст: используй абзацы, подзаголовки если текст длинный\n"
+        "- Структурируй абзацами и эмодзи-маркерами (✅ 🛠 ⚡), а не разметкой\n"
         "- Пиши так, чтобы пост хотелось дочитать до конца\n"
         "- Длину определяй по содержанию: если материала много — пиши развёрнуто (15-30 предложений), "
         "если тема простая — 5-10 предложений. Не тяни и не сокращай искусственно.\n"
@@ -65,11 +83,13 @@ async def write_from_source(
         "добавь свой взгляд и полезные выводы для читателей группы."
     )
 
-    return await generate_response(
+    text = await generate_response(
         prompt=user_prompt,
         system_prompt=system_prompt,
         group_id=group_id,
     )
+    # Safety net: even with the no-markdown rule, models sometimes emit ### / **.
+    return _strip_markdown(text)
 
 
 async def write_from_url(
@@ -155,56 +175,3 @@ async def write_article(
     if not instruction:
         return "Не указан ни URL-источник, ни инструкция для статьи."
     return await write_from_source(group_id, instruction, full_instruction)
-
-
-async def write_patch_notes(
-    group_id: int,
-    github_url: str,
-    days: int = 7,
-) -> str:
-    """Generate patch notes from a GitHub repository."""
-    from urllib.parse import urlparse
-    from core.web_reader import read_github_commits
-
-    parsed = urlparse(github_url)
-    parts = parsed.path.strip("/").split("/")
-    if len(parts) < 2:
-        return "Неверная ссылка на GitHub. Формат: https://github.com/owner/repo"
-
-    owner, repo = parts[0], parts[1].removesuffix(".git")
-
-    commits_data = await read_github_commits(owner, repo, since_days=days)
-    if commits_data.startswith("Ошибка") or commits_data.startswith("Нет коммитов"):
-        return commits_data
-
-    ctx = await _get_group_ai_context(group_id)
-    group_hint = f" Группа: {ctx['ai_group_description']}." if ctx["ai_group_description"] else ""
-
-    system_prompt = (
-        f"Ты технический копирайтер и администратор группы ВКонтакте.{group_hint}\n\n"
-        "Твоя задача — написать красивый, структурированный патч-нот для поста на стене ВК.\n\n"
-        "Правила оформления:\n"
-        "1. Начни с яркого заголовка с эмодзи, например: 🚀 Обновление v1.X — Что нового?\n"
-        "2. Группируй изменения по категориям с эмодзи:\n"
-        "   ✨ Новые возможности\n"
-        "   🛠 Исправления\n"
-        "   ⚡ Улучшения\n"
-        "   🔒 Безопасность\n"
-        "3. Каждый пункт — короткое, понятное предложение для обычных пользователей\n"
-        "4. Технические коммиты (рефакторинг, CI, merge) — пропускай\n"
-        "5. В конце добавь 1-2 предложения с призывом: обновляйтесь, пишите отзывы и т.д.\n"
-        "6. Используй разделители (─── или пустые строки) между секциями\n"
-        "7. Никогда не добавляй хэштеги\n"
-        "8. Пиши живым языком, не сухо — будто рассказываешь другу что изменилось"
-    )
-
-    return await generate_response(
-        prompt=(
-            f"Вот коммиты за последние {days} дней из репозитория {owner}/{repo}:\n\n"
-            f"{commits_data}\n\n"
-            "Напиши красивый, развёрнутый патч-нот для поста ВКонтакте. "
-            "Объясни каждое изменение понятно для обычного пользователя."
-        ),
-        system_prompt=system_prompt,
-        group_id=group_id,
-    )
