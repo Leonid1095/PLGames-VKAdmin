@@ -6,6 +6,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from core.auth import is_authenticated
 from core.config import settings
 from core.crypto import encrypt_token
 from database.service import create_group, seed_default_settings
@@ -67,6 +68,45 @@ async def _setup_callback_api(token: str, gid: int, secret_key: str) -> None:
             logger.info(f"Callback API configured for group {gid} (server_id={server_id})")
 
 
+async def _resolve_group_id(raw: str) -> int | None:
+    """Приводит пользовательский ввод к числовому ID группы.
+
+    Принимает числовой ID, короткое имя (plgames_bot), ссылку
+    (vk.com/plgames_bot) и формы club123/public123. Короткие имена
+    резолвятся через groups.getById сервисным ключом приложения.
+    """
+    s = raw.strip().rstrip("/")
+    if "/" in s:
+        s = s.rsplit("/", 1)[-1]
+    s = s.lstrip("@").split("?")[0]
+    for prefix in ("club", "public", "event"):
+        if s.startswith(prefix) and s[len(prefix):].isdigit():
+            return int(s[len(prefix):])
+    if s.isdigit():
+        return int(s)
+    if not s or not settings.VK_APP_SERVICE_KEY:
+        return None
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://api.vk.com/method/groups.getById",
+            params={
+                "group_id": s,
+                "access_token": settings.VK_APP_SERVICE_KEY,
+                "v": "5.199",
+            },
+        )
+    data = resp.json()
+    if "error" in data:
+        logger.warning(f"Failed to resolve group '{s}': {data['error'].get('error_msg')}")
+        return None
+    groups = data.get("response", {})
+    if isinstance(groups, dict):
+        groups = groups.get("groups", [])
+    if isinstance(groups, list) and groups:
+        return int(groups[0].get("id", 0)) or None
+    return None
+
+
 @router.get("/api/vk/oauth")
 async def start_oauth(request: Request, group_ids: str = ""):
     """
@@ -74,12 +114,34 @@ async def start_oauth(request: Request, group_ids: str = ""):
     Usage: /api/vk/oauth?group_ids=123456
     If group_ids is empty, VK will let the user choose which group to authorize.
     """
+    # Подключать группы может только владелец панели: иначе кто угодно мог бы
+    # повесить свою группу на наш инстанс и жечь LLM-бюджет.
+    if not is_authenticated(request):
+        return RedirectResponse("/dashboard/login", status_code=303)
+
     if not settings.VK_APP_ID:
         return HTMLResponse(
             "<h2>VK App not configured</h2>"
             "<p>Set VK_APP_ID and VK_APP_SECRET in .env</p>",
             status_code=500,
         )
+
+    if group_ids:
+        resolved = []
+        for part in group_ids.split(","):
+            gid = await _resolve_group_id(part)
+            if gid:
+                resolved.append(str(gid))
+        if not resolved:
+            from html import escape
+            return HTMLResponse(
+                "<h2>Группа не найдена</h2>"
+                f"<p>Не удалось определить группу по «{escape(group_ids)}». "
+                "Укажите числовой ID, короткое имя или ссылку на группу.</p>"
+                '<p><a href="/dashboard">&larr; Назад в панель</a></p>',
+                status_code=400,
+            )
+        group_ids = ",".join(resolved)
 
     redirect_uri = f"{settings.BASE_URL}/api/vk/callback"
     scope = "messages,wall,manage,photos"
@@ -95,6 +157,11 @@ async def start_oauth(request: Request, group_ids: str = ""):
         f"&response_type=code"
         f"&state={state}"
         f"&v=5.199"
+        # revoke=1 — без него VK может отдать закэшированный (в т.ч. давно
+        # отозванный) групповой токен: OAuth проходит «успешно», а каждый
+        # вызов API падает с err 27. Принудительный перезапрос согласия
+        # гарантирует свежий токен.
+        f"&revoke=1"
     )
     if group_ids:
         vk_auth_url += f"&group_ids={group_ids}"
@@ -199,14 +266,19 @@ async def oauth_callback(request: Request, code: str = "", error: str = "", erro
 
     # VK returns tokens as access_token_GROUPID for each authorized group
     groups_connected = []
+    groups_failed = []
     for key, value in data.items():
         if key.startswith("access_token_"):
             gid = int(key.replace("access_token_", ""))
             token = value
             secret_key = secrets.token_hex(16)
 
-            # Get group info
+            # Get group info — заодно проверка живости токена: VK может выдать
+            # уже отозванный токен (err 27); без проверки группа выглядела бы
+            # «подключённой», но с мёртвым ботом (пустой confirmation_code,
+            # Callback API не настроен).
             group_name = f"Group {gid}"
+            token_error = ""
             try:
                 async with httpx.AsyncClient() as client:
                     info_resp = await client.get(
@@ -218,6 +290,8 @@ async def oauth_callback(request: Request, code: str = "", error: str = "", erro
                         },
                     )
                 info_data = info_resp.json()
+                if "error" in info_data:
+                    token_error = info_data["error"].get("error_msg", "unknown error")
                 groups_list = info_data.get("response", {}).get("groups", info_data.get("response", []))
                 if isinstance(groups_list, list) and groups_list:
                     group_name = groups_list[0].get("name", group_name)
@@ -225,6 +299,11 @@ async def oauth_callback(request: Request, code: str = "", error: str = "", erro
                     group_name = groups_list.get("name", group_name)
             except Exception as e:
                 logger.warning(f"Failed to get group name for {gid}: {e}")
+
+            if token_error:
+                logger.error(f"Token for group {gid} is unusable: {token_error}")
+                groups_failed.append(f"{gid}: {token_error}")
+                continue
 
             # Get confirmation code for Callback API
             confirmation_code = ""
@@ -284,9 +363,19 @@ async def oauth_callback(request: Request, code: str = "", error: str = "", erro
             groups_connected.append(f"{group_name} (ID: {gid})")
 
     if not groups_connected:
+        from html import escape as html_escape
+        if groups_failed:
+            details = "".join(f"<li>{html_escape(f)}</li>" for f in groups_failed)
+            body = (
+                f"<p>VK выдал неработающий токен:</p><ul>{details}</ul>"
+                "<p>Нажмите «Подключить» ещё раз — согласие будет запрошено "
+                "заново и VK выпустит свежий токен.</p>"
+            )
+        else:
+            body = "<p>Попробуйте ещё раз и убедитесь, что вы выбрали группу.</p>"
         return HTMLResponse(
-            "<h2>Не удалось подключить группы</h2>"
-            "<p>Попробуйте ещё раз и убедитесь, что вы выбрали группу.</p>",
+            "<h2>Не удалось подключить группы</h2>" + body
+            + '<p><a href="/dashboard">&larr; Назад в панель</a></p>',
             status_code=400,
         )
 
@@ -321,6 +410,11 @@ async def oauth_token_callback(request: Request):
     Handle Standalone-app flow where VK returns tokens in URL fragment.
     JS on the client redirects here with token params as query string.
     """
+    # Принимает готовые токены без OAuth state-проверки, поэтому тоже только
+    # для залогиненного владельца панели.
+    if not is_authenticated(request):
+        return RedirectResponse("/dashboard/login", status_code=303)
+
     params = dict(request.query_params)
     logger.info(f"Token callback params: {list(params.keys())}")
 
@@ -333,6 +427,7 @@ async def oauth_token_callback(request: Request):
             secret_key = secrets.token_hex(16)
 
             group_name = f"Group {gid}"
+            token_error = ""
             try:
                 async with httpx.AsyncClient() as client:
                     info_resp = await client.get(
@@ -340,11 +435,17 @@ async def oauth_token_callback(request: Request):
                         params={"group_id": gid, "access_token": token, "v": "5.199"},
                     )
                 info_data = info_resp.json()
+                if "error" in info_data:
+                    token_error = info_data["error"].get("error_msg", "unknown error")
                 groups_list = info_data.get("response", {}).get("groups", info_data.get("response", []))
                 if isinstance(groups_list, list) and groups_list:
                     group_name = groups_list[0].get("name", group_name)
             except Exception as e:
                 logger.warning(f"Failed to get group name for {gid}: {e}")
+
+            if token_error:
+                logger.error(f"Token for group {gid} is unusable: {token_error}")
+                continue
 
             confirmation_code = ""
             try:

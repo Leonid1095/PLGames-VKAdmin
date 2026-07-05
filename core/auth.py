@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import logging
 import secrets
+import time
 from fastapi import Request, Response
 from core.config import settings
 
@@ -61,6 +62,58 @@ def clear_auth_cookie(response: Response) -> Response:
     """Remove the session cookie."""
     response.delete_cookie(key=COOKIE_NAME)
     return response
+
+
+# ─── Login rate limiting ─────────────────────────────────────────────────────
+
+_MAX_LOGIN_FAILURES = 5
+_LOGIN_WINDOW_SECONDS = 15 * 60
+_failed_logins: dict[str, list[float]] = {}
+
+
+def _client_ip(request: Request) -> str:
+    """Client address for rate limiting.
+
+    uvicorn слушает 127.0.0.1 за реверс-прокси, поэтому request.client — это
+    всегда прокси. Берём ПОСЛЕДНИЙ адрес из X-Forwarded-For: его дописывает наш
+    прокси, а первые элементы клиент может подделать.
+    """
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[-1].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def login_retry_after(request: Request) -> int:
+    """Seconds until this client may attempt a login again (0 = not limited)."""
+    now = time.monotonic()
+    ip = _client_ip(request)
+    attempts = [t for t in _failed_logins.get(ip, []) if now - t < _LOGIN_WINDOW_SECONDS]
+    if attempts:
+        _failed_logins[ip] = attempts
+    else:
+        _failed_logins.pop(ip, None)
+    if len(attempts) < _MAX_LOGIN_FAILURES:
+        return 0
+    return int(_LOGIN_WINDOW_SECONDS - (now - attempts[0])) + 1
+
+
+def record_login_failure(request: Request) -> None:
+    now = time.monotonic()
+    # Не даём словарю расти бесконечно при переборе с разных IP.
+    if len(_failed_logins) > 1000:
+        for ip, times in list(_failed_logins.items()):
+            alive = [t for t in times if now - t < _LOGIN_WINDOW_SECONDS]
+            if alive:
+                _failed_logins[ip] = alive
+            else:
+                del _failed_logins[ip]
+    _failed_logins.setdefault(_client_ip(request), []).append(now)
+    logger.warning(f"Failed dashboard login attempt from {_client_ip(request)}")
+
+
+def record_login_success(request: Request) -> None:
+    _failed_logins.pop(_client_ip(request), None)
 
 
 # ─── CSRF protection ─────────────────────────────────────────────────────────

@@ -9,6 +9,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from core.auth import (
     is_authenticated, set_auth_cookie, clear_auth_cookie, get_dashboard_password,
     get_csrf_token, set_csrf_cookie, verify_csrf_token,
+    login_retry_after, record_login_failure, record_login_success,
 )
 from database.service import (
     get_all_active_groups, get_group, get_setting, set_setting,
@@ -219,7 +220,13 @@ async def login_page(request: Request):
         return RedirectResponse("/dashboard", status_code=303)
 
     error = request.query_params.get("error", "")
-    error_html = '<p style="color:#d32f2f;margin-bottom:12px;">Неверный пароль</p>' if error else ""
+    error_messages = {
+        "1": "Неверный пароль",
+        "csrf": "Форма устарела — страница обновлена, попробуйте ещё раз",
+        "locked": "Слишком много попыток входа. Подождите 15 минут.",
+    }
+    error_text = error_messages.get(error, "")
+    error_html = f'<p style="color:#d32f2f;margin-bottom:12px;">{error_text}</p>' if error_text else ""
 
     content = f"""
     <div style="max-width:380px;margin:80px auto;">
@@ -238,7 +245,7 @@ async def login_page(request: Request):
                 </div>
                 <button type="submit" class="btn" style="width:100%;">Войти</button>
             </form>
-            <p class="hint" style="margin-top:12px;text-align:center;">Пароль задаётся в .env как JWT_SECRET</p>
+            <p class="hint" style="margin-top:12px;text-align:center;">Пароль задаётся в .env как DASHBOARD_PASSWORD</p>
         </div>
     </div>
     """
@@ -249,16 +256,20 @@ async def login_page(request: Request):
 
 @router.post("/dashboard/login")
 async def login_submit(request: Request):
+    if login_retry_after(request):
+        return RedirectResponse("/dashboard/login?error=locked", status_code=303)
     if not await verify_csrf_token(request):
-        return RedirectResponse("/dashboard/login?error=1", status_code=303)
+        return RedirectResponse("/dashboard/login?error=csrf", status_code=303)
     form = await request.form()
     password = str(form.get("password", ""))
 
     if hmac.compare_digest(password, get_dashboard_password()):
+        record_login_success(request)
         response = RedirectResponse("/dashboard", status_code=303)
         set_auth_cookie(response)
         return response
 
+    record_login_failure(request)
     return RedirectResponse("/dashboard/login?error=1", status_code=303)
 
 
@@ -291,14 +302,15 @@ async def dashboard_home(request: Request):
         <div class="card">
             <div class="card-title">Подключите группу</div>
             <p style="margin-bottom:12px; color:#666;">Введите ID группы, и бот начнёт работать автоматически.</p>
-            <form action="/api/vk/oauth" method="GET" class="connect-form">
+            <form action="/api/vk/oauth" method="GET" class="connect-form"
+                  onsubmit="location.href='/api/vk/oauth?group_ids='+encodeURIComponent(this.group_ids.value.trim());return false;">
                 <div class="form-group">
-                    <label>ID группы</label>
-                    <input type="text" name="group_ids" placeholder="236517033" required>
+                    <label>ID, короткое имя или ссылка</label>
+                    <input type="text" name="group_ids" placeholder="236517033 или vk.com/plgames" required>
                 </div>
                 <button type="submit" class="btn">Подключить</button>
             </form>
-            <p class="hint">Где найти ID: откройте группу ВК, в адресе будет vk.com/club<b>123456</b> — число после club и есть ID</p>
+            <p class="hint">Подойдёт числовой ID, короткое имя или ссылка на группу ВК</p>
         </div>
         """
         response = HTMLResponse(_base_html("Панель управления", content))
@@ -308,14 +320,26 @@ async def dashboard_home(request: Request):
     groups_html = ""
     for g in groups:
         name = escape(g.group_name or f"Группа {g.group_id}")
+        # Пустой confirmation_code = подключение не завершилось (VK выдал
+        # отозванный токен): бот в такой группе мёртв, честно показываем это
+        # и предлагаем переподключить вместо зелёного «Работает».
+        if g.confirmation_code:
+            status_badge = '<span class="badge badge-green">Работает</span>'
+            reconnect_btn = ""
+        else:
+            status_badge = ('<span class="badge" style="background:#fdecea;color:#c62828;">'
+                            'Нет доступа</span>')
+            reconnect_btn = (f'<a href="/api/vk/oauth?group_ids={g.group_id}" '
+                             'class="btn btn-sm">Переподключить</a>')
         groups_html += f"""
         <div class="card">
             <div class="group-card">
                 <div class="group-info">
                     <h3>{name}</h3>
-                    <p>ID: {g.group_id} &nbsp; <span class="badge badge-green">Работает</span></p>
+                    <p>ID: {g.group_id} &nbsp; {status_badge}</p>
                 </div>
                 <div class="group-actions">
+                    {reconnect_btn}
                     <a href="/dashboard/group/{g.group_id}" class="btn btn-sm">Настроить</a>
                     <form method="POST" action="/dashboard/group/{g.group_id}/disconnect"
                           onsubmit="return confirm('Отключить бота от этой группы?');">
@@ -335,14 +359,15 @@ async def dashboard_home(request: Request):
     {groups_html}
     <div class="card">
         <div class="card-title">Подключить ещё группу</div>
-        <form action="/api/vk/oauth" method="GET" class="connect-form">
+        <form action="/api/vk/oauth" method="GET" class="connect-form"
+              onsubmit="location.href='/api/vk/oauth?group_ids='+encodeURIComponent(this.group_ids.value.trim());return false;">
             <div class="form-group">
-                <label>ID группы</label>
-                <input type="text" name="group_ids" placeholder="236517033" required>
+                <label>ID, короткое имя или ссылка</label>
+                <input type="text" name="group_ids" placeholder="236517033 или vk.com/plgames" required>
             </div>
             <button type="submit" class="btn btn-outline btn-sm">Подключить</button>
         </form>
-        <p class="hint">vk.com/club<b>123456</b> → ID = 123456</p>
+        <p class="hint">Подойдёт числовой ID, короткое имя или ссылка на группу</p>
     </div>
     """
     response = HTMLResponse(_base_html("Панель управления", content))

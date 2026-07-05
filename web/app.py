@@ -4,7 +4,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, Response
 
 # Configure logging at import time. Production runs `uvicorn web.app:app`
 # directly (see vkadmin.service), which never executes main.py — so without
@@ -14,6 +14,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+# httpx на INFO пишет полный URL каждого запроса — а VK API получает
+# access_token в query string, то есть секреты утекали в journald.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 from database.engine import init_db
 from database.service import create_group, seed_default_settings
@@ -146,7 +149,11 @@ class VKFrameMiddleware(BaseHTTPMiddleware):
                 "img-src 'self' data: https:; "
                 "connect-src 'self'; "
                 "base-uri 'self'; "
-                "form-action 'self'; "
+                # Chrome применяет form-action ко ВСЕЙ цепочке редиректов,
+                # включая внутренние прыжки VK (id.vk.com, login.vk.com…),
+                # поэтому форма «Подключить группу» уходит JS-навигацией, а не
+                # сабмитом. oauth.vk.com оставлен как fallback без JS.
+                "form-action 'self' https://oauth.vk.com; "
                 "frame-ancestors 'none'"
             )
         return response
@@ -163,6 +170,23 @@ app.include_router(miniapp_router)
 @app.get("/")
 async def root():
     return RedirectResponse("/dashboard")
+
+
+_FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+    '<rect width="64" height="64" rx="14" fill="#0077ff"/>'
+    '<text x="32" y="45" font-family="Arial,sans-serif" font-size="32" '
+    'font-weight="bold" fill="#fff" text-anchor="middle">VK</text></svg>'
+)
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return Response(
+        content=_FAVICON_SVG,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @app.get("/api/health")

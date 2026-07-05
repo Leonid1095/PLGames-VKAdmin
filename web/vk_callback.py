@@ -283,7 +283,14 @@ async def vk_callback(request: Request):
     if event_type == "confirmation":
         group = await get_group(group_id)
         if group and group.confirmation_code:
+            logger.info(f"Confirmation request for group {group_id} — answered with stored code")
             return PlainTextResponse(group.confirmation_code)
+        # Код может отсутствовать: некоторые токены не могут вызвать
+        # getCallbackConfirmationCode (VK err 1051) — тогда код нужно взять
+        # из UI VK (Работа с API → Callback API) и записать в groups руками.
+        logger.warning(
+            f"Confirmation request for group {group_id}, but no confirmation_code stored — answered 'error'"
+        )
         return PlainTextResponse("error")
 
     # ── Verify secret key ──
