@@ -7,7 +7,7 @@ from database.engine import async_session, _is_sqlite
 from database.models import (
     Group, UserContext, GroupSettings, UserStats,
     SuggestedPost, ContentSource, ScheduledPost, PostAnalytics,
-    Newsletter, BanRecord, ContentTask,
+    Newsletter, BanRecord, ContentTask, Escalation,
 )
 
 # Dialect-aware INSERT ... ON CONFLICT. Both the sqlite and postgresql dialects
@@ -204,6 +204,96 @@ async def save_user_history(group_id: int, vk_id: int, history: list[dict]) -> N
         await session.commit()
 
 
+# ─── Human handoff («живой админ в диалоге») ─────────────────────────────────
+
+async def set_human_mode(group_id: int, vk_id: int, until: datetime | None) -> None:
+    """Пока until в будущем — бот молчит в этом диалоге. None = вернуть бота."""
+    async with async_session() as session:
+        result = await session.execute(
+            select(UserContext).where(
+                UserContext.group_id == group_id, UserContext.vk_id == vk_id,
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row:
+            row.human_mode_until = until
+        else:
+            session.add(UserContext(
+                group_id=group_id, vk_id=vk_id, context_data="",
+                human_mode_until=until,
+            ))
+        await session.commit()
+
+
+async def is_human_mode_active(group_id: int, vk_id: int) -> bool:
+    async with async_session() as session:
+        result = await session.execute(
+            select(UserContext.human_mode_until).where(
+                UserContext.group_id == group_id, UserContext.vk_id == vk_id,
+            )
+        )
+        until = result.scalar_one_or_none()
+    if not until:
+        return False
+    # SQLite отдаёт naive datetime, храним UTC — сравниваем в naive UTC.
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    if until.tzinfo is not None:
+        until = until.astimezone(timezone.utc).replace(tzinfo=None)
+    return until > now
+
+
+async def create_escalation(
+    group_id: int, vk_id: int, user_name: str, reason: str, urgency: str = "normal",
+) -> None:
+    async with async_session() as session:
+        session.add(Escalation(
+            group_id=group_id, vk_id=vk_id, user_name=user_name[:100],
+            reason=reason[:300], urgency=urgency,
+        ))
+        await session.commit()
+
+
+async def resolve_escalations(group_id: int, vk_id: int) -> None:
+    async with async_session() as session:
+        await session.execute(
+            update(Escalation)
+            .where(
+                Escalation.group_id == group_id,
+                Escalation.vk_id == vk_id,
+                Escalation.resolved == False,  # noqa: E712
+            )
+            .values(resolved=True)
+        )
+        await session.commit()
+
+
+async def get_escalations_since(group_id: int, since: datetime) -> list[Escalation]:
+    if since.tzinfo is not None:
+        since = since.astimezone(timezone.utc).replace(tzinfo=None)
+    async with async_session() as session:
+        result = await session.execute(
+            select(Escalation).where(
+                Escalation.group_id == group_id,
+                Escalation.created_at >= since,
+            ).order_by(Escalation.created_at)
+        )
+        return list(result.scalars().all())
+
+
+async def count_active_dialogs(group_id: int, since: datetime) -> int:
+    from sqlalchemy import func
+    if since.tzinfo is not None:
+        since = since.astimezone(timezone.utc).replace(tzinfo=None)
+    async with async_session() as session:
+        result = await session.execute(
+            select(func.count()).select_from(UserContext).where(
+                UserContext.group_id == group_id,
+                UserContext.last_interaction >= since,
+            )
+        )
+        return int(result.scalar_one() or 0)
+
+
 async def clear_user_history(group_id: int, vk_id: int) -> None:
     await save_user_history(group_id, vk_id, [])
 
@@ -259,7 +349,7 @@ async def get_user_stats(group_id: int, vk_id: int) -> UserStatsDTO:
         return _stats_to_dto(result.scalar_one())
 
 
-async def check_and_increment_limit(group_id: int, vk_id: int) -> bool:
+async def check_and_increment_limit(group_id: int, vk_id: int, max_daily: int = 10) -> bool:
     from sqlalchemy import case
 
     async with async_session() as session:
@@ -274,7 +364,7 @@ async def check_and_increment_limit(group_id: int, vk_id: int) -> bool:
 
         now = datetime.now(timezone.utc)
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        max_daily = 1000000 if stats.is_vip else 10
+        max_daily = 1000000 if stats.is_vip else max_daily
 
         # Effective counter: reset to 0 if last request was before today
         effective_count = case(

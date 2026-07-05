@@ -60,7 +60,7 @@ async def _setup_callback_api(token: str, gid: int, secret_key: str) -> None:
                 "https://api.vk.com/method/groups.setCallbackSettings",
                 params={
                     "group_id": gid, "server_id": server_id,
-                    "message_new": 1, "wall_reply_new": 1,
+                    "message_new": 1, "message_reply": 1, "wall_reply_new": 1,
                     "group_join": 1, "group_leave": 1,
                     "like_add": 1, "wall_repost": 1, **common,
                 },

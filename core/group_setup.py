@@ -41,6 +41,64 @@ async def setup_group_ai(group_id: int, access_token: str) -> bool:
         await set_setting(group_id, key, value)
 
     logger.info(f"[SETUP] AI setup complete for group {group_id}: {list(ai_settings.keys())}")
+
+    # 6. Зона знаний: выжимка с сайта группы, чтобы бот отвечал по продукту,
+    # а не выдумывал (best-effort — сайт может отсутствовать).
+    site = (group_info.get("site") or "").strip()
+    if site:
+        await refresh_site_knowledge(group_id, site)
+
+    return True
+
+
+async def refresh_site_knowledge(group_id: int, site_url: str) -> bool:
+    """Скачать сайт группы и сохранить текстовую выжимку в ai_site_knowledge.
+
+    Главная может быть JS-приложением почти без статического текста — тогда
+    добираем контент со страниц из sitemap.xml (обычно SEO-лендинги).
+    """
+    import re as _re
+    from core.web_reader import read_url, is_safe_public_url
+
+    url = site_url.strip().rstrip("/")
+    if url and not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    if not url or not is_safe_public_url(url):
+        return False
+
+    chunks: list[str] = []
+
+    async def _try_page(page_url: str) -> None:
+        try:
+            text = (await read_url(page_url) or "").strip()
+            if len(text) > 100:
+                chunks.append(text)
+        except Exception as e:
+            logger.debug(f"[SETUP] Site page fetch failed {page_url}: {e}")
+
+    await _try_page(url)
+
+    if sum(len(c) for c in chunks) < 500:
+        try:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                resp = await client.get(f"{url}/sitemap.xml")
+            locs = _re.findall(r"<loc>([^<]+)</loc>", resp.text)
+            # Служебные страницы знаний не добавляют.
+            skip = ("terms", "privacy", "sitemap")
+            pages = [l for l in locs if l.rstrip("/") != url and not any(s in l for s in skip)]
+            for page in pages[:4]:
+                if is_safe_public_url(page):
+                    await _try_page(page)
+                if sum(len(c) for c in chunks) > 3000:
+                    break
+        except Exception as e:
+            logger.debug(f"[SETUP] Sitemap fetch failed for {url}: {e}")
+
+    combined = "\n\n".join(chunks).strip()
+    if len(combined) < 100:
+        return False
+    await set_setting(group_id, "ai_site_knowledge", combined[:3500])
+    logger.info(f"[SETUP] Site knowledge saved for group {group_id} ({min(len(combined), 3500)} chars)")
     return True
 
 
@@ -54,7 +112,7 @@ async def _fetch_group_info(group_id: int, token: str) -> dict | None:
                 "https://api.vk.com/method/groups.getById",
                 params={
                     "group_id": group_id,
-                    "fields": "description,activity,status,members_count,counters",
+                    "fields": "description,activity,status,members_count,counters,site",
                     "access_token": token,
                     "v": "5.199",
                 },

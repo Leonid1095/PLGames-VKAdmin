@@ -83,6 +83,37 @@ async def send_to_telegram(
         return False
 
 
+async def notify_admin_telegram(group_id: int, text: str) -> bool:
+    """Служебное уведомление админу в Telegram (например, эскалация из VK).
+
+    Использует отдельный chat_id (setting telegram_admin_chat_id) — не канал
+    кросс-постинга. Не требует telegram_enabled: это операционный канал.
+    """
+    chat_id = await get_setting(group_id, "telegram_admin_chat_id", "")
+    if not chat_id:
+        return False
+
+    bot_token = await get_setting(group_id, "telegram_bot_token", "")
+    if not bot_token:
+        from core.config import settings
+        bot_token = settings.TELEGRAM_BOT_TOKEN
+    if not bot_token:
+        return False
+
+    try:
+        url = f"{_TG_API.format(token=bot_token)}/sendMessage"
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(url, json={
+                "chat_id": chat_id,
+                "text": text[:4096],
+                "disable_web_page_preview": True,
+            })
+        return bool(resp.json().get("ok"))
+    except Exception as e:
+        logger.warning(f"Telegram admin notify failed for group {group_id}: {e}")
+        return False
+
+
 async def check_bot_token(bot_token: str) -> dict | None:
     """Verify a Telegram bot token and return bot info, or None if invalid."""
     try:

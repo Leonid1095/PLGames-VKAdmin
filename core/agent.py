@@ -273,6 +273,24 @@ ADMIN_TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "resume_bot",
+            "description": (
+                "Вернуть бота в диалог с пользователем — снять режим «живой админ в диалоге» "
+                "после эскалации или ручного ответа. Use when admin says «продолжай с <id>», "
+                "«верни бота пользователю», «я закончил с клиентом»."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "integer", "description": "VK ID пользователя (число из vk.com/id… или из уведомления об эскалации)"}
+                },
+                "required": ["user_id"]
+            }
+        }
+    },
 ]
 
 # Subset of tools available to regular users
@@ -313,6 +331,26 @@ USER_TOOLS = [
             "name": "who_am_i",
             "description": "AI personality analysis based on chat history. Use when user asks 'who am I', 'analyze me'.",
             "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "call_admin",
+            "description": (
+                "Позвать живого админа (человека) в этот диалог. ОБЯЗАТЕЛЬНО используй когда: "
+                "пользователь просит человека/админа/оператора/поддержку; жалоба или конфликт; "
+                "вопросы оплаты, возврата, доступа к аккаунту; ты не уверен в точном ответе. "
+                "После вызова бот перестаёт отвечать в диалоге, пока не разберётся человек."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {"type": "string", "description": "Краткая суть: что случилось / что нужно человеку"},
+                    "urgency": {"type": "string", "enum": ["normal", "high"], "description": "high — жалоба, оплата, срочная проблема"}
+                },
+                "required": ["reason"]
+            }
         }
     },
 ]
@@ -783,6 +821,28 @@ async def _exec_who_am_i(ctx: GroupContext, args: dict, user_id: int = 0) -> str
 
 # ─── Tool dispatcher ────────────────────────────────────────────────────────
 
+async def _exec_call_admin(ctx: GroupContext, args: dict, user_id: int = 0) -> str:
+    from core.escalation import escalate_to_admin
+    return await escalate_to_admin(
+        ctx, user_id,
+        reason=args.get("reason", ""),
+        urgency=args.get("urgency", "normal"),
+    )
+
+
+async def _exec_resume_bot(ctx: GroupContext, args: dict) -> str:
+    from database.service import set_human_mode, resolve_escalations
+    try:
+        uid = int(args.get("user_id", 0))
+    except (TypeError, ValueError):
+        uid = 0
+    if not uid:
+        return "Не понял, какого пользователя вернуть боту — нужен его VK ID (число)."
+    await set_human_mode(ctx.group_id, uid, None)
+    await resolve_escalations(ctx.group_id, uid)
+    return f"Готово — бот снова отвечает в диалоге с vk.com/id{uid}."
+
+
 TOOL_EXECUTORS = {
     # Admin tools
     "publish_post": _exec_publish_post,
@@ -803,15 +863,17 @@ TOOL_EXECUTORS = {
     "toggle_gamification": _exec_toggle_gamification,
     "refresh_ai": _exec_refresh_ai,
     "pin_post": _exec_pin_post,
+    "resume_bot": _exec_resume_bot,
     # User tools
     "get_profile": _exec_get_profile,
     "suggest_post": _exec_suggest_post,
     "horoscope": _exec_horoscope,
     "who_am_i": _exec_who_am_i,
+    "call_admin": _exec_call_admin,
 }
 
 # Tools that need user_id passed
-_USER_ID_TOOLS = {"get_profile", "suggest_post", "who_am_i"}
+_USER_ID_TOOLS = {"get_profile", "suggest_post", "who_am_i", "call_admin"}
 
 # Build sets of allowed tool names per role, used to gate execution.
 _ADMIN_TOOL_NAMES = {t["function"]["name"] for t in ADMIN_TOOLS}
@@ -885,18 +947,29 @@ async def _build_system_prompt(ctx: GroupContext, is_admin: bool) -> str:
             "У тебя есть инструменты для публикации, модерации, аналитики и настроек.\n"
             "Если пользователь просит что-то сделать — используй нужный инструмент.\n"
             "Если просто общается — отвечай как умный помощник.\n"
+            "Если админ пишет «продолжай с <id>» или «верни бота пользователю» — resume_bot.\n"
             "Не показывай технические детали (IDs, JSON). Говори человеческим языком.\n"
             "Если не уверен что имел в виду пользователь — уточни.\n"
             f"{group_info}\n"
             f"Дата: {datetime.now(timezone.utc).strftime('%d.%m.%Y %H:%M')} UTC"
         )
     else:
+        knowledge = ""
+        if ai_ctx.get("ai_faq"):
+            knowledge += f"\n\nFAQ группы (это твой главный источник ответов):\n{ai_ctx['ai_faq']}"
+        if ai_ctx.get("ai_site_knowledge"):
+            knowledge += f"\n\nЗнания о продукте с официального сайта:\n{ai_ctx['ai_site_knowledge']}"
         return (
-            "Ты — дружелюбный помощник в группе ВКонтакте. Общайся на русском.\n"
-            "У тебя есть инструменты: профиль, предложение постов, гороскоп, анализ личности.\n"
-            "Если пользователь просит что-то — используй подходящий инструмент.\n"
-            "Если просто общается — будь собеседником, помни контекст.\n"
-            f"{group_info}"
+            "Ты — внимательный живой админ группы ВКонтакте (сотрудник поддержки).\n"
+            "Общайся на русском, по-человечески, кратко и по делу.\n"
+            "Твоя зона ответственности:\n"
+            "1. Отвечай ТОЛЬКО на основе знаний ниже и контекста группы. Никогда не выдумывай "
+            "функции, цены, сроки, обещания — если ответа нет в знаниях, честно скажи и позови человека.\n"
+            "2. Сразу вызывай call_admin, если: просят живого человека/админа/оператора; жалоба "
+            "или конфликт; вопросы оплаты, возврата, доступа к аккаунту; ты не уверен в ответе.\n"
+            "3. Не спорь и не оправдывайся. Наглость и провокации — игнорируй или call_admin.\n"
+            "4. Помни контекст диалога, обращайся к человеку естественно.\n"
+            f"{group_info}{knowledge}"
         )
 
 
@@ -912,18 +985,29 @@ async def run_agent(
         check_and_increment_limit,
     )
 
-    # Rate limit for non-admin users
+    # Rate limit for non-admin users. daily_msg_limit=0 → «живой админ»,
+    # отвечаем на всё без ограничений.
     if not is_admin:
-        can_request = await check_and_increment_limit(ctx.group_id, user_id)
-        if not can_request:
-            return (
-                "На сегодня лимит бесплатных запросов исчерпан (10). "
-                "Завтра снова смогу помочь!"
-            )
+        try:
+            max_daily = int(await get_setting(ctx.group_id, "daily_msg_limit", "10"))
+        except (TypeError, ValueError):
+            max_daily = 10
+        if max_daily > 0:
+            can_request = await check_and_increment_limit(ctx.group_id, user_id, max_daily)
+            if not can_request:
+                return (
+                    f"На сегодня лимит бесплатных запросов исчерпан ({max_daily}). "
+                    "Завтра снова смогу помочь!"
+                )
 
     model = await get_setting(ctx.group_id, "active_model", settings.DEFAULT_MODEL)
     system_prompt = await _build_system_prompt(ctx, is_admin)
     tools = ADMIN_TOOLS + USER_TOOLS if is_admin else USER_TOOLS
+    if not is_admin:
+        # Развлекательные инструменты неуместны в группе поддержки продукта.
+        fun_on = (await get_setting(ctx.group_id, "fun_tools_enabled", "true")).lower() == "true"
+        if not fun_on:
+            tools = [t for t in tools if t["function"]["name"] not in ("horoscope", "who_am_i")]
 
     # Load conversation history
     history = await get_user_history(ctx.group_id, user_id)
@@ -969,7 +1053,8 @@ async def run_agent(
 
     # Whitelist of tools this role may run. We send only role-appropriate tools
     # to the LLM, but a hallucinated/cached tool name must still be blocked here.
-    allowed = _ADMIN_TOOL_NAMES | _USER_TOOL_NAMES if is_admin else _USER_TOOL_NAMES
+    # Derived from the actually-sent list, so fun-tool gating applies here too.
+    allowed = {t["function"]["name"] for t in tools}
 
     # Execute tool calls
     tool_results = []

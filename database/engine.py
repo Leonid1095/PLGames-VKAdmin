@@ -45,6 +45,14 @@ def _apply_light_migrations(conn):
         )
         logger.info("Migration: added scheduled_posts.attempts column.")
 
+    rows = conn.exec_driver_sql("PRAGMA table_info(user_contexts)").fetchall()
+    cols = {r[1] for r in rows}
+    if "human_mode_until" not in cols:
+        conn.exec_driver_sql(
+            "ALTER TABLE user_contexts ADD COLUMN human_mode_until DATETIME"
+        )
+        logger.info("Migration: added user_contexts.human_mode_until column.")
+
 
 async def init_db():
     """Create all tables in the database."""

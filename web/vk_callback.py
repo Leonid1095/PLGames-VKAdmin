@@ -2,8 +2,10 @@
 
 import asyncio
 import logging
+import re
 import time
 from collections import OrderedDict
+from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, Request
 from fastapi.responses import PlainTextResponse
 from vkbottle import API
@@ -16,6 +18,7 @@ from core.onboarding import is_onboarding_needed, run_onboarding
 from database.service import (
     get_group, get_setting, add_xp_activity,
     record_member_join, record_member_leave,
+    is_human_mode_active, set_human_mode,
 )
 from handlers.comments import handle_wall_comment
 
@@ -115,11 +118,51 @@ async def _process_message(ctx: GroupContext, obj: dict):
     from_id = message.get("from_id", 0)
     text = message.get("text", "")
     peer_id = message.get("peer_id", from_id)
-
-    if not text.strip():
-        return
+    attachments = message.get("attachments", []) or []
 
     is_admin = (from_id == ctx.admin_vk_id)
+    is_chat = peer_id >= 2_000_000_000
+
+    # ── Живой админ в диалоге: после эскалации или ручного ответа админа
+    # бот уступает личку человеку и молчит до таймаута/resume_bot.
+    if not is_admin and not is_chat and await is_human_mode_active(ctx.group_id, from_id):
+        logger.info(f"[HUMAN MODE] group={ctx.group_id} user={from_id} — bot stays silent")
+        return
+
+    # ── Беседы: живой админ не встревает в каждую реплику чата —
+    # отвечаем только при упоминании группы или обращении «бот, …».
+    if is_chat:
+        mentioned = f"[club{ctx.group_id}|" in text
+        if not (mentioned or text.lower().lstrip().startswith("бот")):
+            return
+        text = re.sub(r"\[club\d+\|[^\]]*\]\s*,?\s*", "", text).strip()
+
+    # ── Нетекстовые сообщения: скриншот/файл — частый запрос в поддержку,
+    # молча игнорировать нельзя.
+    if not text.strip():
+        if not attachments or is_chat:
+            return
+        att_types = {a.get("type", "") for a in attachments}
+        if att_types & {"photo", "doc", "video", "audio_message", "wall"}:
+            from core.escalation import escalate_to_admin
+            reply = await escalate_to_admin(
+                ctx, from_id,
+                reason=f"Прислал вложение без текста ({', '.join(sorted(att_types))}) — нужен человек",
+            )
+            reply = "Вижу вложение! " + reply
+        else:
+            reply = ("Я лучше понимаю текст 🙂 Опишите вопрос словами — "
+                     "или напишите «позови админа», и подключится человек.")
+        try:
+            await ctx.api.messages.send(peer_id=peer_id, message=reply, random_id=0)
+        except Exception as e:
+            logger.error(f"Failed to reply to attachment-only message from {from_id}: {e}")
+        return
+
+    # Текст + вложения: агент должен знать, что к сообщению что-то приложено.
+    if attachments:
+        att_types = sorted({a.get("type", "") for a in attachments})
+        text = f"{text}\n[к сообщению приложено: {', '.join(att_types)} — содержимое тебе не видно]"
 
     # Onboarding: admin's first messages go through setup dialog
     if is_admin and await is_onboarding_needed(ctx.group_id):
@@ -138,6 +181,27 @@ async def _process_message(ctx: GroupContext, obj: dict):
             await ctx.api.messages.send(peer_id=peer_id, message=reply, random_id=0)
         except Exception as e:
             logger.error(f"Failed to send message to {peer_id}: {e}")
+
+
+async def _process_message_reply(ctx: GroupContext, obj: dict):
+    """Ручной ответ админа из интерфейса сообщества → бот уступает диалог.
+
+    message_reply приходит и на отправки самого бота через API — их отличает
+    отсутствие admin_author_id. Живой человек, ответивший из UI, несёт его.
+    """
+    message = obj.get("message", obj)
+    admin_author = message.get("admin_author_id", 0)
+    if not admin_author:
+        return
+    peer_id = message.get("peer_id", 0)
+    if peer_id <= 0 or peer_id >= 2_000_000_000:
+        return
+    until = datetime.now(timezone.utc) + timedelta(hours=2)
+    await set_human_mode(ctx.group_id, peer_id, until)
+    logger.info(
+        f"[HUMAN MODE] admin {admin_author} replied manually to {peer_id} "
+        f"in group {ctx.group_id} — bot silent for 2h"
+    )
 
 
 async def _process_wall_reply(ctx: GroupContext, obj: dict):
@@ -332,6 +396,8 @@ async def vk_callback(request: Request):
     # ── Dispatch event ──
     if event_type == "message_new":
         _spawn(_process_message(ctx, obj), event_key)
+    elif event_type == "message_reply":
+        _spawn(_process_message_reply(ctx, obj), event_key)
     elif event_type == "wall_reply_new":
         _spawn(_process_wall_reply(ctx, obj), event_key)
     elif event_type == "group_join":

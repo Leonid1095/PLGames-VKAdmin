@@ -321,7 +321,7 @@ async def _public_welcome(api, group_id: int, welcomes: list[dict]) -> None:
 
 
 async def _admin_digest(api, group_id: int, admin_vk_id: int, joins: int, leaves: int) -> None:
-    from database.service import get_post_analytics
+    from database.service import get_post_analytics, get_escalations_since, count_active_dialogs
     analytics = await get_post_analytics(group_id, limit=20)
 
     lines = ["📊 Сводка по группе за сутки:"]
@@ -340,7 +340,19 @@ async def _admin_digest(api, group_id: int, admin_vk_id: int, joins: int, leaves
         lines.append("• Постов с аналитикой пока нет.")
     lines.append(f"• Новых участников: +{joins}, вышло: −{leaves}")
 
-    if not analytics and joins == 0 and leaves == 0:
+    # Пульс «живого админа»: сколько людей говорило с ботом и кого он звал.
+    since = datetime.now(timezone.utc) - timedelta(hours=24)
+    dialogs = await count_active_dialogs(group_id, since)
+    escalations = await get_escalations_since(group_id, since)
+    unresolved = [e for e in escalations if not e.resolved]
+    if dialogs:
+        lines.append(f"• Диалогов с ботом: {dialogs}")
+    if escalations:
+        lines.append(f"• Звали человека: {len(escalations)} (не закрыто: {len(unresolved)})")
+        for e in unresolved[:5]:
+            lines.append(f"   — {e.user_name} (vk.com/id{e.vk_id}): {e.reason[:60]}")
+
+    if not analytics and joins == 0 and leaves == 0 and dialogs == 0 and not escalations:
         return  # nothing worth pinging the admin about
 
     try:

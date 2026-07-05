@@ -66,6 +66,9 @@ async def _get_group_ai_context(group_id: int) -> dict:
         "ai_content_topics": await get_setting(group_id, "ai_content_topics", ""),
         "ai_group_description": await get_setting(group_id, "ai_group_description", ""),
         "ai_tone": await get_setting(group_id, "ai_tone", "friendly"),
+        # Зона знаний «живого админа»: ручной FAQ и выжимка с сайта группы.
+        "ai_faq": await get_setting(group_id, "ai_faq", ""),
+        "ai_site_knowledge": await get_setting(group_id, "ai_site_knowledge", ""),
     }
 
 # ─── Public: One-shot generation (no memory) ─────────────────────────────────

@@ -30,6 +30,9 @@ class UserContext(Base):
     vk_id = Column(BigInteger, nullable=False, index=True)
     context_data = Column(Text, default="", nullable=False)
     last_interaction = Column(DateTime, default=_now, nullable=False)
+    # «Живой админ в диалоге»: до этого момента бот молчит (эскалация или
+    # ручной ответ админа из интерфейса сообщества).
+    human_mode_until = Column(DateTime, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("group_id", "vk_id", name="uq_context_group_user"),
@@ -180,6 +183,20 @@ class ContentTask(Base):
     __table_args__ = (
         UniqueConstraint("group_id", "name", name="uq_content_task_group_name"),
     )
+
+
+class Escalation(Base):
+    """Запрос «позовите человека» — кто, когда и почему звал живого админа."""
+    __tablename__ = "escalations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(BigInteger, ForeignKey("groups.group_id"), nullable=False, index=True)
+    vk_id = Column(BigInteger, nullable=False)
+    user_name = Column(String, default="")
+    reason = Column(String, default="")
+    urgency = Column(String, default="normal")  # normal / high
+    created_at = Column(DateTime, default=_now, nullable=False)
+    resolved = Column(Boolean, default=False, nullable=False)
 
 
 class BanRecord(Base):

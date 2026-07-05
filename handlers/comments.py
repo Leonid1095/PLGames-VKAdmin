@@ -123,16 +123,25 @@ async def handle_wall_comment(ctx: GroupContext, event_object: dict) -> None:
     from core.ai_brain import _get_group_ai_context
     ai_ctx = await _get_group_ai_context(ctx.group_id)
 
+    # Живой админ не поддакивает под каждым комментом: отвечаем на вопросы,
+    # претензии и обращения к сообществу; на реплики/эмоции — молчим.
+    no_reply_rule = (
+        "\nЕсли комментарий НЕ требует ответа администратора (просто эмоция, "
+        "реплика, мем, «спасибо», разговор пользователей между собой) — ответь "
+        "ровно одним словом: NO_REPLY."
+    )
     if ai_ctx["ai_system_prompt"]:
         system_prompt = (
             f"{ai_ctx['ai_system_prompt']}\n"
             "Напиши краткий ответ на комментарий пользователя (1-2 предложения). "
             "Отвечай в стиле и тематике группы."
+            + no_reply_rule
         )
     else:
         system_prompt = (
             "Ты администратор группы ВКонтакте. Напиши краткий, дружелюбный ответ "
             "на комментарий пользователя (1-2 предложения)."
+            + no_reply_rule
         )
 
     reply_text = await generate_response(
@@ -143,6 +152,9 @@ async def handle_wall_comment(ctx: GroupContext, event_object: dict) -> None:
 
     # Don't post an LLM error string as a public comment.
     if not reply_text or reply_text.startswith("Извините"):
+        return
+    if "NO_REPLY" in reply_text.upper()[:30]:
+        logger.info(f"[COMMENT] group={ctx.group_id} comment={comment_id}: no reply needed")
         return
 
     try:
