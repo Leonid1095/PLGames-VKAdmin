@@ -89,16 +89,17 @@ async def download_image_from_url(url: str) -> bytes | None:
     """Download an image from URL. Returns bytes or None."""
     if not url:
         return None
+    from core.web_reader import safe_get
     try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            resp = await client.get(url, headers={
-                "User-Agent": "Mozilla/5.0 (compatible; VKAdminBot/1.0)",
-            })
-            if resp.status_code == 200 and len(resp.content) > 1000:
-                content_type = resp.headers.get("content-type", "")
-                ext = url.split("?")[0].split(".")[-1].lower()
-                if "image" in content_type or ext in ("jpg", "jpeg", "png", "webp", "gif"):
-                    return resp.content
+        # URL картинки приходит из чужой ленты/API — только через SSRF-защиту.
+        resp = await safe_get(url, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; VKAdminBot/1.0)",
+        })
+        if resp.status_code == 200 and len(resp.content) > 1000:
+            content_type = resp.headers.get("content-type", "")
+            ext = url.split("?")[0].split(".")[-1].lower()
+            if "image" in content_type or ext in ("jpg", "jpeg", "png", "webp", "gif"):
+                return resp.content
     except Exception as e:
         logger.warning(f"Image download failed {url}: {e}")
     return None

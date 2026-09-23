@@ -13,7 +13,7 @@ from core.auth import (
 )
 from database.service import (
     get_all_active_groups, get_group, get_setting, set_setting,
-    deactivate_group, get_content_sources,
+    deactivate_group, get_content_sources, get_post_analytics,
 )
 
 logger = logging.getLogger(__name__)
@@ -178,6 +178,13 @@ def _base_html(title: str, content: str) -> str:
     .source-fetched {{ font-size: 0.78rem; color: #aaa; }}
     .btn-delete {{ background: none; border: none; color: #d32f2f; cursor: pointer; font-size: 0.85rem; padding: 4px 8px; border-radius: 4px; }}
     .btn-delete:hover {{ background: #ffebee; }}
+
+    /* Wall stats */
+    .stat-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 14px; }}
+    .stat-item {{ background: #f5f8fc; border-radius: 10px; padding: 12px; text-align: center; }}
+    .stat-value {{ font-size: 1.35rem; font-weight: 700; color: #1565c0; }}
+    .stat-label {{ font-size: 0.78rem; color: #888; }}
+    @media (max-width: 520px) {{ .stat-grid {{ grid-template-columns: repeat(2, 1fr); }} }}
 
     .toast {{
         position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
@@ -449,6 +456,8 @@ async def group_settings_page(request: Request, group_id: int):
     </div>
     """
 
+    stats_html = await _render_wall_stats(group_id, csrf, request.query_params.get("stats", ""))
+
     # ── Hint card ──
     hint_html = """
     <div class="card" style="background:#f8f9fa;border:1px dashed #ccc;">
@@ -461,7 +470,7 @@ async def group_settings_page(request: Request, group_id: int):
             <li>«Забань спамера 12345»</li>
             <li>«Следи за этим RSS: https://...»</li>
             <li>«Как дела в группе?» — статистика</li>
-            <li>«Публикуй патчноты каждую пятницу»</li>
+            <li>«Позови меня, если спросят про оплату»</li>
         </ul>
         <p style="font-size:0.82rem;color:#999;margin-top:10px;">
             Бот понимает естественный язык. Не нужно запоминать команды.
@@ -477,12 +486,81 @@ async def group_settings_page(request: Request, group_id: int):
         <p>ID: {group_id}</p>
     </div>
     {status_html}
+    {stats_html}
     {sections_html}
     {hint_html}
     """
     response = HTMLResponse(_base_html(name, content))
     set_csrf_cookie(response, csrf_token)
     return response
+
+
+async def _render_wall_stats(group_id: int, csrf: str, flash: str = "") -> str:
+    """Карточка «Статистика стены»: лайки/комментарии/репосты/просмотры
+    последних постов (из post_analytics, собирается раз в час)."""
+    posts = await get_post_analytics(group_id, limit=20)
+
+    flash_html = ""
+    if flash == "ok":
+        flash_html = '<div class="flash flash-success">Статистика обновлена</div>'
+    elif flash == "fail":
+        flash_html = ('<div class="flash" style="background:#fdecea;color:#c62828;">'
+                      'VK не отдал стену — подробности в журнале сервиса</div>')
+
+    refresh_form = f"""
+        <form method="POST" action="/dashboard/group/{group_id}/analytics/refresh" style="margin:0;">
+            {csrf}
+            <button type="submit" class="btn btn-outline btn-sm">Обновить сейчас</button>
+        </form>"""
+
+    if not posts:
+        body = ('<p style="color:#888;font-size:0.9rem;">Статистика ещё не собрана — '
+                'она обновляется раз в час. Нажмите «Обновить сейчас», чтобы собрать сразу.</p>')
+    else:
+        totals = {
+            "likes": sum(p.likes or 0 for p in posts),
+            "comments": sum(p.comments or 0 for p in posts),
+            "reposts": sum(p.reposts or 0 for p in posts),
+            "views": sum(p.views or 0 for p in posts),
+        }
+        labels = {"likes": "Лайков", "comments": "Комментариев",
+                  "reposts": "Репостов", "views": "Просмотров"}
+        grid = "".join(
+            f'<div class="stat-item"><div class="stat-value" data-stat="{k}">{v}</div>'
+            f'<div class="stat-label">{labels[k]}</div></div>'
+            for k, v in totals.items()
+        )
+        rows = ""
+        for p in posts:
+            date = p.published_at.strftime("%d.%m.%Y %H:%M") if p.published_at else "—"
+            url = f"https://vk.com/wall-{group_id}_{p.vk_post_id}"
+            rows += (
+                f'<tr><td><a class="source-url" href="{url}" target="_blank" rel="noopener">'
+                f'#{p.vk_post_id}</a><div class="source-fetched">{date}</div></td>'
+                f'<td>👍 {p.likes or 0}</td><td>💬 {p.comments or 0}</td>'
+                f'<td>🔁 {p.reposts or 0}</td><td>👁 {p.views or 0}</td></tr>'
+            )
+        checked = max((p.last_checked_at for p in posts if p.last_checked_at), default=None)
+        checked_txt = f"Обновлено: {checked.strftime('%d.%m.%Y %H:%M')} UTC" if checked else ""
+        body = f"""
+        <div class="stat-grid">{grid}</div>
+        <div style="overflow-x:auto;">
+            <table class="source-table">
+                <tr><th>Пост</th><th>Лайки</th><th>Комм.</th><th>Репосты</th><th>Просмотры</th></tr>
+                {rows}
+            </table>
+        </div>
+        <p class="hint">Последние {len(posts)} постов. {checked_txt}</p>"""
+
+    return f"""
+    <div class="card">
+        <div class="card-title" style="justify-content:space-between;">
+            <span>Статистика стены</span>{refresh_form}
+        </div>
+        {flash_html}
+        {body}
+    </div>
+    """
 
 
 def _render_control(group_id: int, setting: dict, current_value: str, csrf: str = "") -> str:
@@ -571,6 +649,21 @@ async def update_group_setting(request: Request, group_id: int):
         return JSONResponse({"ok": True})
 
     return RedirectResponse(f"/dashboard/group/{group_id}?msg=saved", status_code=303)
+
+
+@router.post("/dashboard/group/{group_id}/analytics/refresh")
+async def refresh_group_analytics(request: Request, group_id: int):
+    redirect = _require_auth(request)
+    if redirect:
+        return redirect
+    if not await verify_csrf_token(request):
+        return RedirectResponse(f"/dashboard/group/{group_id}", status_code=303)
+    if not await get_group(group_id):
+        return RedirectResponse("/dashboard", status_code=303)
+    from tasks import analytics
+    result = await analytics.collect_group_analytics(group_id)
+    status = "ok" if result.ok else "fail"
+    return RedirectResponse(f"/dashboard/group/{group_id}?stats={status}", status_code=303)
 
 
 @router.post("/dashboard/group/{group_id}/disconnect")

@@ -33,6 +33,27 @@ async def _get_manager_ids(ctx: GroupContext) -> list[int]:
     return manager_ids
 
 
+async def notify_managers(ctx: GroupContext, note: str) -> int:
+    """ЛС всем менеджерам группы + опционально Telegram. Возвращает, скольким
+    каналам удалось доставить (0 — никто не узнал)."""
+    notified = 0
+    for mid in await _get_manager_ids(ctx):
+        try:
+            await ctx.api.messages.send(user_id=mid, message=note, random_id=0)
+            notified += 1
+        except Exception as e:
+            # У менеджера может не быть диалога с группой — best-effort.
+            logger.warning(f"notify: can't DM manager {mid} of group {ctx.group_id}: {e}")
+
+    try:
+        from core.telegram import notify_admin_telegram
+        if await notify_admin_telegram(ctx.group_id, note):
+            notified += 1
+    except Exception as e:
+        logger.warning(f"notify: telegram failed for group {ctx.group_id}: {e}")
+    return notified
+
+
 async def escalate_to_admin(
     ctx: GroupContext,
     user_id: int,
@@ -66,21 +87,7 @@ async def escalate_to_admin(
         f"Вернуть его раньше: напишите мне «продолжай с {user_id}»."
     )
 
-    notified = 0
-    for mid in await _get_manager_ids(ctx):
-        try:
-            await ctx.api.messages.send(user_id=mid, message=note, random_id=0)
-            notified += 1
-        except Exception as e:
-            # У менеджера может не быть диалога с группой — best-effort.
-            logger.warning(f"escalate: can't DM manager {mid} of group {ctx.group_id}: {e}")
-
-    try:
-        from core.telegram import notify_admin_telegram
-        if await notify_admin_telegram(ctx.group_id, note):
-            notified += 1
-    except Exception as e:
-        logger.warning(f"escalate: telegram notify failed for group {ctx.group_id}: {e}")
+    notified = await notify_managers(ctx, note)
 
     until = datetime.now(timezone.utc) + timedelta(hours=HANDOFF_HOURS)
     await set_human_mode(ctx.group_id, user_id, until)

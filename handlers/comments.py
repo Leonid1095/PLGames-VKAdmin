@@ -2,6 +2,7 @@ import logging
 import time
 from core.ai_brain import analyze_toxicity, generate_response
 from core.group_context import GroupContext
+from core.text_guard import is_llm_failure
 from database.service import get_setting, add_xp, add_warning, clear_warnings, modify_reputation
 
 logger = logging.getLogger(__name__)
@@ -27,12 +28,16 @@ async def handle_wall_comment(ctx: GroupContext, event_object: dict) -> None:
     stripped = text.strip()
     if not stripped:
         return
+    # Ответы самого бота приходят обратно как wall_reply_new (from_id = -group_id):
+    # их нельзя модерировать и на них нельзя отвечать — иначе бот спорит сам с собой.
+    if from_id == -ctx.group_id:
+        return
 
     logger.info(f"[COMMENT] group={ctx.group_id} post={post_id} from={from_id}: {stripped[:80]}")
 
     # ── Reputation (+ / -) — only if gamification enabled ──
     gamification_on = (await get_setting(ctx.group_id, "gamification_enabled", "false")).lower() == "true"
-    if gamification_on and reply_to_user and reply_to_user > 0 and from_id != reply_to_user:
+    if gamification_on and from_id > 0 and reply_to_user and reply_to_user > 0 and from_id != reply_to_user:
         if stripped == "+":
             new_rep = await modify_reputation(ctx.group_id, reply_to_user, 1)
             try:
@@ -55,6 +60,10 @@ async def handle_wall_comment(ctx: GroupContext, event_object: dict) -> None:
             return
 
     # ── Moderation: keyword pre-filter + AI ──
+    # Владельца группы не модерируем: бот не удаляет комментарии админа
+    # и не копит ему «страйки» к автобану.
+    if from_id == ctx.admin_vk_id:
+        return
     # Quick keyword check before expensive AI call
     banned_words_str = await get_setting(ctx.group_id, "banned_words", "")
     is_toxic = False
@@ -66,30 +75,11 @@ async def handle_wall_comment(ctx: GroupContext, event_object: dict) -> None:
     if not is_toxic:
         is_toxic = await analyze_toxicity(ctx.group_id, stripped)
     if is_toxic:
-        logger.info(f"[MODERATE] Deleting comment {comment_id} from {from_id}")
-        try:
-            await ctx.api.wall.delete_comment(owner_id=owner_id, comment_id=comment_id)
-        except Exception as e:
-            logger.error(f"Failed to delete comment {comment_id}: {e}")
-
-        try:
-            warnings = await add_warning(ctx.group_id, from_id)
-            if warnings >= 3:
-                logger.info(f"[BAN] User {from_id} reached {warnings} strikes. Banning.")
-                await ctx.api.groups.ban(
-                    group_id=abs(owner_id),
-                    owner_id=from_id,
-                    reason=0,
-                    comment="Автобан ИИ за систематические нарушения",
-                    comment_visible=1,
-                )
-                await clear_warnings(ctx.group_id, from_id)
-        except Exception as e:
-            logger.error(f"Failed to issue warning/ban for {from_id}: {e}")
+        await _moderate(ctx, owner_id, post_id, comment_id, from_id, stripped)
         return
 
-    # ── Gamification: Award XP (only if enabled) ──
-    if gamification_on:
+    # ── Gamification: Award XP (only if enabled; people only, not communities) ──
+    if gamification_on and from_id > 0:
         try:
             cooldown_sec = int(await get_setting(ctx.group_id, "xp_cooldown_sec", "60"))
         except ValueError:
@@ -151,7 +141,7 @@ async def handle_wall_comment(ctx: GroupContext, event_object: dict) -> None:
     )
 
     # Don't post an LLM error string as a public comment.
-    if not reply_text or reply_text.startswith("Извините"):
+    if is_llm_failure(reply_text):
         return
     if "NO_REPLY" in reply_text.upper()[:30]:
         logger.info(f"[COMMENT] group={ctx.group_id} comment={comment_id}: no reply needed")
@@ -166,3 +156,62 @@ async def handle_wall_comment(ctx: GroupContext, event_object: dict) -> None:
         )
     except Exception as e:
         logger.error(f"Failed to reply to comment {comment_id}: {e}")
+
+
+async def _moderate(
+    ctx: GroupContext, owner_id: int, post_id: int, comment_id: int, from_id: int, text: str,
+) -> None:
+    """Удалить нарушение и считать страйки; что не вышло — отдать людям.
+
+    Ключ сообщества VK не пускает в wall.deleteComment и groups.ban (error 27),
+    поэтому провал здесь — штатная ситуация, а не повод молча писать в лог:
+    админ получает ссылку на комментарий и делает руками.
+    """
+    logger.info(f"[MODERATE] Deleting comment {comment_id} from {from_id}")
+    deleted = False
+    try:
+        await ctx.api.wall.delete_comment(owner_id=owner_id, comment_id=comment_id)
+        deleted = True
+    except Exception as e:
+        logger.warning(f"[MODERATE] Can't delete comment {comment_id}: {e}")
+
+    ban_failed = False
+    strikes = 0
+    if from_id > 0:
+        try:
+            strikes = await add_warning(ctx.group_id, from_id)
+            if strikes >= 3:
+                logger.info(f"[BAN] User {from_id} reached {strikes} strikes. Banning.")
+                try:
+                    await ctx.api.groups.ban(
+                        group_id=abs(owner_id),
+                        owner_id=from_id,
+                        reason=0,
+                        comment="Автобан ИИ за систематические нарушения",
+                        comment_visible=1,
+                    )
+                    await clear_warnings(ctx.group_id, from_id)
+                except Exception as e:
+                    ban_failed = True
+                    logger.warning(f"[BAN] Can't ban {from_id}: {e}")
+        except Exception as e:
+            logger.error(f"Failed to issue warning for {from_id}: {e}")
+
+    if deleted and not ban_failed:
+        return
+
+    link = f"https://vk.com/wall{owner_id}_{post_id}?reply={comment_id}"
+    lines = ["🛡 Модерация: нужна ваша рука"]
+    if not deleted:
+        lines.append("Бот счёл комментарий нарушением, но удалить не смог — "
+                     "VK не даёт ключу сообщества удалять комментарии.")
+    lines += [
+        f"Автор: vk.com/id{from_id}" if from_id > 0 else f"Автор: vk.com/club{-from_id}",
+        f"Текст: «{text[:300]}»",
+        f"Комментарий: {link}",
+    ]
+    if ban_failed:
+        lines.append(f"У автора {strikes} нарушений — стоит заблокировать его "
+                     "вручную (Управление → Участники → Чёрный список).")
+    from core.escalation import notify_managers
+    await notify_managers(ctx, "\n".join(lines))

@@ -12,7 +12,8 @@ import httpx
 
 from core.config import settings
 from core.content_writer import write_from_source, write_from_multiple_sources
-from core.web_reader import read_url, is_safe_public_url
+from core.text_guard import is_publishable
+from core.web_reader import read_url, is_safe_public_url, safe_get
 from database.service import (
     get_content_sources, update_source_fetched,
     create_scheduled_post, get_setting, set_setting,
@@ -73,10 +74,9 @@ async def parse_rss(url: str) -> list[dict]:
         logger.warning(f"Blocked non-public RSS URL: {url}")
         return []
     try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            resp = await client.get(url, headers={
-                "User-Agent": "Mozilla/5.0 (compatible; VKAdminBot/1.0)",
-            })
+        resp = await safe_get(url, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; VKAdminBot/1.0)",
+        })
         feed = feedparser.parse(resp.text)
         items = []
         for entry in feed.entries[:10]:
@@ -170,8 +170,7 @@ async def parse_api(url: str) -> list[dict]:
         logger.warning(f"Blocked non-public API URL: {url}")
         return []
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(url)
+        resp = await safe_get(url)
         data = resp.json()
         if isinstance(data, dict):
             data = data.get("items", data.get("news", data.get("data", [])))
@@ -203,7 +202,8 @@ async def parse_api(url: str) -> list[dict]:
                 })
         return items
     except Exception as e:
-        logger.error(f"API parse error for {url}: {e}")
+        # repr: у таймаутов httpx str() пустой — в журнале было «error for …:» без причины.
+        logger.error(f"API parse error for {url}: {e!r}")
         return []
 
 
@@ -213,27 +213,6 @@ async def parse_web(url: str) -> list[dict]:
     if content.startswith("Ошибка") or len(content.strip()) < 50:
         return []
     return [{"title": "", "text": content[:3000], "link": url, "image_url": ""}]
-
-
-async def _download_image(url: str) -> bytes | None:
-    """Download an image from URL, return bytes or None."""
-    if not url:
-        return None
-    if not is_safe_public_url(url):
-        logger.warning(f"Blocked non-public image URL: {url}")
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            resp = await client.get(url, headers={
-                "User-Agent": "Mozilla/5.0 (compatible; VKAdminBot/1.0)",
-            })
-            if resp.status_code == 200 and len(resp.content) > 1000:
-                content_type = resp.headers.get("content-type", "")
-                if "image" in content_type or url.split("?")[0].split(".")[-1] in ("jpg", "jpeg", "png", "webp", "gif"):
-                    return resp.content
-    except Exception as e:
-        logger.warning(f"Image download failed {url}: {e}")
-    return None
 
 
 async def fetch_and_schedule(group_id: int) -> int:
@@ -346,7 +325,7 @@ async def fetch_and_schedule(group_id: int) -> int:
             ),
         )
 
-        if not post_text or post_text.startswith("Извините") or len(post_text.strip()) < 50:
+        if not is_publishable(post_text):
             continue
 
         # Upload image: source image > Pexels search > no image

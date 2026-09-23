@@ -14,6 +14,9 @@ from core.config import settings
 logger = logging.getLogger(__name__)
 
 
+LAUNCH_PARAMS_MAX_AGE = 86400  # сек: подписанные параметры запуска живут сутки
+
+
 @dataclass
 class VKLaunchParams:
     vk_user_id: int
@@ -65,6 +68,21 @@ def verify_vk_launch_params(query_params: dict) -> VKLaunchParams | None:
 
     if not verified:
         logger.warning("VK launch params signature mismatch")
+        return None
+
+    # Подпись вечна, а URL с ней оседает в журналах прокси — без проверки
+    # свежести утёкший URL давал сессию навсегда.
+    try:
+        ts = int(vk_params.get("vk_ts", 0))
+    except ValueError:
+        ts = 0
+    if not ts or abs(time.time() - ts) > LAUNCH_PARAMS_MAX_AGE:
+        logger.warning("VK launch params are stale (vk_ts)")
+        return None
+
+    allowed_apps = {a for a in (settings.VK_MINIAPP_ID, settings.VK_APP_ID) if a}
+    if allowed_apps and vk_params.get("vk_app_id", "") not in allowed_apps:
+        logger.warning(f"VK launch params for a foreign app {vk_params.get('vk_app_id')!r}")
         return None
 
     return VKLaunchParams(

@@ -9,13 +9,34 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from core.auth import is_authenticated
 from core.config import settings
 from core.crypto import encrypt_token
-from database.service import create_group, seed_default_settings
+from database.service import create_group, get_group, seed_default_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-async def _setup_callback_api(token: str, gid: int, secret_key: str) -> None:
+async def _stable_secret(gid: int) -> str:
+    """Секрет Callback API для (пере)подключения: существующий, если есть.
+
+    Ротация при каждом переподключении разводила БД и VK: новый секрет попадал
+    в БД раньше, чем в VK, и события отбрасывались как «Invalid secret».
+    """
+    group = await get_group(gid)
+    if group and group.secret_key:
+        return group.secret_key
+    return secrets.token_hex(16)
+
+
+def _vk_error(resp: httpx.Response) -> str:
+    try:
+        data = resp.json()
+    except Exception:
+        return f"HTTP {resp.status_code}"
+    err = data.get("error")
+    return f"{err.get('error_code')}: {err.get('error_msg')}" if err else ""
+
+
+async def _setup_callback_api(token: str, gid: int, secret_key: str) -> bool:
     """Idempotently register/refresh this group's Callback API server.
 
     VK has no upsert: ``addCallbackServer`` creates a NEW server on every call, so
@@ -38,13 +59,16 @@ async def _setup_callback_api(token: str, gid: int, secret_key: str) -> None:
         if server_id:
             # Refresh url/title/secret on the existing server; this re-checks the
             # endpoint, flipping a previously-failed server back to "ok".
-            await client.get(
+            edit_resp = await client.get(
                 "https://api.vk.com/method/groups.editCallbackServer",
                 params={
                     "group_id": gid, "server_id": server_id, "url": callback_url,
                     "title": "VKAdmin Bot", "secret_key": secret_key, **common,
                 },
             )
+            if err := _vk_error(edit_resp):
+                logger.error(f"Callback API: editCallbackServer failed for group {gid}: {err}")
+                return False
         else:
             add_resp = await client.get(
                 "https://api.vk.com/method/groups.addCallbackServer",
@@ -53,19 +77,29 @@ async def _setup_callback_api(token: str, gid: int, secret_key: str) -> None:
                     "title": "VKAdmin Bot", "secret_key": secret_key, **common,
                 },
             )
+            if err := _vk_error(add_resp):
+                logger.error(f"Callback API: addCallbackServer failed for group {gid}: {err}")
+                return False
             server_id = add_resp.json().get("response", {}).get("server_id")
 
-        if server_id:
-            await client.get(
-                "https://api.vk.com/method/groups.setCallbackSettings",
-                params={
-                    "group_id": gid, "server_id": server_id,
-                    "message_new": 1, "message_reply": 1, "wall_reply_new": 1,
-                    "group_join": 1, "group_leave": 1,
-                    "like_add": 1, "wall_repost": 1, **common,
-                },
-            )
-            logger.info(f"Callback API configured for group {gid} (server_id={server_id})")
+        if not server_id:
+            logger.error(f"Callback API: no server_id for group {gid}")
+            return False
+
+        settings_resp = await client.get(
+            "https://api.vk.com/method/groups.setCallbackSettings",
+            params={
+                "group_id": gid, "server_id": server_id,
+                "message_new": 1, "message_reply": 1, "wall_reply_new": 1,
+                "group_join": 1, "group_leave": 1,
+                "like_add": 1, "wall_repost": 1, **common,
+            },
+        )
+        if err := _vk_error(settings_resp):
+            logger.error(f"Callback API: setCallbackSettings failed for group {gid}: {err}")
+            return False
+        logger.info(f"Callback API configured for group {gid} (server_id={server_id})")
+        return True
 
 
 async def _resolve_group_id(raw: str) -> int | None:
@@ -215,7 +249,8 @@ async def oauth_callback(request: Request, code: str = "", error: str = "", erro
                 var code = params.get('code');
                 var accessToken = params.get('access_token');
                 if (code) {
-                    window.location.href = '/api/vk/callback?code=' + code;
+                    // Весь fragment целиком: вместе с code должен уйти state.
+                    window.location.href = '/api/vk/callback?' + window.location.hash.substring(1);
                 } else if (accessToken) {
                     // Redirect with token directly
                     window.location.href = '/api/vk/callback/token?' + window.location.hash.substring(1);
@@ -271,7 +306,7 @@ async def oauth_callback(request: Request, code: str = "", error: str = "", erro
         if key.startswith("access_token_"):
             gid = int(key.replace("access_token_", ""))
             token = value
-            secret_key = secrets.token_hex(16)
+            secret_key = await _stable_secret(gid)
 
             # Get group info — заодно проверка живости токена: VK может выдать
             # уже отозванный токен (err 27); без проверки группа выглядела бы
@@ -347,18 +382,19 @@ async def oauth_callback(request: Request, code: str = "", error: str = "", erro
             # Seed default settings
             await seed_default_settings(gid)
 
+            # Callback API — ДО медленной настройки ИИ: события начинают
+            # доходить сразу, а не через минуту LLM-анализа (idempotent).
+            try:
+                await _setup_callback_api(token, gid, secret_key)
+            except Exception as e:
+                logger.error(f"Failed to setup Callback API for {gid}: {e!r}")
+
             # Auto-setup AI personality for this group
             try:
                 from core.group_setup import setup_group_ai
                 await setup_group_ai(gid, token)
             except Exception as e:
                 logger.warning(f"AI setup failed for group {gid}, will use defaults: {e}")
-
-            # Set up Callback API server for this group (idempotent)
-            try:
-                await _setup_callback_api(token, gid, secret_key)
-            except Exception as e:
-                logger.error(f"Failed to setup Callback API for {gid}: {e}")
 
             groups_connected.append(f"{group_name} (ID: {gid})")
 
@@ -410,10 +446,21 @@ async def oauth_token_callback(request: Request):
     Handle Standalone-app flow where VK returns tokens in URL fragment.
     JS on the client redirects here with token params as query string.
     """
-    # Принимает готовые токены без OAuth state-проверки, поэтому тоже только
-    # для залогиненного владельца панели.
+    # Только для залогиненного владельца панели И только в рамках OAuth, который
+    # он сам начал (state из куки). Без state это CSRF: GET + сессионная кука
+    # SameSite=Lax уходят при переходе по чужой ссылке — атакующий подменял бы
+    # токен и админа любой группы своими.
     if not is_authenticated(request):
         return RedirectResponse("/dashboard/login", status_code=303)
+    cookie_state = request.cookies.get("vkadmin_oauth_state", "")
+    state = request.query_params.get("state", "")
+    if not cookie_state or not secrets.compare_digest(cookie_state, state):
+        logger.warning("Token callback without matching OAuth state — possible CSRF")
+        return HTMLResponse(
+            "<h2>Ошибка безопасности</h2><p>Несоответствие state-параметра. "
+            "Начните подключение заново из панели.</p>",
+            status_code=403,
+        )
 
     params = dict(request.query_params)
     logger.info(f"Token callback params: {list(params.keys())}")
@@ -424,7 +471,7 @@ async def oauth_token_callback(request: Request):
         if key.startswith("access_token_"):
             gid = int(key.replace("access_token_", ""))
             token = value
-            secret_key = secrets.token_hex(16)
+            secret_key = await _stable_secret(gid)
 
             group_name = f"Group {gid}"
             token_error = ""
@@ -472,18 +519,18 @@ async def oauth_token_callback(request: Request):
             )
             await seed_default_settings(gid)
 
+            # Setup Callback API first (idempotent), then the slow AI setup
+            try:
+                await _setup_callback_api(token, gid, secret_key)
+            except Exception as e:
+                logger.error(f"Failed to setup Callback API for {gid}: {e!r}")
+
             # Auto-setup AI personality
             try:
                 from core.group_setup import setup_group_ai
                 await setup_group_ai(gid, token)
             except Exception as e:
                 logger.warning(f"AI setup failed for group {gid}: {e}")
-
-            # Setup Callback API (idempotent)
-            try:
-                await _setup_callback_api(token, gid, secret_key)
-            except Exception as e:
-                logger.error(f"Failed to setup Callback API for {gid}: {e}")
 
             groups_connected.append(f"{group_name} (ID: {gid})")
 

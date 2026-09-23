@@ -25,7 +25,7 @@ async def setup_group_ai(group_id: int, access_token: str) -> bool:
         return False
 
     # 2. Fetch recent wall posts for tone analysis
-    recent_posts = await _fetch_recent_posts(group_id, access_token)
+    recent_posts = await _fetch_recent_posts(group_id)
 
     # 3. Build analysis prompt
     analysis = _build_analysis_text(group_info, recent_posts)
@@ -58,7 +58,7 @@ async def refresh_site_knowledge(group_id: int, site_url: str) -> bool:
     добираем контент со страниц из sitemap.xml (обычно SEO-лендинги).
     """
     import re as _re
-    from core.web_reader import read_url, is_safe_public_url
+    from core.web_reader import read_url, is_safe_public_url, safe_get
 
     url = site_url.strip().rstrip("/")
     if url and not url.startswith(("http://", "https://")):
@@ -80,8 +80,7 @@ async def refresh_site_knowledge(group_id: int, site_url: str) -> bool:
 
     if sum(len(c) for c in chunks) < 500:
         try:
-            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-                resp = await client.get(f"{url}/sitemap.xml")
+            resp = await safe_get(f"{url}/sitemap.xml")
             locs = _re.findall(r"<loc>([^<]+)</loc>", resp.text)
             # Служебные страницы знаний не добавляют.
             skip = ("terms", "privacy", "sitemap")
@@ -128,31 +127,24 @@ async def _fetch_group_info(group_id: int, token: str) -> dict | None:
     return None
 
 
-async def _fetch_recent_posts(group_id: int, token: str, count: int = 10) -> list[str]:
-    """Fetch recent wall posts text for tone/topic analysis."""
-    from core.http_retry import http_request_with_retry
+async def _fetch_recent_posts(group_id: int, count: int = 10) -> list[str]:
+    """Fetch recent wall posts text for tone/topic analysis.
+
+    Через сервисный ключ: ключ сообщества wall.get не может (VK error 27),
+    и раньше ИИ настраивался вслепую — без единого поста стены.
+    """
+    from core.vk_read import wall_get
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await http_request_with_retry(
-                client, "GET",
-                "https://api.vk.com/method/wall.get",
-                params={
-                    "owner_id": -group_id,
-                    "count": count,
-                    "access_token": token,
-                    "v": "5.199",
-                },
-            )
-        data = resp.json()
-        posts = []
-        for item in data.get("response", {}).get("items", []):
-            text = item.get("text", "").strip()
-            if text and len(text) > 20:
-                posts.append(text[:500])
-        return posts
+        items = await wall_get(-group_id, count=count)
     except Exception as e:
-        logger.error(f"Failed to fetch posts for group {group_id}: {e}")
+        logger.warning(f"[SETUP] Can't read wall of group {group_id}: {e}")
         return []
+    posts = []
+    for item in items:
+        text = (item.get("text") or "").strip()
+        if text and len(text) > 20:
+            posts.append(text[:500])
+    return posts
 
 
 def _build_analysis_text(group_info: dict, recent_posts: list[str]) -> str:

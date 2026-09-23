@@ -7,6 +7,7 @@ the bot asks 3 simple questions in chat and configures itself.
 import logging
 from core.group_context import GroupContext
 from core.ai_brain import generate_response
+from core.text_guard import is_llm_failure
 
 logger = logging.getLogger(__name__)
 
@@ -168,7 +169,8 @@ async def _auto_configure_ai(ctx: GroupContext, group_description: str) -> bool:
     )
 
     system_prompt = await generate_response(prompt=prompt)
-    if system_prompt and not system_prompt.startswith("Извините"):
+    # Заглушку сбоя ИИ нельзя сохранять как личность бота.
+    if not is_llm_failure(system_prompt):
         await set_setting(ctx.group_id, "ai_system_prompt", system_prompt)
         await set_setting(ctx.group_id, "ai_group_description", group_description)
         logger.info(f"[ONBOARDING] AI configured from description for group {ctx.group_id}")

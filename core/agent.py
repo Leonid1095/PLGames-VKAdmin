@@ -17,6 +17,7 @@ from openai import (
 )
 from core.config import settings
 from core.group_context import GroupContext
+from core.text_guard import is_publishable
 
 logger = logging.getLogger(__name__)
 
@@ -365,7 +366,7 @@ async def _exec_publish_post(ctx: GroupContext, args: dict) -> str:
     topic = args.get("topic", "").strip()
     post_text = await generate_post(group_id=ctx.group_id, topic=topic)
 
-    if not post_text or len(post_text.strip()) < 50 or post_text.startswith("Извините"):
+    if not is_publishable(post_text):
         return (
             "Не удалось сгенерировать пост — нет ни темы, ни описания группы. "
             "Напишите о чём писать (например: «напиши пост про новое обновление»)."
@@ -398,8 +399,10 @@ async def _exec_write_article(ctx: GroupContext, args: dict) -> str:
     instruction = args.get("instruction", "")
     text = await write_from_url(group_id=ctx.group_id, url=url, instruction=instruction)
 
-    if text.startswith("Не удалось") or text.startswith("Ошибка"):
-        return text
+    if not is_publishable(text):
+        if text.startswith(("Не удалось", "Ошибка")):
+            return text
+        return "Не удалось написать статью — ИИ не ответил. Попробуйте позже."
 
     post_kwargs = {"owner_id": -ctx.group_id, "message": text}
     try:
@@ -428,6 +431,8 @@ async def _exec_schedule_post(ctx: GroupContext, args: dict) -> str:
 
     if args.get("generate"):
         text = await generate_post(group_id=ctx.group_id, topic=text)
+        if not is_publishable(text):
+            return "Не удалось сгенерировать пост — ИИ не ответил. Попробуйте позже."
 
     try:
         h, m = map(int, time_str.split(":"))
@@ -440,6 +445,12 @@ async def _exec_schedule_post(ctx: GroupContext, args: dict) -> str:
 
     post = await create_scheduled_post(ctx.group_id, text, scheduled, source="agent")
     return f"Пост запланирован на {scheduled.strftime('%d.%m %H:%M')} UTC (ID: {post.id})"
+
+
+def _is_group_auth_denied(e: Exception) -> bool:
+    """VK error 27: метод недоступен ключу сообщества (ban/unban/pin/
+    deleteComment — только личный ключ админа)."""
+    return getattr(e, "code", None) == 27 or "unavailable with group auth" in str(e)
 
 
 async def _exec_ban_user(ctx: GroupContext, args: dict) -> str:
@@ -455,6 +466,11 @@ async def _exec_ban_user(ctx: GroupContext, args: dict) -> str:
         await create_ban_record(ctx.group_id, uid, ctx.admin_vk_id, reason)
         return f"Пользователь {uid} забанен. Причина: {reason}"
     except Exception as e:
+        if _is_group_auth_denied(e):
+            return (
+                "VK не даёт боту банить: это право есть только у личного аккаунта админа. "
+                f"Заблокируйте вручную: Управление → Участники → Чёрный список, vk.com/id{uid}."
+            )
         return f"Ошибка бана: {e}"
 
 
@@ -467,6 +483,11 @@ async def _exec_unban_user(ctx: GroupContext, args: dict) -> str:
         await remove_ban_record(ctx.group_id, uid)
         return f"Пользователь {uid} разбанен."
     except Exception as e:
+        if _is_group_auth_denied(e):
+            return (
+                "VK не даёт боту разбанивать: это право есть только у личного аккаунта админа. "
+                f"Снимите блокировку вручную: Управление → Участники → Чёрный список, vk.com/id{uid}."
+            )
         return f"Ошибка разбана: {e}"
 
 
@@ -519,7 +540,9 @@ async def _exec_get_suggestions(ctx: GroupContext, args: dict) -> str:
 
 
 async def _exec_review_suggestion(ctx: GroupContext, args: dict) -> str:
-    from database.service import get_suggestion, review_suggestion
+    from database.service import (
+        get_suggestion, review_suggestion, claim_suggestion, release_suggestion,
+    )
     from core.telegram import send_to_telegram
 
     sid = args["suggestion_id"]
@@ -533,23 +556,28 @@ async def _exec_review_suggestion(ctx: GroupContext, args: dict) -> str:
         return f"Предложение уже обработано ({suggestion.status})."
 
     if action == "accept":
-        await review_suggestion(sid, ctx.group_id, "approved", ctx.admin_vk_id)
+        if not await claim_suggestion(sid, ctx.group_id):
+            return f"Предложение #{sid} уже обрабатывается."
         try:
             result = await ctx.api.wall.post(owner_id=-ctx.group_id, message=suggestion.text)
-            vk_post_id = result.post_id if result else 0
-            await send_to_telegram(ctx.group_id, suggestion.text, vk_post_id)
-            await review_suggestion(sid, ctx.group_id, "published", ctx.admin_vk_id)
-            try:
-                await ctx.api.messages.send(
-                    user_id=suggestion.from_vk_id,
-                    message=f"Ваше предложение #{sid} опубликовано!",
-                    random_id=0,
-                )
-            except Exception:
-                pass
-            return f"Предложение #{sid} опубликовано."
         except Exception as e:
+            await release_suggestion(sid, ctx.group_id)
             return f"Ошибка публикации: {e}"
+        vk_post_id = result.post_id if result else 0
+        await review_suggestion(sid, ctx.group_id, "published", ctx.admin_vk_id)
+        try:
+            await send_to_telegram(ctx.group_id, suggestion.text, vk_post_id)
+        except Exception as e:
+            logger.warning(f"Telegram cross-post of suggestion #{sid} failed: {e}")
+        try:
+            await ctx.api.messages.send(
+                user_id=suggestion.from_vk_id,
+                message=f"Ваше предложение #{sid} опубликовано!",
+                random_id=0,
+            )
+        except Exception:
+            pass
+        return f"Предложение #{sid} опубликовано."
     else:
         await review_suggestion(sid, ctx.group_id, "rejected", ctx.admin_vk_id, reason)
         try:
@@ -567,8 +595,11 @@ async def _exec_review_suggestion(ctx: GroupContext, args: dict) -> str:
 async def _exec_add_content_source(ctx: GroupContext, args: dict) -> str:
     from database.service import add_content_source
 
-    url = args["url"]
+    url = str(args["url"]).strip()
     stype = args.get("source_type", "rss")
+    # Тип уходит в HTML мини-аппа и выбирает парсер — только известные значения.
+    if stype not in ("rss", "vk_group", "api", "web"):
+        return f"Неизвестный тип источника «{stype}». Допустимо: rss, vk_group, api, web."
     src = await add_content_source(ctx.group_id, stype, url)
     return f"Источник добавлен (ID: {src.id}): {stype} — {url}"
 
@@ -760,6 +791,11 @@ async def _exec_pin_post(ctx: GroupContext, args: dict) -> str:
         await ctx.api.wall.pin(owner_id=-ctx.group_id, post_id=post_id)
         return f"Пост {post_id} закреплён."
     except Exception as e:
+        if _is_group_auth_denied(e):
+            return (
+                "VK не даёт боту закреплять посты — только личному аккаунту админа. "
+                f"Закрепите вручную: откройте https://vk.com/wall-{ctx.group_id}_{post_id} → «…» → «Закрепить»."
+            )
         return f"Ошибка: {e}"
 
 

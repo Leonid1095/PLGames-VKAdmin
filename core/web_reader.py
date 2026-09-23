@@ -1,11 +1,12 @@
 """Web reader — fetch and extract text from URLs (web pages, GitHub, etc.)."""
 
+import asyncio
 import html
 import re
 import socket
 import ipaddress
 import logging
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -21,9 +22,8 @@ def is_safe_public_url(url: str) -> bool:
 
     Blocks loopback/private/link-local/reserved ranges so an admin-supplied
     (or forged-token-supplied) URL can't reach 127.0.0.1, 169.254.169.254
-    (cloud metadata), or internal services. Note: this validates the *input*
-    host; redirect-based SSRF is a residual risk (callers keep follow_redirects
-    for legitimate http→https feeds).
+    (cloud metadata), or internal services. Checks ONE url — to fetch
+    user-supplied URLs use safe_get(), which re-checks every redirect hop.
     """
     try:
         p = urlparse(url)
@@ -44,6 +44,36 @@ def is_safe_public_url(url: str) -> bool:
                 or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
             return False
     return True
+
+
+class UnsafeURLError(Exception):
+    """URL (или шаг его редиректа) ведёт во внутреннюю сеть."""
+
+
+def _http_client(timeout: float) -> httpx.AsyncClient:
+    # Редиректы — только вручную в safe_get, с проверкой каждого шага.
+    return httpx.AsyncClient(timeout=timeout, follow_redirects=False)
+
+
+async def safe_get(
+    url: str, *, headers: dict | None = None, timeout: float = 15, max_redirects: int = 5,
+) -> httpx.Response:
+    """GET пользовательского URL с SSRF-защитой на каждом шаге редиректа.
+
+    httpx с follow_redirects=True проверку обходил: внешний адрес отвечал
+    302 → http://127.0.0.1:<порт>/ и бот читал внутренний сервис.
+    Бросает UnsafeURLError; остаточный риск — DNS rebinding между проверкой
+    и соединением.
+    """
+    async with _http_client(timeout) as client:
+        for _ in range(max_redirects + 1):
+            if not await asyncio.to_thread(is_safe_public_url, url):
+                raise UnsafeURLError(url)
+            resp = await client.get(url, headers=headers)
+            if not resp.is_redirect:
+                return resp
+            url = urljoin(str(resp.url), resp.headers.get("location", ""))
+    raise UnsafeURLError(f"too many redirects: {url}")
 
 
 def _github_headers() -> dict:
@@ -77,11 +107,10 @@ async def _read_webpage(url: str) -> str:
         logger.warning(f"Blocked non-public/unsafe URL fetch: {url}")
         return "Ошибка: ссылка недоступна (недопустимый или внутренний адрес)."
     try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            resp = await client.get(url, headers={
-                "User-Agent": "Mozilla/5.0 (compatible; VKAdminBot/1.0)"
-            })
-            resp.raise_for_status()
+        resp = await safe_get(url, timeout=20, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; VKAdminBot/1.0)"
+        })
+        resp.raise_for_status()
 
         raw_html = resp.text
 

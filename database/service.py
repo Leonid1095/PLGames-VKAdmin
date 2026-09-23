@@ -71,11 +71,18 @@ async def create_group(
         result = await session.execute(select(Group).where(Group.group_id == group_id))
         group = result.scalar_one_or_none()
         if group:
+            # Переподключение: пустые значения НЕ затирают рабочие. VK может не
+            # отдать код подтверждения (err 1051 — тогда он введён из UI руками)
+            # или user_id; пустой секрет выключил бы проверку событий.
             group.access_token = access_token
-            group.admin_vk_id = admin_vk_id
-            group.group_name = group_name
-            group.confirmation_code = confirmation_code
-            group.secret_key = secret_key
+            if admin_vk_id:
+                group.admin_vk_id = admin_vk_id
+            if group_name:
+                group.group_name = group_name
+            if confirmation_code:
+                group.confirmation_code = confirmation_code
+            if secret_key:
+                group.secret_key = secret_key
             group.is_active = True
         else:
             group = Group(
@@ -206,8 +213,14 @@ async def save_user_history(group_id: int, vk_id: int, history: list[dict]) -> N
 
 # ─── Human handoff («живой админ в диалоге») ─────────────────────────────────
 
-async def set_human_mode(group_id: int, vk_id: int, until: datetime | None) -> None:
-    """Пока until в будущем — бот молчит в этом диалоге. None = вернуть бота."""
+async def set_human_mode(
+    group_id: int, vk_id: int, until: datetime | None, extend_only: bool = False,
+) -> None:
+    """Пока until в будущем — бот молчит в этом диалоге. None = вернуть бота.
+
+    extend_only: только продлить — ручной ответ админа (2 ч) не должен
+    сокращать уже идущую 24-часовую паузу после эскалации.
+    """
     async with async_session() as session:
         result = await session.execute(
             select(UserContext).where(
@@ -216,6 +229,14 @@ async def set_human_mode(group_id: int, vk_id: int, until: datetime | None) -> N
         )
         row = result.scalar_one_or_none()
         if row:
+            current = row.human_mode_until
+            if extend_only and current is not None and until is not None:
+                # SQLite отдаёт naive UTC — сравниваем в naive UTC.
+                cur = current.replace(tzinfo=None) if current.tzinfo is None else \
+                    current.astimezone(timezone.utc).replace(tzinfo=None)
+                new = until.astimezone(timezone.utc).replace(tzinfo=None) if until.tzinfo else until
+                if cur >= new:
+                    return
             row.human_mode_until = until
         else:
             session.add(UserContext(
@@ -564,6 +585,40 @@ async def get_suggestion(suggestion_id: int) -> SuggestedPost | None:
             select(SuggestedPost).where(SuggestedPost.id == suggestion_id)
         )
         return result.scalar_one_or_none()
+
+
+async def claim_suggestion(suggestion_id: int, group_id: int) -> SuggestedPost | None:
+    """Атомарно pending → publishing. Второй клик/вызов получит None и не
+    опубликует предложение повторно."""
+    async with async_session() as session:
+        result = await session.execute(
+            update(SuggestedPost)
+            .where(
+                SuggestedPost.id == suggestion_id,
+                SuggestedPost.group_id == group_id,
+                SuggestedPost.status == "pending",
+            )
+            .values(status="publishing")
+        )
+        await session.commit()
+        if result.rowcount != 1:
+            return None
+        return await session.get(SuggestedPost, suggestion_id)
+
+
+async def release_suggestion(suggestion_id: int, group_id: int) -> None:
+    """Публикация не удалась — вернуть в очередь, чтобы можно было повторить."""
+    async with async_session() as session:
+        await session.execute(
+            update(SuggestedPost)
+            .where(
+                SuggestedPost.id == suggestion_id,
+                SuggestedPost.group_id == group_id,
+                SuggestedPost.status == "publishing",
+            )
+            .values(status="pending")
+        )
+        await session.commit()
 
 
 async def review_suggestion(suggestion_id: int, group_id: int, status: str, reviewed_by: int, reject_reason: str = "") -> None:

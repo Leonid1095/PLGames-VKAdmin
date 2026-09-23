@@ -1,48 +1,66 @@
-"""Post analytics collector — fetches stats from VK wall posts."""
+"""Post analytics collector — fetches stats from VK wall posts.
+
+Стена читается сервисным ключом (core.vk_read): ключ сообщества wall.get не
+может (VK error 27), из-за чего раньше статистика не собиралась вообще.
+"""
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from vkbottle import API
-
-from core.crypto import decrypt_token
+from core.vk_read import VKReadError, wall_get
 from database.service import get_all_active_groups, upsert_post_analytics
 
 logger = logging.getLogger(__name__)
 
+POSTS_TO_TRACK = 20
 
-async def collect_analytics():
+
+@dataclass
+class CollectResult:
+    ok: bool
+    posts: int = 0
+    error: str = ""
+
+
+def _count(post: dict, field: str) -> int:
+    value = post.get(field) or {}
+    return int(value.get("count", 0) or 0) if isinstance(value, dict) else 0
+
+
+async def collect_group_analytics(group_id: int) -> CollectResult:
+    """Обновить статистику последних постов одной группы."""
+    try:
+        items = await wall_get(-group_id, count=POSTS_TO_TRACK)
+    except VKReadError as e:
+        logger.warning(f"Analytics: wall.get failed for group {group_id}: {e}")
+        return CollectResult(ok=False, error=str(e))
+    except Exception as e:
+        logger.warning(f"Analytics: wall.get failed for group {group_id}: {e!r}")
+        return CollectResult(ok=False, error=repr(e))
+
+    for post in items:
+        published = (
+            datetime.fromtimestamp(post["date"], tz=timezone.utc) if post.get("date") else None
+        )
+        await upsert_post_analytics(
+            group_id=group_id,
+            vk_post_id=post["id"],
+            likes=_count(post, "likes"),
+            reposts=_count(post, "reposts"),
+            comments=_count(post, "comments"),
+            views=_count(post, "views"),
+            published_at=published,
+        )
+
+    logger.info(f"Analytics collected for group {group_id}: {len(items)} posts")
+    return CollectResult(ok=True, posts=len(items))
+
+
+async def collect_analytics() -> None:
     """Fetch recent post stats for all active groups."""
-    groups = await get_all_active_groups()
-
-    for group in groups:
+    for group in await get_all_active_groups():
         try:
-            token = decrypt_token(group.access_token)
-            api = API(token=token)
-
-            try:
-                resp = await api.wall.get(owner_id=-group.group_id, count=20)
-            except Exception as wall_err:
-                logger.warning(f"wall.get failed for group {group.group_id}: {wall_err}")
-                continue
-            if not resp or not resp.items:
-                continue
-
-            for post in resp.items:
-                likes = post.likes.count if post.likes else 0
-                reposts = post.reposts.count if post.reposts else 0
-                comments = post.comments.count if post.comments else 0
-                views = post.views.count if post.views else 0
-                published = datetime.fromtimestamp(post.date, tz=timezone.utc) if post.date else None
-
-                await upsert_post_analytics(
-                    group_id=group.group_id,
-                    vk_post_id=post.id,
-                    likes=likes, reposts=reposts,
-                    comments=comments, views=views,
-                    published_at=published,
-                )
-
-            logger.info(f"Analytics collected for group {group.group_id}: {len(resp.items)} posts")
+            await collect_group_analytics(group.group_id)
         except Exception as e:
-            logger.error(f"Analytics error for group {group.group_id}: {e}")
+            logger.error(f"Analytics error for group {group.group_id}: {e!r}")

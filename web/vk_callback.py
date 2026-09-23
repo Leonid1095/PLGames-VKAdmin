@@ -1,6 +1,7 @@
 """VK Callback API endpoint — receives events from all connected groups."""
 
 import asyncio
+import hmac
 import logging
 import re
 import time
@@ -15,6 +16,7 @@ from core.group_context import GroupContext
 from core.crypto import decrypt_token
 from core.agent import run_agent
 from core.onboarding import is_onboarding_needed, run_onboarding
+from core.text_guard import is_llm_failure
 from database.service import (
     get_group, get_setting, add_xp_activity,
     record_member_join, record_member_leave,
@@ -197,7 +199,7 @@ async def _process_message_reply(ctx: GroupContext, obj: dict):
     if peer_id <= 0 or peer_id >= 2_000_000_000:
         return
     until = datetime.now(timezone.utc) + timedelta(hours=2)
-    await set_human_mode(ctx.group_id, peer_id, until)
+    await set_human_mode(ctx.group_id, peer_id, until, extend_only=True)
     logger.info(
         f"[HUMAN MODE] admin {admin_author} replied manually to {peer_id} "
         f"in group {ctx.group_id} — bot silent for 2h"
@@ -213,11 +215,8 @@ async def _process_group_join(ctx: GroupContext, obj: dict):
     user_id = obj.get("user_id", 0)
     if not user_id:
         return
-
-    welcome_msg = await get_setting(ctx.group_id, "welcome_message", "")
-    use_ai = (await get_setting(ctx.group_id, "welcome_ai", "false")).lower() == "true"
-
-    if not welcome_msg and not use_ai:
+    # join_type=request — заявка в закрытую группу, человек ещё не вступил.
+    if obj.get("join_type") == "request":
         return
 
     # Resolve user name for placeholders and AI
@@ -231,10 +230,18 @@ async def _process_group_join(ctx: GroupContext, obj: dict):
 
     # Record the join so the daily proactive job can greet newcomers publicly
     # (group→user DMs below are best-effort; VK blocks them for most non-openers).
+    # Учитываем ВСЕГДА — от этого зависят дайджест и публичное приветствие,
+    # а не только ЛС-приветствие ниже.
     try:
         await record_member_join(ctx.group_id, user_id, first_name)
     except Exception as e:
         logger.warning(f"Failed to record join for {user_id} in group {ctx.group_id}: {e}")
+
+    welcome_msg = await get_setting(ctx.group_id, "welcome_message", "")
+    use_ai = (await get_setting(ctx.group_id, "welcome_ai", "false")).lower() == "true"
+
+    if not welcome_msg and not use_ai:
+        return
 
     # Support placeholders in static welcome message
     if welcome_msg and not use_ai:
@@ -281,7 +288,7 @@ async def _process_group_join(ctx: GroupContext, obj: dict):
 
     # Never send an LLM error string as a welcome. If AI generation failed,
     # stay silent rather than greeting newcomers with "Извините, произошла ошибка".
-    if welcome_msg and not welcome_msg.startswith("Извините"):
+    if not is_llm_failure(welcome_msg):
         try:
             await ctx.api.messages.send(user_id=user_id, message=welcome_msg, random_id=0)
             logger.info(f"Welcome message sent to {user_id} in group {ctx.group_id}")
@@ -358,11 +365,16 @@ async def vk_callback(request: Request):
         return PlainTextResponse("error")
 
     # ── Verify secret key ──
-    secret = data.get("secret", "")
+    secret = str(data.get("secret", ""))
     group = await get_group(group_id)
-    if group and group.secret_key:
+    if not group:
+        # Неизвестная/отключённая группа: не заводим под неё счётчики лимитера
+        # (иначе мусорные group_id раздувают память) — просто подтверждаем приём.
+        logger.warning(f"Event for unknown/inactive group {group_id} dropped")
+        return PlainTextResponse("ok")
+    if group.secret_key:
         # A secret is configured → it must match (fail-closed for this group).
-        if secret != group.secret_key:
+        if not hmac.compare_digest(secret.encode(), group.secret_key.encode()):
             logger.warning(f"Invalid secret for group {group_id}")
             return PlainTextResponse("ok")
     elif settings.CALLBACK_REQUIRE_SECRET:

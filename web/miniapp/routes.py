@@ -15,6 +15,13 @@ from database.service import (
 )
 from web.dashboard.routes import SETTINGS_SCHEMA
 
+# Что админ группы вправе менять через Mini App: ключи из формы настроек +
+# флаг виджета. Служебные (_last_newsletter_at — суточный лимит рассылки,
+# daily_msg_limit, active_model, telegram_* …) отсюда не пишутся.
+MINIAPP_SETTING_KEYS = frozenset(
+    s["key"] for section in SETTINGS_SCHEMA for s in section["settings"]
+) | {"widget_enabled"}
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
@@ -274,7 +281,8 @@ async def miniapp_profile(request: Request):
 
     token = request.query_params.get("token", request.query_params.get("t", ""))
     vk_user_id = auth["uid"]
-    group_id = int(request.query_params.get("gid", auth.get("gid", 0)))
+    # Группа из подписанного токена важнее ?gid= (иначе чужие лидерборды/профили).
+    group_id = int(auth.get("gid") or request.query_params.get("gid", 0))
 
     if not group_id:
         return _error_page("Откройте приложение из группы ВКонтакте.")
@@ -408,7 +416,8 @@ async def miniapp_leaderboard(request: Request):
 
     token = request.query_params.get("token", request.query_params.get("t", ""))
     vk_user_id = auth["uid"]
-    group_id = int(request.query_params.get("gid", auth.get("gid", 0)))
+    # Группа из подписанного токена важнее ?gid= (иначе чужие лидерборды/профили).
+    group_id = int(auth.get("gid") or request.query_params.get("gid", 0))
     sort_by = request.query_params.get("sort", "xp")
 
     if not group_id:
@@ -493,7 +502,8 @@ async def miniapp_shop(request: Request):
 
     token = request.query_params.get("token", request.query_params.get("t", ""))
     vk_user_id = auth["uid"]
-    group_id = int(request.query_params.get("gid", auth.get("gid", 0)))
+    # Группа из подписанного токена важнее ?gid= (иначе чужие лидерборды/профили).
+    group_id = int(auth.get("gid") or request.query_params.get("gid", 0))
 
     if not group_id:
         return _error_page("Откройте приложение из группы.")
@@ -637,7 +647,7 @@ async def miniapp_analytics(request: Request):
             </div>
             """
     else:
-        posts_html = '<p style="text-align:center;color:#aaa;padding:20px;">Нет данных. Аналитика собирается каждые 6 часов.</p>'
+        posts_html = '<p style="text-align:center;color:#aaa;padding:20px;">Нет данных. Статистика обновляется раз в час.</p>'
 
     # Top users mini
     top_html = ""
@@ -1044,19 +1054,28 @@ async def api_review_suggestion(request: Request):
     if action == "approve":
         from core.crypto import decrypt_token
         from core.telegram import send_to_telegram
-        from vkbottle import API
+        from database.service import claim_suggestion, release_suggestion
+        import vkbottle
 
+        # Атомарный захват: двойной клик не публикует предложение дважды.
+        if not await claim_suggestion(suggestion_id, group_id):
+            return JSONResponse({"error": "Уже обработано"}, status_code=409)
         try:
-            vk_token = decrypt_token(group.access_token)
-            api = API(token=vk_token)
+            api = vkbottle.API(token=decrypt_token(group.access_token))
             result = await api.wall.post(owner_id=-group_id, message=suggestion.text)
-            vk_post_id = result.post_id if result else 0
-            await review_suggestion(suggestion_id, group_id, "published", auth["uid"])
-            await send_to_telegram(group_id, suggestion.text, vk_post_id)
-            return JSONResponse({"ok": True, "vk_post_id": vk_post_id})
         except Exception as e:
+            await release_suggestion(suggestion_id, group_id)
             return JSONResponse({"error": str(e)}, status_code=500)
+        vk_post_id = result.post_id if result else 0
+        await review_suggestion(suggestion_id, group_id, "published", auth["uid"])
+        try:
+            await send_to_telegram(group_id, suggestion.text, vk_post_id)
+        except Exception as e:
+            logger.warning(f"Telegram cross-post of suggestion #{suggestion_id} failed: {e}")
+        return JSONResponse({"ok": True, "vk_post_id": vk_post_id})
     elif action == "reject":
+        if suggestion.status != "pending":
+            return JSONResponse({"error": "Уже обработано"}, status_code=409)
         await review_suggestion(suggestion_id, group_id, "rejected", auth["uid"])
         return JSONResponse({"ok": True})
     else:
@@ -1097,6 +1116,7 @@ async def miniapp_calendar(request: Request):
                 time_str = p.scheduled_at.strftime("%H:%M") if p.scheduled_at else "—"
                 status_cls = {"pending": "🕐", "published": "✅", "failed": "❌"}.get(p.status, "")
                 source_label = {"manual": "вручную", "ai": "ИИ", "parsed": "парсинг", "suggested": "предложка"}.get(p.source.split(":")[0] if p.source else "", p.source or "")
+                source_label = escape(source_label)  # task:<имя из URL> — пользовательские данные
                 text_preview = escape(p.text[:80]) + ("..." if len(p.text) > 80 else "")
                 posts_items += f"""
                 <div style="padding:8px 0;border-bottom:1px solid #f0f0f0;">
@@ -1389,18 +1409,18 @@ async def miniapp_entry(request: Request):
     # Verify VK launch params
     launch = verify_vk_launch_params(params)
     if not launch:
-        # Fallback: try token (already authenticated)
+        # Fallback: уже выданный токен — используем как есть, БЕЗ продления:
+        # раньше /miniapp?token=<старый> выпускал новый на 24 ч, и токен жил вечно.
         auth = _get_auth(request)
         if not auth:
             return _error_page("Не удалось проверить подпись VK. Откройте приложение из группы ВКонтакте.")
         vk_user_id = auth["uid"]
         vk_group_id = auth.get("gid", 0)
+        token = request.query_params.get("token", "") or request.query_params.get("t", "")
     else:
         vk_user_id = launch.vk_user_id
         vk_group_id = launch.vk_group_id
-
-    # Create session token
-    token = create_miniapp_token(vk_user_id, vk_group_id)
+        token = create_miniapp_token(vk_user_id, vk_group_id)
 
     # If opened from a specific group
     if vk_group_id:
@@ -1522,7 +1542,7 @@ async def miniapp_group_settings(request: Request, group_id: int):
             type_label = {"rss": "RSS", "vk_group": "VK", "api": "API", "web": "Сайт"}.get(s.source_type, s.source_type)
             sources_rows += f"""
             <tr>
-                <td><span class="source-type source-type-{type_class}">{type_label}</span></td>
+                <td><span class="source-type source-type-{type_class}">{escape(type_label)}</span></td>
                 <td><span class="source-url">{escape(s.source_url)}</span></td>
                 <td>
                     <form method="POST" action="/miniapp/group/{group_id}/sources/delete?token={token}"
@@ -1576,7 +1596,7 @@ async def miniapp_group_settings(request: Request, group_id: int):
             type_label = type_labels.get(t.task_type, t.task_type)
             tasks_rows += f"""
             <tr>
-                <td><span class="source-type source-type-api">{type_label}</span></td>
+                <td><span class="source-type source-type-api">{escape(type_label)}</span></td>
                 <td><span class="source-url">{escape(t.source_url or '—')}</span></td>
                 <td style="font-size:0.75rem;color:#888;">{escape(t.schedule_cron)}</td>
                 <td style="font-size:0.75rem;color:#888;">{last}</td>
@@ -1877,8 +1897,13 @@ async def miniapp_update_setting(request: Request, group_id: int):
     values = form.getlist("value")
     value = str(values[-1]).strip() if values else ""
 
-    if key:
-        await set_setting(group_id, key, value)
+    if key not in MINIAPP_SETTING_KEYS:
+        logger.warning(f"Mini App: rejected setting key {key!r} for group {group_id}")
+        if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+            return JSONResponse({"error": "Недопустимая настройка"}, status_code=400)
+        return _error_page("Недопустимая настройка")
+
+    await set_setting(group_id, key, value)
 
     if request.headers.get("X-Requested-With") == "XMLHttpRequest":
         return JSONResponse({"ok": True})
@@ -2079,7 +2104,9 @@ async def miniapp_widget_code(request: Request, group_id: int):
     return JSONResponse({"code": code})
 
 
-@router.api_route("/miniapp/group/{group_id}/widget/refresh", methods=["GET", "POST"])
+@router.api_route(
+    "/miniapp/group/{group_id}/widget/refresh", methods=["GET", "POST"], include_in_schema=False,
+)
 async def miniapp_widget_refresh(request: Request, group_id: int):
     """Force-refresh the widget data."""
     auth = _get_auth(request)

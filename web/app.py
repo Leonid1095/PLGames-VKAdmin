@@ -3,8 +3,8 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
-from fastapi.responses import RedirectResponse, Response
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 # Configure logging at import time. Production runs `uvicorn web.app:app`
 # directly (see vkadmin.service), which never executes main.py — so without
@@ -195,9 +195,16 @@ async def health():
 
 
 @app.get("/api/health/llm")
-async def health_llm():
+async def health_llm(request: Request):
     """Live probe of the AI provider — distinguishes a rejected key from an
-    unreachable provider. Does a real (tiny) call, so don't poll it hard."""
+    unreachable provider. Does a real (tiny) call, so don't poll it hard.
+
+    Только для владельца панели: каждый вызов — платный запрос к LLM, а ответ
+    раскрывает адрес провайдера, модель и текст ошибки.
+    """
+    from core.auth import is_authenticated
+    if not is_authenticated(request):
+        return JSONResponse({"status": "unauthorized"}, status_code=401)
     from core.agent import check_llm_health
     ok, detail = await check_llm_health()
     return {"status": "ok" if ok else "error", "detail": detail}

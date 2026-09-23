@@ -2,12 +2,14 @@
 
 import logging
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from vkbottle import API
 
 from core.crypto import decrypt_token
 from core.telegram import send_to_telegram
+from core.text_guard import is_llm_failure, is_publishable as _is_publishable
 from tasks.content_parser import fetch_and_schedule
 from database.service import (
     get_all_active_groups, get_setting, set_setting,
@@ -17,25 +19,6 @@ from database.service import (
 logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler()
-
-
-# Prefixes that mean the generator returned an error / "nothing to report"
-# placeholder rather than a real post. These must NEVER reach the wall — in the
-# past "Нет коммитов за 7 дней" and "Извините, ошибка ИИ" got published as posts.
-_FAILURE_PREFIXES = (
-    "Ошибка", "Не удалось", "Извините", "Нет коммитов",
-    "Произошла ошибка", "Не могу", "Неверная ссылка", "Unknown",
-)
-
-
-def _is_publishable(text: str | None) -> bool:
-    """True only if `text` is a real post, not an LLM error or placeholder."""
-    if not text:
-        return False
-    stripped = text.strip()
-    if len(stripped) < 50:
-        return False
-    return not any(stripped.startswith(p) for p in _FAILURE_PREFIXES)
 
 
 # ─── Job 1: Auto-post (only real content from sources) ──────────────────────
@@ -118,6 +101,12 @@ async def _scheduled_posts_job():
             api = API(token=token)
 
             for p in group_posts:
+                # Заглушка сбоя ИИ, попавшая в план (schedule_post с генерацией),
+                # на стену не идёт — и повторять её бессмысленно.
+                if is_llm_failure(p.text):
+                    logger.error(f"Scheduled post #{p.id} holds an LLM failure text — not publishing")
+                    await mark_post_failed(p.id, max_attempts=1)
+                    continue
                 try:
                     attachments = p.attachments or ""
                     post_kwargs = {"owner_id": -gid, "message": p.text}
@@ -141,24 +130,6 @@ async def _scheduled_posts_job():
             logger.error(f"Scheduled posts error for group {gid}: {e}")
 
 
-# ─── Job 3: Content parser ──────────────────────────────────────────────────
-
-async def _content_parse_job():
-    """Parse content sources for groups that don't have autopost enabled (those are handled by _autopost_job)."""
-    groups = await get_all_active_groups()
-    for group in groups:
-        try:
-            autopost = (await get_setting(group.group_id, "autopost_enabled", "false")).lower()
-            if autopost == "true":
-                continue  # already handled by _autopost_job
-
-            count = await fetch_and_schedule(group.group_id)
-            if count:
-                logger.info(f"Content parser: scheduled {count} posts for group {group.group_id}")
-        except Exception as e:
-            logger.error(f"Content parser error for group {group.group_id}: {e}")
-
-
 # ─── Job 4: Content tasks (smart copywriter tasks) ──────────────────────────
 
 async def _content_tasks_job():
@@ -169,7 +140,7 @@ async def _content_tasks_job():
     from core.images import find_and_upload_image
     from database.service import (
         get_all_active_content_tasks, update_content_task_run,
-        create_scheduled_post,
+        create_scheduled_post, delete_content_task,
     )
 
     tasks = await get_all_active_content_tasks()
@@ -207,7 +178,12 @@ async def _content_tasks_job():
                     length="medium",
                 )
             else:
-                logger.warning(f"Unknown task type: {task.task_type}")
+                # Исполнителя для такого типа нет (patch_notes удалён) — задача
+                # никогда не выполнится; выключаем, а не повторяем каждые 30 мин.
+                logger.warning(
+                    f"Content task #{task.id} has unknown type {task.task_type!r} — deactivating"
+                )
+                await delete_content_task(task.id, task.group_id)
                 continue
 
             if _is_publishable(text):
@@ -307,7 +283,7 @@ async def _public_welcome(api, group_id: int, welcomes: list[dict]) -> None:
                    "для новых участников группы. Без обращения по имени — имена допишутся отдельно.",
             system_prompt=sys, group_id=group_id,
         )
-        if text and not text.startswith("Извините"):
+        if not is_llm_failure(text):
             intro = text.strip()
     except Exception as e:
         logger.warning(f"AI welcome generation failed for group {group_id}: {e}")
@@ -385,6 +361,26 @@ async def _milestone_post(api, group_id: int, count: int | None) -> None:
         logger.warning(f"Milestone post failed for group {group_id}: {e}")
 
 
+# Дайджест — раз в календарный день по Москве, не раньше DIGEST_HOUR. Почасовой
+# триггер + проверка даты переживают рестарты (не успели в 10:00 — догоним позже),
+# а старый гейт «прошло 20 ч» сдвигал отправку на 4 ч в сутки, вплоть до ночи.
+DIGEST_TZ = ZoneInfo("Europe/Moscow")
+DIGEST_HOUR = 10
+
+
+def _daily_summary_due(last_str: str, now: datetime) -> bool:
+    local_now = now.astimezone(DIGEST_TZ)
+    if local_now.hour < DIGEST_HOUR:
+        return False
+    try:
+        last = datetime.fromisoformat(last_str)
+    except (TypeError, ValueError):
+        return True
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return last.astimezone(DIGEST_TZ).date() < local_now.date()
+
+
 async def _daily_summary_job():
     from database.service import take_daily_membership_state
 
@@ -393,15 +389,10 @@ async def _daily_summary_job():
 
     for group in groups:
         try:
-            # Run at most once per ~day even though the trigger fires hourly
-            # (survives restarts without double-firing).
+            # Once per Moscow calendar day, from DIGEST_HOUR (trigger fires hourly).
             last_str = await get_setting(group.group_id, "_last_daily_summary", "")
-            if last_str:
-                try:
-                    if (now - datetime.fromisoformat(last_str)).total_seconds() < 20 * 3600:
-                        continue
-                except ValueError:
-                    pass
+            if not _daily_summary_due(last_str, now):
+                continue
 
             token = decrypt_token(group.access_token)
             api = API(token=token)
@@ -440,13 +431,6 @@ async def start_scheduler():
         id="scheduled_posts", replace_existing=True,
     )
 
-    # Content parser: check every 4 hours
-    scheduler.add_job(
-        _content_parse_job,
-        trigger=IntervalTrigger(hours=4),
-        id="content_parser", replace_existing=True,
-    )
-
     # Content tasks: check every 30 minutes
     scheduler.add_job(
         _content_tasks_job,
@@ -454,10 +438,13 @@ async def start_scheduler():
         id="content_tasks", replace_existing=True,
     )
 
-    # Analytics: collect every 6 hours
+    # Analytics: hourly, first run ~1 min after start — otherwise a restart
+    # left the dashboard without stats for up to 6 hours. wall.get goes via
+    # the service key (one call per group), so hourly is cheap.
     scheduler.add_job(
         _analytics_job,
-        trigger=IntervalTrigger(hours=6),
+        trigger=IntervalTrigger(hours=1),
+        next_run_time=datetime.now(timezone.utc) + timedelta(minutes=1),
         id="analytics", replace_existing=True,
     )
 
@@ -479,6 +466,6 @@ async def start_scheduler():
     scheduler.start()
     logger.info(
         "Scheduler started: autopost(1h), scheduled_posts(5m), "
-        "content_parser(4h), content_tasks(30m), analytics(6h), widgets(1h), "
-        "daily_summary(1h/once-a-day)"
+        "content_tasks(30m), analytics(1h), widgets(1h), "
+        "daily_summary(1h/once-a-day from 10:00 MSK)"
     )
