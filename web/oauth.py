@@ -294,6 +294,15 @@ async def _finish_admin_oauth(request: Request, code: str, state: str) -> HTMLRe
             raise AdminKeyError("VK ID вернул неполный ответ или подключение длилось дольше "
                                 "10 минут. Нажмите «Подключить» ещё раз.")
         tokens = await exchange_code(code, verifier, device_id, state)
+        granted = set(tokens.scope.split())
+        if tokens.scope and not granted & set(ADMIN_SCOPE.split()):
+            # VK ID молча урезает запрошенные права до разрешённых приложению.
+            raise AdminKeyError(
+                f"VK ID выдал только базовые права ({tokens.scope}) — без стены, фото и "
+                "сообществ ключ боту бесполезен. Нужно разрешить приложению доступы "
+                "«Стена», «Фотографии» и «Сообщества» в кабинете VK ID "
+                f"(приложение {settings.VK_APP_ID} → «Доступы») и нажать «Подключить» снова."
+            )
         connected = await connect_admin_key(tokens)
     except AdminKeyError as e:
         logger.warning(f"Admin key not connected: {e}")

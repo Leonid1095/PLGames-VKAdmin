@@ -244,3 +244,21 @@ async def test_token_callback_no_longer_takes_admin_keys(db, monkeypatch):
 
     assert r.status_code in (400, 403)
     assert await _key() == ""
+
+
+async def test_vk_id_granting_only_basic_rights_says_what_to_enable(db, monkeypatch):
+    """25.09: VK ID молча урезал запрошенные wall/photos/groups до
+    vkid.personal_info — владелец видел «ошибка 1051» и не понимал, что делать."""
+    await create_group(GID, "WOW", encrypt_token("group-token"), ADMIN)
+    _vk(monkeypatch, exchange={
+        "access_token": "user-token", "refresh_token": "refresh-token",
+        "expires_in": 3600, "user_id": str(ADMIN), "scope": "vkid.personal_info",
+    })
+
+    r = await _return_from_vk()
+
+    assert r.status_code == 400
+    assert "кабинет" in r.text and "VK ID" in r.text
+    assert "Стена" in r.text and "Фотографии" in r.text and "Сообщества" in r.text
+    assert "1051" not in r.text
+    assert await _key() == ""
