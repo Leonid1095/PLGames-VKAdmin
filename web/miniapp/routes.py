@@ -1401,6 +1401,120 @@ async def miniapp_onboarding(request: Request):
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
+
+def _widget_install_script(token: str) -> str:
+    """JS установки виджета через VK Bridge — общий для стартовой страницы и ⚙️.
+
+    На Android VK держит внутри себя только стартовую страницу (её он открывает
+    сам по launch-параметрам), а любая ссылка из мини-аппа уходит во внешний
+    Chrome, где Bridge мёртв. Поэтому с телефона кнопка работает только там."""
+    app_id = settings.VK_MINIAPP_ID or 0
+    return f"""
+    <script>
+    // Каждый шаг установки — в журнал сервиса: Bridge работает на телефоне,
+    // и без этого сбой серверу не виден.
+    function widgetLog(groupId, step, error, env) {{
+        var fd = new FormData();
+        fd.append('step', step);
+        if (error) fd.append('error', typeof error === 'string' ? error : JSON.stringify(error));
+        if (env) fd.append('env', JSON.stringify(env));
+        return fetch('/miniapp/group/' + groupId + '/widget/client-log?token={token}', {{
+            method: 'POST', body: fd,
+            headers: {{'X-Requested-With': 'XMLHttpRequest'}}
+        }}).catch(function() {{}});
+    }}
+
+    function installWidget(groupId, statusId) {{
+        var statusEl = document.getElementById(statusId);
+        var step = 'token';
+        var openInVk = 'Страница открыта вне ВКонтакте. С телефона: закройте её, откройте приложение '
+            + 'заново и нажмите «🏆 Виджет» у группы на первом экране. Или на компьютере: '
+            + 'https://vk.com/app{app_id}_-' + groupId;
+        if (typeof vkBridge === 'undefined') {{
+            statusEl.textContent = 'Ошибка: VK Bridge не загрузился. ' + openInVk;
+            widgetLog(groupId, 'bridge', 'vkBridge undefined');
+            return;
+        }}
+        widgetLog(groupId, 'start', '', {{
+            embedded: vkBridge.isEmbedded(), webview: vkBridge.isWebView(),
+            iframe: vkBridge.isIframe(), ua: navigator.userAgent.slice(0, 160)
+        }});
+        // Вне VK (обычная вкладка браузера) Bridge некому ответить — запрос висит вечно.
+        if (!vkBridge.isEmbedded()) {{
+            statusEl.textContent = openInVk;
+            widgetLog(groupId, 'bridge', 'страница открыта не внутри VK');
+            return;
+        }}
+        statusEl.textContent = 'Запрос прав на виджет...';
+
+        // 1. Токен с правом app_widget. Если клиент VK метод не поддерживает,
+        // ответа не будет вовсе — ждём 20 с.
+        Promise.race([
+            vkBridge.send('VKWebAppGetCommunityToken', {{
+                app_id: {app_id},
+                group_id: groupId,
+                scope: 'app_widget'
+            }}),
+            new Promise(function(_, reject) {{
+                setTimeout(function() {{ reject(new Error('VK не ответил на запрос прав за 20 с')); }}, 20000);
+            }})
+        ])
+        .then(function(tokenResult) {{
+            step = 'save';
+            statusEl.textContent = 'Сохранение токена...';
+            var fd = new FormData();
+            fd.append('widget_token', tokenResult.access_token);
+            return fetch('/miniapp/group/' + groupId + '/widget/save-token?token={token}', {{
+                method: 'POST', body: fd,
+                headers: {{'X-Requested-With': 'XMLHttpRequest'}}
+            }}).then(function(r) {{ return r.json(); }});
+        }})
+        .then(function(saveResult) {{
+            // Раньше сбой сохранения проглатывался: виджет ставился, но не обновлялся.
+            if (!saveResult.ok) throw new Error(saveResult.error || 'токен не сохранён');
+            step = 'code';
+            statusEl.textContent = 'Подготовка виджета...';
+            return fetch('/miniapp/group/' + groupId + '/widget/code?token={token}')
+                .then(function(r) {{ return r.json(); }});
+        }})
+        .then(function(data) {{
+            if (data.error) throw new Error(data.error);
+            step = 'preview';
+            statusEl.textContent = 'Открытие диалога VK...';
+            return vkBridge.send('VKWebAppShowCommunityWidgetPreviewBox', {{
+                group_id: groupId,
+                type: data.type,
+                code: data.code
+            }});
+        }})
+        .then(function(result) {{
+            if (result) {{
+                widgetLog(groupId, 'done');
+                statusEl.innerHTML = '<span style="color:#2e7d32;">✓ Виджет установлен!</span>';
+                var fd = new FormData();
+                fd.append('key', 'widget_enabled');
+                fd.append('value', 'true');
+                fetch('/miniapp/group/' + groupId + '/settings?token={token}', {{
+                    method: 'POST', body: fd,
+                    headers: {{'X-Requested-With': 'XMLHttpRequest'}}
+                }});
+                showToast('Виджет установлен!');
+            }}
+        }})
+        .catch(function(e) {{
+            console.error('Widget install error:', e);
+            widgetLog(groupId, step, e && e.error_data ? e : ((e && e.message) || String(e)));
+            if (e && e.error_data && e.error_data.error_code === 4) {{
+                statusEl.textContent = 'Отменено пользователем';
+            }} else {{
+                statusEl.textContent = 'Ошибка: ' + (e.error_data ? e.error_data.error_reason : (e.message || 'неизвестная'))
+                    + (step === 'token' ? '. ' + openInVk : '');
+            }}
+        }});
+    }}
+    </script>
+    """
+
 @router.get("/miniapp")
 async def miniapp_entry(request: Request):
     """Entry point — VK opens this URL with launch params."""
@@ -1447,10 +1561,8 @@ async def miniapp_entry(request: Request):
         """
         return HTMLResponse(_miniapp_html("VKAdmin", content, token))
 
-    # If only one group — redirect to profile
-    if len(groups) == 1:
-        g = groups[0]
-        return RedirectResponse(f"/miniapp/profile?token={token}&gid={g.group_id}", status_code=303)
+    # Даже при одной группе админ попадает сюда, а не в профиль: с Android
+    # только отсюда можно поставить виджет (см. _widget_install_script).
 
     groups_html = ""
     for g in groups:
@@ -1465,8 +1577,10 @@ async def miniapp_entry(request: Request):
                 <div style="display:flex;gap:6px;">
                     <a href="/miniapp/profile?token={token}&gid={g.group_id}" class="btn btn-sm">Открыть</a>
                     <a href="/miniapp/group/{g.group_id}?token={token}" class="btn btn-sm" style="background:#455a64;">⚙️</a>
+                    <button class="btn btn-sm" style="background:#f57c00;" onclick="installWidget({g.group_id}, 'wstatus-{g.group_id}')">🏆 Виджет</button>
                 </div>
             </div>
+            <p id="wstatus-{g.group_id}" style="font-size:0.78rem;color:#888;margin-top:6px;"></p>
         </div>
         """
 
@@ -1476,6 +1590,7 @@ async def miniapp_entry(request: Request):
         <p style="opacity: 0.85; font-size: 0.85rem;">AI-администратор ваших групп</p>
     </div>
     {groups_html}
+    {_widget_install_script(token)}
     """
     return HTMLResponse(_miniapp_html("VKAdmin", content, token))
 
@@ -1675,121 +1790,13 @@ async def miniapp_group_settings(request: Request, group_id: int):
             Участники получают XP за сообщения, лайки и репосты.
         </p>
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
-            <button class="btn" onclick="installWidget()">Установить виджет</button>
+            <button class="btn" onclick="installWidget({group_id}, 'widget-status')">Установить виджет</button>
             <button class="btn" style="background:#4caf50;" onclick="refreshWidget()">Обновить данные</button>
         </div>
         <p id="widget-status" style="font-size:0.8rem;color:#888;margin-top:8px;"></p>
     </div>
+    {_widget_install_script(token)}
     <script>
-    // Каждый шаг установки — в журнал сервиса: Bridge работает на телефоне,
-    // и без этого сбой серверу не виден.
-    function widgetLog(step, error, env) {{
-        var fd = new FormData();
-        fd.append('step', step);
-        if (error) fd.append('error', typeof error === 'string' ? error : JSON.stringify(error));
-        if (env) fd.append('env', JSON.stringify(env));
-        return fetch('/miniapp/group/{group_id}/widget/client-log?token={token}', {{
-            method: 'POST', body: fd,
-            headers: {{'X-Requested-With': 'XMLHttpRequest'}}
-        }}).catch(function() {{}});
-    }}
-
-    function installWidget() {{
-        var statusEl = document.getElementById('widget-status');
-        var step = 'token';
-        // На Android ссылки мини-аппа открываются во внешнем Chrome, где Bridge мёртв,
-        // поэтому «откройте через ВКонтакте» с телефона вело по кругу.
-        var openInVk = 'С телефона установка не проходит — откройте https://vk.com/app{settings.VK_MINIAPP_ID}_-{group_id} в браузере на компьютере и нажмите снова';
-        if (typeof vkBridge === 'undefined') {{
-            statusEl.textContent = 'Ошибка: VK Bridge не загрузился. ' + openInVk;
-            widgetLog('bridge', 'vkBridge undefined');
-            return;
-        }}
-        widgetLog('start', '', {{
-            embedded: vkBridge.isEmbedded(), webview: vkBridge.isWebView(),
-            iframe: vkBridge.isIframe(), ua: navigator.userAgent.slice(0, 160)
-        }});
-        // Вне VK (обычная вкладка браузера) Bridge некому ответить — запрос висит вечно.
-        if (!vkBridge.isEmbedded()) {{
-            statusEl.textContent = 'Ошибка: страница открыта не внутри ВКонтакте. ' + openInVk;
-            widgetLog('bridge', 'страница открыта не внутри VK');
-            return;
-        }}
-        statusEl.textContent = 'Запрос прав на виджет...';
-
-        // 1. Get widget token with app_widget scope via VK Bridge.
-        // Если клиент VK метод не поддерживает, ответа не будет вовсе — ждём 20 с.
-        Promise.race([
-            vkBridge.send('VKWebAppGetCommunityToken', {{
-                app_id: {settings.VK_MINIAPP_ID or 0},
-                group_id: {group_id},
-                scope: 'app_widget'
-            }}),
-            new Promise(function(_, reject) {{
-                setTimeout(function() {{ reject(new Error('VK не ответил на запрос прав за 20 с')); }}, 20000);
-            }})
-        ])
-        .then(function(tokenResult) {{
-            var widgetToken = tokenResult.access_token;
-            step = 'save';
-            statusEl.textContent = 'Сохранение токена...';
-
-            // 2. Save widget token on server
-            var fd = new FormData();
-            fd.append('widget_token', widgetToken);
-            return fetch('/miniapp/group/{group_id}/widget/save-token?token={token}', {{
-                method: 'POST', body: fd,
-                headers: {{'X-Requested-With': 'XMLHttpRequest'}}
-            }}).then(function(r) {{ return r.json(); }});
-        }})
-        .then(function(saveResult) {{
-            // Раньше сбой сохранения проглатывался: виджет ставился, но не обновлялся.
-            if (!saveResult.ok) throw new Error(saveResult.error || 'токен не сохранён');
-            step = 'code';
-            statusEl.textContent = 'Подготовка виджета...';
-
-            // 3. Get widget code from server
-            return fetch('/miniapp/group/{group_id}/widget/code?token={token}')
-                .then(function(r) {{ return r.json(); }});
-        }})
-        .then(function(data) {{
-            if (data.error) throw new Error(data.error);
-            // 4. Show VK widget preview dialog
-            step = 'preview';
-            statusEl.textContent = 'Открытие диалога VK...';
-            return vkBridge.send('VKWebAppShowCommunityWidgetPreviewBox', {{
-                group_id: {group_id},
-                type: data.type,
-                code: data.code
-            }});
-        }})
-        .then(function(result) {{
-            if (result) {{
-                widgetLog('done');
-                statusEl.innerHTML = '<span style="color:#2e7d32;">✓ Виджет установлен!</span>';
-                // Enable widget in settings
-                var fd = new FormData();
-                fd.append('key', 'widget_enabled');
-                fd.append('value', 'true');
-                fetch('/miniapp/group/{group_id}/settings?token={token}', {{
-                    method: 'POST', body: fd,
-                    headers: {{'X-Requested-With': 'XMLHttpRequest'}}
-                }});
-                showToast('Виджет установлен!');
-            }}
-        }})
-        .catch(function(e) {{
-            console.error('Widget install error:', e);
-            widgetLog(step, e && e.error_data ? e : ((e && e.message) || String(e)));
-            if (e && e.error_data && e.error_data.error_code === 4) {{
-                statusEl.textContent = 'Отменено пользователем';
-            }} else {{
-                statusEl.textContent = 'Ошибка: ' + (e.error_data ? e.error_data.error_reason : (e.message || 'неизвестная'))
-                    + (step === 'token' ? '. ' + openInVk : '');
-            }}
-        }});
-    }}
-
     function refreshWidget() {{
         var statusEl = document.getElementById('widget-status');
         statusEl.textContent = 'Обновление...';

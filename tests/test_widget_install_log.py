@@ -72,7 +72,9 @@ async def test_install_button_does_not_hang_forever(db):
 
     assert "isEmbedded()" in html
     assert "VK не ответил" in html
-    assert f"vk.com/app{mini.settings.VK_MINIAPP_ID}_-{GID}" in html
+    # ссылка на приложение в подсказке — для той группы, чью кнопку нажали
+    assert f"vk.com/app{mini.settings.VK_MINIAPP_ID}_-' + groupId" in html
+    assert f"installWidget({GID}," in html
     # На Android ссылки мини-аппа уходят во внешний Chrome, где Bridge мёртв:
     # «откройте через ВКонтакте» вело по кругу. Рабочий путь — компьютер.
     assert "на компьютере" in html
@@ -109,6 +111,7 @@ async def test_install_button_reports_each_step(db):
     async with _client() as c:
         html = (await c.get(f"/miniapp/group/{GID}?token={token}")).text
 
-    assert f"/miniapp/group/{GID}/widget/client-log" in html
+    assert "'/miniapp/group/' + groupId + '/widget/client-log" in html
+    assert f"installWidget({GID}," in html
     # сбой сохранения токена больше не проглатывается
     assert "saveResult.ok" in html
