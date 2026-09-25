@@ -1,7 +1,11 @@
 """OAuth flow for connecting VK groups to the bot."""
 
+import base64
+import hashlib
 import logging
 import secrets
+from urllib.parse import urlencode
+
 import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -212,16 +216,20 @@ async def start_oauth(request: Request, group_ids: str = ""):
 
 
 ADMIN_STATE_COOKIE = "vkadmin_admin_oauth_state"
-ADMIN_SCOPE = "wall,photos,groups,offline"
+ADMIN_PKCE_COOKIE = "vkadmin_admin_pkce"
+ADMIN_SCOPE = "wall photos groups"
+VKID_AUTHORIZE_URL = "https://id.vk.ru/authorize"
+_ADMIN_COOKIE_SECURE = settings.BASE_URL.lower().startswith("https")
 
 
 @router.get("/api/vk/admin-oauth")
 async def start_admin_oauth(request: Request):
     """Подключить личный ключ админа (зачем — core/admin_key.py).
 
-    Тот же экран VK и тот же redirect_uri, что у групп (он уже разрешён в
-    настройках приложения), но без group_ids, со своими правами и своей
-    state-кукой — по ней колбэк отличает этот поток от группового."""
+    Через VK ID (OAuth 2.1 + PKCE): oauth.vk.com на любой запрос ключа
+    пользователя для нашего приложения отвечает «Security Error». Redirect URI —
+    тот же, что у групп (он доверенный в настройках приложения); свой state и
+    code_verifier — в куках, по ним колбэк отличает этот поток от группового."""
     if not is_authenticated(request):
         return RedirectResponse("/dashboard/login", status_code=303)
     if not settings.VK_APP_ID:
@@ -230,21 +238,22 @@ async def start_admin_oauth(request: Request):
             status_code=500,
         )
 
-    state = secrets.token_hex(16)
-    vk_auth_url = (
-        f"https://oauth.vk.com/authorize?"
-        f"client_id={settings.VK_APP_ID}"
-        f"&redirect_uri={settings.BASE_URL}/api/vk/callback"
-        f"&scope={ADMIN_SCOPE}"
-        f"&response_type=code"
-        f"&state={state}"
-        f"&v=5.199"
-        f"&revoke=1"  # иначе VK может отдать закэшированный отозванный ключ
-    )
+    state = secrets.token_urlsafe(32)          # VK ID: не короче 32 символов
+    verifier = secrets.token_urlsafe(64)       # PKCE: 43–128 символов [A-Za-z0-9_-]
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    vk_auth_url = VKID_AUTHORIZE_URL + "?" + urlencode({
+        "response_type": "code",
+        "client_id": settings.VK_APP_ID,
+        "redirect_uri": f"{settings.BASE_URL}/api/vk/callback",
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "scope": ADMIN_SCOPE,
+    })
     response = RedirectResponse(vk_auth_url)
-    response.set_cookie(
-        key=ADMIN_STATE_COOKIE, value=state, httponly=True, samesite="lax", max_age=600,
-    )
+    for key, value in ((ADMIN_STATE_COOKIE, state), (ADMIN_PKCE_COOKIE, verifier)):
+        response.set_cookie(key=key, value=value, httponly=True, samesite="lax",
+                            max_age=600, secure=_ADMIN_COOKIE_SECURE)
     return response
 
 
@@ -269,34 +278,36 @@ def _admin_page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
     </body></html>
     """, status_code=status_code)
     response.delete_cookie(ADMIN_STATE_COOKIE)
+    response.delete_cookie(ADMIN_PKCE_COOKIE)
     return response
 
 
-async def _finish_admin_oauth(token: str, user_id: int) -> HTMLResponse:
+async def _finish_admin_oauth(request: Request, code: str, state: str) -> HTMLResponse:
+    """Возврат VK ID: ?code&device_id&state → пара ключей → проверка админства."""
     from html import escape
-    from core.admin_key import AdminKeyError, connect_admin_key
+    from core.admin_key import AdminKeyError, connect_admin_key, exchange_code
 
+    device_id = request.query_params.get("device_id", "")
+    verifier = request.cookies.get(ADMIN_PKCE_COOKIE, "")
     try:
-        if not token or not user_id:
-            raise AdminKeyError("VK не вернул ключ. Нажмите «Подключить» ещё раз.")
-        connected = await connect_admin_key(token, user_id)
+        if not device_id or not verifier:
+            raise AdminKeyError("VK ID вернул неполный ответ или подключение длилось дольше "
+                                "10 минут. Нажмите «Подключить» ещё раз.")
+        tokens = await exchange_code(code, verifier, device_id, state)
+        connected = await connect_admin_key(tokens)
     except AdminKeyError as e:
         logger.warning(f"Admin key not connected: {e}")
         return _admin_page("Личный ключ не подключён", f"<p>{escape(str(e))}</p>", 400)
 
     items = "".join(f"<li>{escape(name)} (ID: {gid})</li>" for gid, name in connected)
+    missing = set(ADMIN_SCOPE.split()) - set(tokens.scope.split()) if tokens.scope else set()
+    warning = (f"<p>⚠️ VK выдал не все права — нет: {escape(', '.join(sorted(missing)))}. "
+               "Часть действий останется ручной.</p>") if missing else ""
     return _admin_page(
         "🔑 Личный ключ админа подключён",
         "<p>Теперь бот сам загружает фото к постам, удаляет нарушения, банит и "
-        f"закрепляет посты в группах:</p><ul>{items}</ul>",
+        f"закрепляет посты в группах:</p><ul>{items}</ul>{warning}",
     )
-
-
-def _int(value) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
 
 
 async def _exchange_code(code: str) -> dict:
@@ -384,29 +395,11 @@ async def oauth_callback(request: Request, code: str = "", error: str = "", erro
         </body></html>
         """, status_code=200)
 
-    # Личный ключ админа: тот же redirect_uri, отличаем по своей state-куке.
+    # Личный ключ админа (VK ID): тот же redirect_uri, отличаем по своей state-куке.
     if _is_admin_flow(request, state):
         if not is_authenticated(request):
             return RedirectResponse("/dashboard/login", status_code=303)
-        try:
-            data = await _exchange_code(code)
-        except (httpx.HTTPError, ValueError) as e:
-            logger.error(f"Admin key OAuth: code exchange failed: {e!r}")
-            return _admin_page(
-                "Личный ключ не подключён",
-                "<p>VK не ответил при обмене кода. Нажмите «Подключить» ещё раз.</p>",
-                400,
-            )
-        if not isinstance(data, dict) or "error" in data:
-            data = data if isinstance(data, dict) else {"error": "неожиданный ответ VK"}
-            from html import escape
-            logger.error(f"Admin key OAuth error: {data.get('error')}")
-            return _admin_page(
-                "Личный ключ не подключён",
-                f"<p>VK отказал: {escape(str(data.get('error_description') or data.get('error')))}</p>",
-                400,
-            )
-        return await _finish_admin_oauth(data.get("access_token", ""), _int(data.get("user_id")))
+        return await _finish_admin_oauth(request, code, state)
 
     # Verify OAuth state parameter
     cookie_state = request.cookies.get("vkadmin_oauth_state", "")
@@ -584,9 +577,8 @@ async def oauth_token_callback(request: Request):
     params = dict(request.query_params)
     if request.method == "POST":
         params.update({k: str(v) for k, v in (await request.form()).items()})
+    # Личный ключ сюда не принимаем: VK ID отдаёт код в адресе (см. oauth_callback).
     state = params.get("state", "")
-    if _is_admin_flow(request, state):
-        return await _finish_admin_oauth(params.get("access_token", ""), _int(params.get("user_id")))
     cookie_state = request.cookies.get("vkadmin_oauth_state", "")
     if not cookie_state or not secrets.compare_digest(cookie_state, state):
         logger.warning("Token callback without matching OAuth state — possible CSRF")

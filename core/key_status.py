@@ -165,6 +165,13 @@ async def _check_admin_key(group_id: int) -> KeyStatus:
     if error:
         status.state, status.detail = "fail", f"не работает: {error}"
         return status
+    token = await admin_key.fresh_token(group_id)  # ключ VK ID живёт час — берём продлённый
+    if not token:
+        error = await get_setting(group_id, admin_key.ERROR_KEY, "")
+        status.state = "fail"
+        status.detail = (f"не работает: {error}" if error else
+                         "ключ истёк, а VK ID сейчас не продлил — обновите страницу позже")
+        return status
     try:
         name = await _owner_of(token)
     except Exception as e:

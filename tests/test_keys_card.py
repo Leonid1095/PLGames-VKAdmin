@@ -122,6 +122,7 @@ async def _with_admin_key(**extra):
     await set_setting(GID, "admin_user_token", encrypt_token("admin-token"))
     await set_setting(GID, "admin_user_id", "309736634")
     await set_setting(GID, "admin_user_name", "Ленар Фатыхов")
+    await set_setting(GID, "admin_token_expires_at", "9999999999")  # ключ VK ID ещё жив
     for key, value in extra.items():
         await set_setting(GID, key, value)
 
@@ -203,3 +204,21 @@ async def test_rendered_disconnect_form_actually_disconnects(db, monkeypatch):
         await c.post(f"/dashboard/group/{GID}/admin-key/disconnect", data=fields)
 
     assert await admin_token(GID) == ""
+
+
+async def test_expired_key_that_vk_id_cannot_refresh_now_is_not_killed(db, monkeypatch):
+    """Ключ VK ID живёт час; если продлить сейчас не вышло (VK ID молчит),
+    карточка честно говорит «истёк», но ключ не хоронит."""
+    from core.admin_key import admin_token
+    from database.service import get_setting
+
+    await create_group(GID, "WOW", encrypt_token("group-token"), 1)
+    await _with_admin_key(admin_token_expires_at="0",
+                          admin_refresh_token=encrypt_token("ref"), admin_device_id="dev")
+
+    row = await _admin_row(monkeypatch)  # id.vk.ru в тестах недоступен (conftest)
+
+    assert 'data-state="fail"' in row
+    assert "истёк" in row
+    assert await get_setting(GID, "admin_key_error") == ""
+    assert await admin_token(GID) == "admin-token"
