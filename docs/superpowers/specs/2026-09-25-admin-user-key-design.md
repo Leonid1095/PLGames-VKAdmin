@@ -99,3 +99,26 @@ fail с ошибкой; `where` — «кнопка «Подключить» ни
 - `upload_photo_to_vk`, `_moderate`, `ban_user`/`pin_post` берут ключ админа,
   когда он есть; ошибка 5 помечает ключ мёртвым и шлёт одно ЛС;
 - карточка ключей: off / ok / fail.
+
+## Ревизия 25.09.2026: VK ID вместо oauth.vk.com
+
+Живая проверка: `oauth.vk.com/authorize` отвечает `invalid_request / Security
+Error` на любой запрос ключа пользователя для приложения 54477693 (при любых
+scope/revoke/redirect; подключение групп с `group_ids` по-прежнему
+принимается). VK ID (`id.vk.ru/authorize`) приложение и наш redirect_uri
+принимает. Поэтому:
+
+- старт: `id.vk.ru/authorize?response_type=code&client_id&redirect_uri&state
+  &code_challenge&code_challenge_method=S256&scope=wall photos groups`;
+  `state` (≥32 символов) и `code_verifier` — в httponly-куках на 10 минут;
+- возврат: `?code&device_id&state` в query → POST `id.vk.ru/oauth2/auth`
+  (`grant_type=authorization_code`, `code_verifier`, `device_id`, …);
+- ключ живёт 1 час; хранятся ещё `admin_refresh_token` (зашифрован),
+  `admin_device_id`, `admin_token_expires_at`. За 5 минут до истечения бот
+  продлевает пару (`grant_type=refresh_token`) — под одним замком и сразу во
+  всех группах этого админа: после продления старая пара недействительна;
+- мёртвым ключ считается и при отказе VK ID продлить (`invalid_grant`,
+  `invalid_token`, `access_denied`, `invalid_client`); временные сбои
+  (`server_error`, таймаут) — нет;
+- ветка ключа во #фрагменте (`/api/vk/callback/token`) убрана: VK ID
+  возвращает код в query.
