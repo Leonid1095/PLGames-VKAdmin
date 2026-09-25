@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from core import vk_read
+from core import admin_key, vk_read
 from core.config import settings
 from core.crypto import decrypt_token
 from core.widgets import widget_install_hint
@@ -132,15 +132,48 @@ async def _check_widget_token(group_id: int) -> KeyStatus:
     return status
 
 
-def _admin_key_status() -> KeyStatus:
-    return KeyStatus(
+async def _owner_of(token: str) -> str:
+    """Имя владельца личного ключа — заодно проверка, что ключ жив."""
+    async with _client() as client:
+        resp = await client.post(
+            f"{vk_read.VK_API}/users.get",
+            data={"access_token": token, "v": vk_read.VK_API_VERSION},
+        )
+    data = resp.json()
+    if "error" in data:
+        err = data["error"]
+        raise vk_read.VKReadError(int(err.get("error_code", 0)), str(err.get("error_msg", "")))
+    user = data["response"][0]
+    return f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+
+
+async def _check_admin_key(group_id: int) -> KeyStatus:
+    status = KeyStatus(
         key="admin", title="Личный ключ админа",
-        purpose="удаление комментариев, баны, закрепы, фото к постам",
+        purpose="фото к постам, удаление нарушений, баны, закрепы",
         state="off",
         detail="не подключён — ключ сообщества VK эти действия не пускает, "
                "бот присылает админу ссылку",
-        where="нужно решение владельца: подключить личный ключ администратора",
+        where="кнопка «Подключить» — VK спросит разрешение у аккаунта админа группы",
     )
+    token = await admin_key.admin_token(group_id)
+    if not token:
+        return status
+    status.where = ("переподключить — «Подключить»; полностью отозвать доступ — "
+                    "VK: Настройки → Приложения")
+    error = await get_setting(group_id, admin_key.ERROR_KEY, "")
+    if error:
+        status.state, status.detail = "fail", f"не работает: {error}"
+        return status
+    try:
+        name = await _owner_of(token)
+    except Exception as e:
+        await admin_key.report_admin_key_failure(group_id, e)
+        status.state, status.detail = "fail", _rejected(e)
+        return status
+    uid = await get_setting(group_id, admin_key.USER_ID_KEY, "")
+    status.state, status.detail = "ok", f"подключён: {name} (vk.com/id{uid})"
+    return status
 
 
 async def check_group_keys(group_id: int) -> list[KeyStatus]:
@@ -148,9 +181,9 @@ async def check_group_keys(group_id: int) -> list[KeyStatus]:
     group = await get_group(group_id)
     if not group:
         return []
-    checked = await asyncio.gather(
+    return list(await asyncio.gather(
         _check_group_key(group),
         _check_service_key(group_id),
         _check_widget_token(group_id),
-    )
-    return [*checked, _admin_key_status()]
+        _check_admin_key(group_id),
+    ))

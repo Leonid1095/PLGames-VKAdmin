@@ -11,6 +11,7 @@ from core.auth import (
     get_csrf_token, set_csrf_cookie, verify_csrf_token,
     login_retry_after, record_login_failure, record_login_success,
 )
+from core.admin_key import disconnect_admin_key
 from core.key_status import check_group_keys
 from database.service import (
     get_all_active_groups, get_group, get_setting, set_setting,
@@ -457,7 +458,7 @@ async def group_settings_page(request: Request, group_id: int):
     </div>
     """
 
-    keys_html = await _render_keys_card(group_id)
+    keys_html = await _render_keys_card(group_id, csrf)
     stats_html = await _render_wall_stats(group_id, csrf, request.query_params.get("stats", ""))
 
     # ── Hint card ──
@@ -498,17 +499,33 @@ async def group_settings_page(request: Request, group_id: int):
     return response
 
 
-async def _render_keys_card(group_id: int) -> str:
+def _admin_key_actions(group_id: int, state: str, csrf: str) -> str:
+    """Личный ключ подключается кнопкой (VK OAuth), а не через консоль."""
+    if state == "ok":
+        return (
+            f'<form method="POST" action="/dashboard/group/{group_id}/admin-key/disconnect" '
+            f'style="margin-top:6px;">'
+            f'<input type="hidden" name="_csrf" value="{escape(csrf)}">'
+            f'<button type="submit" class="btn btn-sm" style="background:#c62828;">Отключить</button>'
+            f'</form>'
+        )
+    label = "Подключить заново" if state == "fail" else "Подключить"
+    return (f'<div style="margin-top:6px;"><a href="/api/vk/admin-oauth" class="btn btn-sm">'
+            f'{label}</a></div>')
+
+
+async def _render_keys_card(group_id: int, csrf: str) -> str:
     """Карточка «Ключи и доступы»: каждый ключ проверен живым запросом к VK,
     рядом — где его взять. Чтобы не вспоминать при каждой поломке."""
     icons = {"ok": "✅", "fail": "❌", "missing": "⚠️", "off": "⚪"}
     rows = ""
     for s in await check_group_keys(group_id):
+        actions = _admin_key_actions(group_id, s.state, csrf) if s.key == "admin" else ""
         rows += (
             f'<tr data-key="{s.key}" data-state="{s.state}">'
             f'<td>{icons.get(s.state, "")}</td>'
             f'<td><b>{escape(s.title)}</b><div class="source-fetched">{escape(s.purpose)}</div></td>'
-            f'<td>{escape(s.detail)}<div class="source-fetched">Где взять: {escape(s.where)}</div></td>'
+            f'<td>{escape(s.detail)}<div class="source-fetched">Где взять: {escape(s.where)}</div>{actions}</td>'
             f'</tr>'
         )
     return f"""
@@ -675,6 +692,17 @@ async def update_group_setting(request: Request, group_id: int):
     if request.headers.get("X-Requested-With") == "XMLHttpRequest":
         return JSONResponse({"ok": True})
 
+    return RedirectResponse(f"/dashboard/group/{group_id}?msg=saved", status_code=303)
+
+
+@router.post("/dashboard/group/{group_id}/admin-key/disconnect")
+async def disconnect_group_admin_key(request: Request, group_id: int):
+    redirect = _require_auth(request)
+    if redirect:
+        return redirect
+    if not await verify_csrf_token(request):
+        return RedirectResponse(f"/dashboard/group/{group_id}", status_code=303)
+    await disconnect_admin_key(group_id)
     return RedirectResponse(f"/dashboard/group/{group_id}?msg=saved", status_code=303)
 
 

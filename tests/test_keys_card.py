@@ -107,3 +107,75 @@ async def test_widget_token_without_app_widget_right_is_flagged(db, monkeypatch)
 
     assert statuses["widget"].state == "fail"
     assert "app_widget" in statuses["widget"].detail
+
+
+# ─── Личный ключ админа: подключить / отключить из карточки ──────────────────
+
+_BASE_KEYS = {
+    "group-token": _PERMS_GROUP,
+    "svc-test-key": {"response": {"count": 5, "items": []}},
+}
+_OWNER = {"response": [{"id": 309736634, "first_name": "Ленар", "last_name": "Фатыхов"}]}
+
+
+async def _with_admin_key(**extra):
+    await set_setting(GID, "admin_user_token", encrypt_token("admin-token"))
+    await set_setting(GID, "admin_user_id", "309736634")
+    await set_setting(GID, "admin_user_name", "Ленар Фатыхов")
+    for key, value in extra.items():
+        await set_setting(GID, key, value)
+
+
+async def _admin_row(monkeypatch) -> str:
+    _mock_vk(monkeypatch, {**_BASE_KEYS, "admin-token": _OWNER})
+    async with dashboard_client() as c:
+        html = (await c.get(f"/dashboard/group/{GID}")).text
+    return _row(html, "admin")
+
+
+async def test_no_admin_key_offers_connect_button(db, monkeypatch):
+    await create_group(GID, "WOW", encrypt_token("group-token"), 1)
+
+    row = await _admin_row(monkeypatch)
+
+    assert 'data-state="off"' in row
+    assert 'href="/api/vk/admin-oauth"' in row
+
+
+async def test_connected_admin_key_is_checked_live_and_can_be_disconnected(db, monkeypatch):
+    await create_group(GID, "WOW", encrypt_token("group-token"), 1)
+    await _with_admin_key()
+
+    row = await _admin_row(monkeypatch)
+
+    assert 'data-state="ok"' in row
+    assert "Ленар Фатыхов" in row
+    assert f'action="/dashboard/group/{GID}/admin-key/disconnect"' in row
+    assert 'name="_csrf"' in row
+    assert "admin-token" not in row
+
+
+async def test_dead_admin_key_is_flagged_with_reconnect(db, monkeypatch):
+    await create_group(GID, "WOW", encrypt_token("group-token"), 1)
+    await _with_admin_key(admin_key_error="VK error 5: User authorization failed")
+
+    row = await _admin_row(monkeypatch)
+
+    assert 'data-state="fail"' in row
+    assert "User authorization failed" in row
+    assert 'href="/api/vk/admin-oauth"' in row
+
+
+async def test_disconnect_requires_csrf(db):
+    from core.admin_key import admin_token
+
+    await create_group(GID, "WOW", encrypt_token("group-token"), 1)
+    await _with_admin_key()
+
+    async with dashboard_client() as c:
+        await c.post(f"/dashboard/group/{GID}/admin-key/disconnect", data={"_csrf": "wrong"})
+    assert await admin_token(GID) == "admin-token"
+
+    async with dashboard_client() as c:
+        await c.post(f"/dashboard/group/{GID}/admin-key/disconnect", data={"_csrf": "csrf-x"})
+    assert await admin_token(GID) == ""
