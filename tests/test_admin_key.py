@@ -249,3 +249,37 @@ async def test_transient_failure_with_expired_key_gives_no_key_but_does_not_kill
     assert await admin_key.get_admin_api(GID) is None
     assert await get_setting(GID, "admin_key_error") == ""
     assert notes == []
+
+
+# ─── Диагностика: какой метод VK не пускает этот ключ ────────────────────────
+
+async def test_rejected_key_names_failing_method_and_logs_probe(db, monkeypatch, caplog):
+    """25.09: VK ID выдал ключ, но VK API ответил 1051 «Method is not available
+    for this profile type» — непонятно на чём. Теперь видно метод и карту
+    доступных методов (без самого ключа)."""
+    import logging
+
+    await _two_groups()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        method = request.url.path.rsplit("/", 1)[-1]
+        if method in ("users.get", "wall.get"):
+            ok = {"users.get": [{"id": ADMIN, "first_name": "Л", "last_name": "Ф"}],
+                  "wall.get": {"count": 0, "items": []}}[method]
+            return httpx.Response(200, json={"response": ok})
+        return httpx.Response(200, json={"error": {
+            "error_code": 1051, "error_msg": "Method is not available for this profile type"}})
+
+    monkeypatch.setattr(admin_key, "_client",
+                        lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+    with caplog.at_level(logging.WARNING), pytest.raises(admin_key.AdminKeyError) as err:
+        await admin_key.connect_admin_key(_tokens(access="secret-acc"))
+
+    assert "groups.get" in str(err.value) and "1051" in str(err.value)
+    assert "users.get=ok" in caplog.text
+    assert "groups.get=1051" in caplog.text
+    assert "wall.get=ok" in caplog.text
+    assert "photos.getWallUploadServer=1051" in caplog.text
+    assert "wall photos groups" in caplog.text  # какие права выдал VK ID
+    assert "secret-acc" not in caplog.text

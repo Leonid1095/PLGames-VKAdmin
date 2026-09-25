@@ -151,14 +151,42 @@ async def _store(group_ids: list[int], tokens: TokenSet) -> None:
         await set_setting(gid, EXPIRES_KEY, expires_at)
 
 
+# Безопасные методы на чтение: какие из них VK пускает с этим ключом.
+_PROBES = (
+    ("users.get", {}),
+    ("groups.get", {"filter": "admin"}),
+    ("groups.getById", {"group_id": "{gid}", "fields": "is_admin,admin_level"}),
+    ("wall.get", {"owner_id": "-{gid}", "count": "1"}),
+    ("photos.getWallUploadServer", {"group_id": "{gid}"}),
+)
+
+
+async def _probe(token: str) -> str:
+    """Карта «метод=ok|код ошибки» для журнала — когда ключ не приняли."""
+    groups = await get_all_active_groups()
+    gid = groups[0].group_id if groups else 1
+    results = []
+    for method, params in _PROBES:
+        try:
+            await _vk(token, method, **{k: v.format(gid=gid) for k, v in params.items()})
+            results.append(f"{method}=ok")
+        except vk_read.VKReadError as e:
+            results.append(f"{method}={e.code}")
+    return " ".join(results)
+
+
 async def connect_admin_key(tokens: TokenSet) -> list[tuple[int, str]]:
     """Сохранить ключ для наших групп, где VK подтверждает админство владельца
     ключа. Возвращает [(group_id, name)]; ни одной — AdminKeyError."""
+    method = "users.get"
     try:
-        admin_of = set((await _vk(tokens.access_token, "groups.get", filter="admin")).get("items", []))
-        users = await _vk(tokens.access_token, "users.get")  # владелец ключа, а не чей-то id из URL
+        users = await _vk(tokens.access_token, method)  # владелец ключа, а не чей-то id из URL
+        method = "groups.get"
+        admin_of = set((await _vk(tokens.access_token, method, filter="admin")).get("items", []))
     except vk_read.VKReadError as e:
-        raise AdminKeyError(f"VK не принял ключ: ошибка {e.code} ({e.message})") from e
+        probe = await _probe(tokens.access_token)
+        logger.warning(f"Admin key rejected on {method}: {e}; scope={tokens.scope!r}; probe: {probe}")
+        raise AdminKeyError(f"VK не принял ключ: {method} — ошибка {e.code} ({e.message})") from e
     if not users:
         raise AdminKeyError("VK не вернул данные аккаунта. Нажмите «Подключить» ещё раз.")
     user = users[0]
