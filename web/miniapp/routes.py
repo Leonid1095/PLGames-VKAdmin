@@ -1348,7 +1348,7 @@ async def miniapp_onboarding(request: Request):
         ("ai", "🤖 Настроить ИИ-профиль", "Бот проанализирует группу и создаст персонализированный промпт", bool(ai_desc), f"/miniapp/group/{group_id}?token={token}"),
         ("sources", "📡 Добавить источники контента", "RSS, VK-группы или сайты для автоматического парсинга", len(sources) > 0, f"/miniapp/group/{group_id}?token={token}"),
         ("autopost", "📝 Включить автопостинг", "Бот будет сам писать и публиковать посты из источников", autopost, f"/miniapp/group/{group_id}?token={token}"),
-        ("widget", "🏆 Установить виджет", "Таблица топ-участников на странице группы", widget, f"/miniapp/group/{group_id}?token={token}"),
+        ("widget", "🏆 Установить виджет", "Рейтинг топ-участников на странице группы", widget, f"/miniapp/group/{group_id}?token={token}"),
         ("telegram", "📨 Подключить Telegram", "Автоматический кросс-постинг в Telegram-канал", telegram, f"/miniapp/group/{group_id}?token={token}"),
     ]
 
@@ -1671,7 +1671,7 @@ async def miniapp_group_settings(request: Request, group_id: int):
         <div class="card-title">🏆 Виджет-лидерборд</div>
         <p style="font-size:0.85rem;margin-bottom:6px;">Статус: {widget_status}</p>
         <p style="font-size:0.78rem;color:#888;margin-bottom:12px;">
-            Виджет показывает таблицу топ-участников прямо на странице группы.
+            Виджет показывает рейтинг топ-участников прямо на странице группы.
             Участники получают XP за сообщения, лайки и репосты.
         </p>
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
@@ -1681,18 +1681,57 @@ async def miniapp_group_settings(request: Request, group_id: int):
         <p id="widget-status" style="font-size:0.8rem;color:#888;margin-top:8px;"></p>
     </div>
     <script>
+    // Каждый шаг установки — в журнал сервиса: Bridge работает на телефоне,
+    // и без этого сбой серверу не виден.
+    function widgetLog(step, error, env) {{
+        var fd = new FormData();
+        fd.append('step', step);
+        if (error) fd.append('error', typeof error === 'string' ? error : JSON.stringify(error));
+        if (env) fd.append('env', JSON.stringify(env));
+        return fetch('/miniapp/group/{group_id}/widget/client-log?token={token}', {{
+            method: 'POST', body: fd,
+            headers: {{'X-Requested-With': 'XMLHttpRequest'}}
+        }}).catch(function() {{}});
+    }}
+
     function installWidget() {{
         var statusEl = document.getElementById('widget-status');
+        var step = 'token';
+        // На Android ссылки мини-аппа открываются во внешнем Chrome, где Bridge мёртв,
+        // поэтому «откройте через ВКонтакте» с телефона вело по кругу.
+        var openInVk = 'С телефона установка не проходит — откройте https://vk.com/app{settings.VK_MINIAPP_ID}_-{group_id} в браузере на компьютере и нажмите снова';
+        if (typeof vkBridge === 'undefined') {{
+            statusEl.textContent = 'Ошибка: VK Bridge не загрузился. ' + openInVk;
+            widgetLog('bridge', 'vkBridge undefined');
+            return;
+        }}
+        widgetLog('start', '', {{
+            embedded: vkBridge.isEmbedded(), webview: vkBridge.isWebView(),
+            iframe: vkBridge.isIframe(), ua: navigator.userAgent.slice(0, 160)
+        }});
+        // Вне VK (обычная вкладка браузера) Bridge некому ответить — запрос висит вечно.
+        if (!vkBridge.isEmbedded()) {{
+            statusEl.textContent = 'Ошибка: страница открыта не внутри ВКонтакте. ' + openInVk;
+            widgetLog('bridge', 'страница открыта не внутри VK');
+            return;
+        }}
         statusEl.textContent = 'Запрос прав на виджет...';
 
-        // 1. Get widget token with app_widget scope via VK Bridge
-        vkBridge.send('VKWebAppGetCommunityToken', {{
-            app_id: {settings.VK_MINIAPP_ID or 0},
-            group_id: {group_id},
-            scope: 'app_widget'
-        }})
+        // 1. Get widget token with app_widget scope via VK Bridge.
+        // Если клиент VK метод не поддерживает, ответа не будет вовсе — ждём 20 с.
+        Promise.race([
+            vkBridge.send('VKWebAppGetCommunityToken', {{
+                app_id: {settings.VK_MINIAPP_ID or 0},
+                group_id: {group_id},
+                scope: 'app_widget'
+            }}),
+            new Promise(function(_, reject) {{
+                setTimeout(function() {{ reject(new Error('VK не ответил на запрос прав за 20 с')); }}, 20000);
+            }})
+        ])
         .then(function(tokenResult) {{
             var widgetToken = tokenResult.access_token;
+            step = 'save';
             statusEl.textContent = 'Сохранение токена...';
 
             // 2. Save widget token on server
@@ -1704,6 +1743,9 @@ async def miniapp_group_settings(request: Request, group_id: int):
             }}).then(function(r) {{ return r.json(); }});
         }})
         .then(function(saveResult) {{
+            // Раньше сбой сохранения проглатывался: виджет ставился, но не обновлялся.
+            if (!saveResult.ok) throw new Error(saveResult.error || 'токен не сохранён');
+            step = 'code';
             statusEl.textContent = 'Подготовка виджета...';
 
             // 3. Get widget code from server
@@ -1711,20 +1753,19 @@ async def miniapp_group_settings(request: Request, group_id: int):
                 .then(function(r) {{ return r.json(); }});
         }})
         .then(function(data) {{
-            if (data.error) {{
-                statusEl.textContent = 'Ошибка: ' + data.error;
-                return;
-            }}
+            if (data.error) throw new Error(data.error);
             // 4. Show VK widget preview dialog
+            step = 'preview';
             statusEl.textContent = 'Открытие диалога VK...';
             return vkBridge.send('VKWebAppShowCommunityWidgetPreviewBox', {{
                 group_id: {group_id},
-                type: 'table',
+                type: data.type,
                 code: data.code
             }});
         }})
         .then(function(result) {{
             if (result) {{
+                widgetLog('done');
                 statusEl.innerHTML = '<span style="color:#2e7d32;">✓ Виджет установлен!</span>';
                 // Enable widget in settings
                 var fd = new FormData();
@@ -1739,10 +1780,12 @@ async def miniapp_group_settings(request: Request, group_id: int):
         }})
         .catch(function(e) {{
             console.error('Widget install error:', e);
+            widgetLog(step, e && e.error_data ? e : ((e && e.message) || String(e)));
             if (e && e.error_data && e.error_data.error_code === 4) {{
                 statusEl.textContent = 'Отменено пользователем';
             }} else {{
-                statusEl.textContent = 'Ошибка: ' + (e.error_data ? e.error_data.error_reason : (e.message || 'неизвестная'));
+                statusEl.textContent = 'Ошибка: ' + (e.error_data ? e.error_data.error_reason : (e.message || 'неизвестная'))
+                    + (step === 'token' ? '. ' + openInVk : '');
             }}
         }});
     }}
@@ -2049,6 +2092,32 @@ async def miniapp_widget_save_token(request: Request, group_id: int):
     return JSONResponse({"ok": True})
 
 
+@router.post("/miniapp/group/{group_id}/widget/client-log")
+async def miniapp_widget_client_log(request: Request, group_id: int):
+    """Ход установки виджета с телефона админа. VK Bridge работает в браузере,
+    и без этого сбой установки серверу не виден вовсе (так было с июля)."""
+    auth = _get_auth(request)
+    if not auth:
+        return JSONResponse({"error": "Сессия истекла"}, status_code=401)
+
+    group = await get_group(group_id)
+    if not group or group.admin_vk_id != auth["uid"]:
+        return JSONResponse({"error": "Нет доступа"}, status_code=403)
+
+    form = await request.form()
+    step = str(form.get("step", ""))[:40]
+    error = str(form.get("error", ""))[:500]
+    env = str(form.get("env", ""))[:300]  # где открыта страница: внутри VK или нет
+    if error:
+        logger.warning(f"Widget install failed on client: group={group_id} step={step} error={error!r}")
+        await set_setting(group_id, "widget_install_error", f"шаг «{step}»: {error}")
+    else:
+        logger.info(f"Widget install: group={group_id} step={step} env={env!r}")
+        if step == "done":
+            await set_setting(group_id, "widget_install_error", "")
+    return JSONResponse({"ok": True})
+
+
 @router.get("/miniapp/group/{group_id}/widget/code")
 async def miniapp_widget_code(request: Request, group_id: int):
     """Return VKScript code for the widget preview dialog."""
@@ -2060,48 +2129,18 @@ async def miniapp_widget_code(request: Request, group_id: int):
     if not group or group.admin_vk_id != auth["uid"]:
         return JSONResponse({"error": "Нет доступа"}, status_code=403)
 
-    from core.widgets import _build_table_widget_code, _resolve_user_names
+    from core.widgets import WIDGET_TYPE, build_top_widget, demo_widget_code
     from core.crypto import decrypt_token
-    from database.service import get_top_users
-    from vkbottle import API
 
-    widget_count = int(await get_setting(group_id, "widget_top_count", "10"))
-    widget_sort = await get_setting(group_id, "widget_sort_by", "xp")
-    top = await get_top_users(group_id, order_by=widget_sort, limit=widget_count)
-
-    if not top:
-        # Demo widget if no data yet
-        import json
-        demo = {
-            "title": "🏆 Топ участников",
-            "head": [{"text": "#"}, {"text": "Участник"}, {"text": "Уровень"}, {"text": "XP"}],
-            "body": [
-                [{"text": "1"}, {"text": "Пока нет данных"}, {"text": "1"}, {"text": "0"}],
-            ],
-        }
-        return JSONResponse({"code": f"return {json.dumps(demo, ensure_ascii=False)};"})
-
+    # Тот же код, что шлёт ежечасное обновление, — иначе после установки
+    # виджет через час сменит вид. Имена резолвим ключом группы.
     try:
         token = decrypt_token(group.access_token)
-        api = API(token=token)
-        vk_ids = [u.vk_id for u in top]
-        names = await _resolve_user_names(api, vk_ids)
     except Exception:
-        names = {}
-
-    rows = []
-    for u in top:
-        rows.append({
-            "vk_id": u.vk_id,
-            "name": names.get(u.vk_id, f"id{u.vk_id}"),
-            "level": u.level,
-            "xp": u.xp,
-            "messages": u.messages_count,
-            "reputation": u.reputation,
-        })
-
-    code = _build_table_widget_code(rows, sort_by=widget_sort)
-    return JSONResponse({"code": code})
+        token = ""
+    built = await build_top_widget(group_id, token)
+    code = built[0] if built else demo_widget_code(group_id)
+    return JSONResponse({"type": WIDGET_TYPE, "code": code})
 
 
 @router.api_route(

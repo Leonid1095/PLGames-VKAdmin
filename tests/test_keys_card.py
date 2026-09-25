@@ -1,0 +1,109 @@
+"""Карточка «Ключи и доступы» в дашборде: какой ключ работает и где взять новый.
+
+Зачем: ключей у бота несколько (сообщества, сервисный, виджета), и каждый раз
+при поломке владелец заново искал, какой из них умер и где его получить.
+Карточка проверяет ключи живым запросом к VK и пишет, куда нажать.
+"""
+
+import httpx
+
+from core import key_status, vk_read
+from core.crypto import encrypt_token
+from database.service import create_group, set_setting
+from tests.test_dashboard_stats import _client as dashboard_client
+
+GID = 236517033
+
+_PERMS_GROUP = {"response": {"mask": 12292, "permissions": [
+    {"name": "messages", "setting": 4096}, {"name": "wall", "setting": 8192},
+]}}
+_PERMS_WIDGET = {"response": {"mask": 64, "permissions": [
+    {"name": "app_widget", "setting": 64},
+]}}
+
+
+def _mock_vk(monkeypatch, by_token: dict):
+    """Ответ VK выбирается по access_token запроса — так видно, каким ключом звали."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        params = request.url.params
+        if request.method == "POST":
+            params = httpx.QueryParams(request.content.decode())
+        return httpx.Response(200, json=by_token[params["access_token"]])
+
+    factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))  # noqa: E731
+    monkeypatch.setattr(key_status, "_client", factory)
+    monkeypatch.setattr(vk_read, "_client", factory)
+
+
+def _row(html: str, key: str) -> str:
+    start = html.index(f'data-key="{key}"')
+    return html[start:html.index("</tr>", start)]
+
+
+async def test_card_shows_live_status_of_every_key(db, monkeypatch):
+    await create_group(GID, "WOW", encrypt_token("group-token"), 1)
+    await set_setting(GID, "widget_enabled", "true")
+    await set_setting(GID, "widget_token", "widget-token")
+    _mock_vk(monkeypatch, {
+        "group-token": _PERMS_GROUP,
+        "svc-test-key": {"response": {"count": 5, "items": []}},
+        "widget-token": _PERMS_WIDGET,
+    })
+
+    async with dashboard_client() as c:
+        html = (await c.get(f"/dashboard/group/{GID}")).text
+
+    assert "Ключи и доступы" in html
+    assert 'data-state="ok"' in _row(html, "group")
+    assert "messages" in _row(html, "group")
+    assert 'data-state="ok"' in _row(html, "service")
+    assert 'data-state="ok"' in _row(html, "widget")
+    assert 'data-state="off"' in _row(html, "admin")
+
+
+async def test_card_says_where_to_get_missing_widget_token(db, monkeypatch):
+    await create_group(GID, "WOW", encrypt_token("group-token"), 1)
+    await set_setting(GID, "widget_enabled", "true")
+    _mock_vk(monkeypatch, {
+        "group-token": _PERMS_GROUP,
+        "svc-test-key": {"response": {"count": 0, "items": []}},
+    })
+
+    async with dashboard_client() as c:
+        html = (await c.get(f"/dashboard/group/{GID}")).text
+
+    row = _row(html, "widget")
+    assert 'data-state="missing"' in row
+    assert "Установить виджет" in row
+
+
+async def test_card_shows_vk_rejecting_group_key(db, monkeypatch):
+    await create_group(GID, "WOW", encrypt_token("group-token"), 1)
+    _mock_vk(monkeypatch, {
+        "group-token": {"error": {"error_code": 5, "error_msg": "User authorization failed"}},
+        "svc-test-key": {"response": {"count": 0, "items": []}},
+    })
+
+    async with dashboard_client() as c:
+        html = (await c.get(f"/dashboard/group/{GID}")).text
+
+    row = _row(html, "group")
+    assert 'data-state="fail"' in row
+    assert "ошибка 5" in row
+    assert "Работа с API" in row
+
+
+async def test_widget_token_without_app_widget_right_is_flagged(db, monkeypatch):
+    await create_group(GID, "WOW", encrypt_token("group-token"), 1)
+    await set_setting(GID, "widget_enabled", "true")
+    await set_setting(GID, "widget_token", "widget-token")
+    _mock_vk(monkeypatch, {
+        "group-token": _PERMS_GROUP,
+        "svc-test-key": {"response": {"count": 0, "items": []}},
+        "widget-token": _PERMS_GROUP,  # токен есть, но без app_widget
+    })
+
+    statuses = {s.key: s for s in await key_status.check_group_keys(GID)}
+
+    assert statuses["widget"].state == "fail"
+    assert "app_widget" in statuses["widget"].detail

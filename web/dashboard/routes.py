@@ -11,6 +11,7 @@ from core.auth import (
     get_csrf_token, set_csrf_cookie, verify_csrf_token,
     login_retry_after, record_login_failure, record_login_success,
 )
+from core.key_status import check_group_keys
 from database.service import (
     get_all_active_groups, get_group, get_setting, set_setting,
     deactivate_group, get_content_sources, get_post_analytics,
@@ -456,6 +457,7 @@ async def group_settings_page(request: Request, group_id: int):
     </div>
     """
 
+    keys_html = await _render_keys_card(group_id)
     stats_html = await _render_wall_stats(group_id, csrf, request.query_params.get("stats", ""))
 
     # ── Hint card ──
@@ -486,6 +488,7 @@ async def group_settings_page(request: Request, group_id: int):
         <p>ID: {group_id}</p>
     </div>
     {status_html}
+    {keys_html}
     {stats_html}
     {sections_html}
     {hint_html}
@@ -493,6 +496,30 @@ async def group_settings_page(request: Request, group_id: int):
     response = HTMLResponse(_base_html(name, content))
     set_csrf_cookie(response, csrf_token)
     return response
+
+
+async def _render_keys_card(group_id: int) -> str:
+    """Карточка «Ключи и доступы»: каждый ключ проверен живым запросом к VK,
+    рядом — где его взять. Чтобы не вспоминать при каждой поломке."""
+    icons = {"ok": "✅", "fail": "❌", "missing": "⚠️", "off": "⚪"}
+    rows = ""
+    for s in await check_group_keys(group_id):
+        rows += (
+            f'<tr data-key="{s.key}" data-state="{s.state}">'
+            f'<td>{icons.get(s.state, "")}</td>'
+            f'<td><b>{escape(s.title)}</b><div class="source-fetched">{escape(s.purpose)}</div></td>'
+            f'<td>{escape(s.detail)}<div class="source-fetched">Где взять: {escape(s.where)}</div></td>'
+            f'</tr>'
+        )
+    return f"""
+    <div class="card">
+        <div class="card-title">Ключи и доступы</div>
+        <div style="overflow-x:auto;">
+            <table class="source-table">{rows}</table>
+        </div>
+        <p class="hint">Проверено запросом к VK при открытии страницы.</p>
+    </div>
+    """
 
 
 async def _render_wall_stats(group_id: int, csrf: str, flash: str = "") -> str:

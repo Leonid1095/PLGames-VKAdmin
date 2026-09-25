@@ -137,8 +137,10 @@ class VKFrameMiddleware(BaseHTTPMiddleware):
         )
         if is_vk_frame:
             response.headers["X-Frame-Options"] = ""
+            # vk.com для части пользователей редиректит на vk.ru — без него
+            # браузер не встраивает Mini App с компьютера.
             response.headers["Content-Security-Policy"] = (
-                "frame-ancestors https://*.vk.com https://vk.com"
+                "frame-ancestors https://*.vk.com https://vk.com https://*.vk.ru https://vk.ru"
             )
         else:
             response.headers["X-Frame-Options"] = "DENY"

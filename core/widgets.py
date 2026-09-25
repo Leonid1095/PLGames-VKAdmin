@@ -14,55 +14,111 @@ from database.service import get_top_users, get_all_active_groups, get_setting, 
 logger = logging.getLogger(__name__)
 
 
-def _build_table_widget_code(rows: list[dict], sort_by: str = "xp") -> str:
-    """Build VKScript code for appWidgets.update with type=table.
+def _client() -> httpx.AsyncClient:
+    # Отдельная фабрика — точка подмены транспорта в тестах.
+    return httpx.AsyncClient(timeout=15)
 
-    VK requires this exact format:
-    return {"title": "...", "head": [...], "body": [...]};
-    """
-    sort_labels = {
-        "xp": "XP",
-        "level": "Ур.",
-        "messages": "Сообщ.",
-        "rep": "Репут.",
-    }
-    value_label = sort_labels.get(sort_by, "XP")
-    value_key = {
-        "xp": "xp",
-        "level": "level",
-        "messages": "messages",
-        "rep": "reputation",
-    }.get(sort_by, "xp")
 
-    head = [
-        {"text": "#", "align": "center"},
-        {"text": "Участник"},
-        {"text": value_label, "align": "right"},
-    ]
+async def _notify_admin(group_id: int, text: str) -> bool:
+    """ЛС менеджерам группы от её имени. True — хоть кому-то доставлено."""
+    from core.escalation import notify_managers
+    from web.vk_callback import _build_context
 
-    body = []
-    for i, row in enumerate(rows, 1):
-        # Medal for top-3
-        rank = ["🥇", "🥈", "🥉"][i - 1] if i <= 3 else str(i)
-        value = row.get(value_key, row.get("xp", 0))
-        body.append([
-            {"text": rank, "icon_id": f"id{row['vk_id']}"},
-            {"text": row["name"], "url": f"https://vk.com/id{row['vk_id']}"},
-            {"text": str(value)},
-        ])
+    ctx = await _build_context(group_id)
+    if not ctx:
+        return False
+    return await notify_managers(ctx, text) > 0
 
-    widget = {
-        "title": "🏆 Топ участников",
-        "title_url": f"https://vk.com/app{settings.VK_MINIAPP_ID}" if settings.VK_MINIAPP_ID else "",
-        "head": head,
-        "body": body,
-    }
 
-    # Remove empty title_url
-    if not widget["title_url"]:
-        del widget["title_url"]
+def widget_install_hint() -> str:
+    """Где админу нажать «Установить виджет» — чтобы не вспоминать каждый раз.
+    Только с компьютера: на Android мини-апп уводит настройки во внешний
+    браузер, и запрос прав VK оттуда не проходит."""
+    app = f"https://vk.com/app{settings.VK_MINIAPP_ID}" if settings.VK_MINIAPP_ID else "Mini App"
+    return f"на компьютере: {app} → ⚙️ у группы → вкладка «🏆 Виджет» → «Установить виджет»"
 
+
+async def _alert_once(group_id: int, problem: str, text: str) -> None:
+    """Одно ЛС на каждую новую проблему, а не каждый час. Сбрасывается
+    успешным обновлением — следующая поломка снова дойдёт до админа."""
+    if await get_setting(group_id, "widget_alerted", "") == problem:
+        return
+    if await _notify_admin(group_id, text):
+        await set_setting(group_id, "widget_alerted", problem)
+
+
+WIDGET_TYPE = "table"
+TABLE_MAX_ROWS = 10  # больше VK в table не принимает (плюс строка заголовков)
+WIDGET_TITLE = "🏆 Топ участников"
+_HEAD = [
+    {"text": "Участник"},
+    {"text": "Уровень", "align": "center"},
+    {"text": "Опыт", "align": "center"},
+    {"text": "Сообщения", "align": "center"},
+]
+
+
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    n = abs(n) % 100
+    if 11 <= n <= 14:
+        return many
+    return {1: one, 2: few, 3: few, 4: few}.get(n % 10, many)
+
+
+def _table_code(body: list[list[dict]], group_id: int) -> str:
+    widget = {"title": WIDGET_TITLE, "head": _HEAD, "body": body}
+    if settings.VK_MINIAPP_ID:
+        widget["title_url"] = f"https://vk.com/app{settings.VK_MINIAPP_ID}_-{group_id}"
     return f"return {json.dumps(widget, ensure_ascii=False)};"
+
+
+def _build_table_widget_code(rows: list[dict], group_id: int) -> str:
+    """VKScript для appWidgets.update с type=table. Иконку VK разрешает только
+    в первой ячейке строки — поэтому аватарка, место и имя живут вместе."""
+    body = []
+    for i, row in enumerate(rows[:TABLE_MAX_ROWS], 1):
+        rank = ["🥇", "🥈", "🥉"][i - 1] if i <= 3 else f"{i}."
+        body.append([
+            {
+                "text": f"{rank} {row['name']}",
+                "url": f"https://vk.com/id{row['vk_id']}",
+                "icon_id": f"id{row['vk_id']}",  # VK подставляет аватарку участника
+            },
+            {"text": str(row["level"])},
+            {"text": str(row["xp"])},
+            {"text": str(row["messages"])},
+        ])
+    return _table_code(body, group_id)
+
+
+def demo_widget_code(group_id: int) -> str:
+    """Заглушка для предпросмотра, пока в рейтинге никого нет."""
+    return _table_code([[{"text": "Пока никого нет"}, {"text": "—"}, {"text": "—"}, {"text": "—"}]], group_id)
+
+
+async def build_top_widget(group_id: int, token: str) -> tuple[str, int] | None:
+    """(VKScript виджета «Топ участников», сколько в нём человек) или None,
+    если рейтинга ещё нет.
+
+    token — любой ключ, которым можно вызвать users.get (нужны имена)."""
+    widget_count = int(await get_setting(group_id, "widget_top_count", "10"))
+    widget_sort = await get_setting(group_id, "widget_sort_by", "xp")
+    top = await get_top_users(
+        group_id, order_by=widget_sort, limit=min(widget_count, TABLE_MAX_ROWS),
+    )
+    if not top:
+        return None
+
+    names = await _resolve_user_names(token, [u.vk_id for u in top])
+    rows = [{
+        "vk_id": u.vk_id,
+        "name": names.get(u.vk_id, f"id{u.vk_id}"),
+        "level": u.level,
+        "xp": u.xp,
+        "messages": u.messages_count,
+        "reputation": u.reputation,
+    } for u in top]
+    return _build_table_widget_code(rows, group_id), len(rows)
 
 
 async def _resolve_user_names(api_or_token, vk_ids: list[int]) -> dict[int, str]:
@@ -76,7 +132,7 @@ async def _resolve_user_names(api_or_token, vk_ids: list[int]) -> dict[int, str]
     # If it's a string token, use httpx directly
     if isinstance(api_or_token, str):
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
+            async with _client() as client:
                 resp = await client.get(
                     "https://api.vk.com/method/users.get",
                     params={
@@ -121,41 +177,28 @@ async def update_widget_for_group(group_id: int) -> tuple[bool, str]:
     widget_token = await get_setting(group_id, "widget_token", "")
 
     if not widget_token:
+        await _alert_once(
+            group_id, "no_token",
+            "🏆 Виджет «Топ участников» включён, но у бота нет токена — "
+            "рейтинг в группе не обновляется.\n"
+            f"Где установить: {widget_install_hint()}",
+        )
         return False, "Сначала нажмите «Установить виджет» — это даст боту права на обновление данных"
 
-    # Get top users
-    widget_count = int(await get_setting(group_id, "widget_top_count", "10"))
-    widget_sort = await get_setting(group_id, "widget_sort_by", "xp")
-    top = await get_top_users(group_id, order_by=widget_sort, limit=widget_count)
-
-    if not top:
+    # Имена резолвим тем же токеном виджета
+    built = await build_top_widget(group_id, widget_token)
+    if built is None:
         return False, "Нет данных об участниках. Пользователи появятся когда начнут писать сообщения/комментарии"
-
-    # Resolve names using the widget token
-    vk_ids = [u.vk_id for u in top]
-    names = await _resolve_user_names(widget_token, vk_ids)
-
-    rows = []
-    for u in top:
-        rows.append({
-            "vk_id": u.vk_id,
-            "name": names.get(u.vk_id, f"id{u.vk_id}"),
-            "level": u.level,
-            "xp": u.xp,
-            "messages": u.messages_count,
-            "reputation": u.reputation,
-        })
-
-    code = _build_table_widget_code(rows, sort_by=widget_sort)
+    code, shown = built
 
     # Call appWidgets.update via httpx (widget_token has app_widget scope)
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with _client() as client:
             resp = await client.get(
                 "https://api.vk.com/method/appWidgets.update",
                 params={
                     "code": code,
-                    "type": "table",
+                    "type": WIDGET_TYPE,
                     "access_token": widget_token,
                     "v": "5.199",
                 },
@@ -167,17 +210,27 @@ async def update_widget_for_group(group_id: int) -> tuple[bool, str]:
                 error_code = error.get("error_code", 0)
                 error_msg = error.get("error_msg", "unknown")
                 logger.error(f"Widget API error for group {group_id}: [{error_code}] {error_msg}")
+                await set_setting(group_id, "widget_last_error", f"[{error_code}] {error_msg}")
 
-                # Token expired or invalid — clear it
+                # Токен НЕ стираем: раньше одна ошибка VK молча удаляла его, и
+                # виджет месяцами стоял без обновлений. Админ узнаёт сам, один раз.
                 if error_code in (5, 15, 27):
-                    logger.warning(f"Widget token invalid for group {group_id}, clearing.")
-                    await set_setting(group_id, "widget_token", "")
-                    return False, "Токен виджета устарел. Нажмите «Установить виджет» заново"
+                    await _alert_once(
+                        group_id, f"vk_{error_code}",
+                        f"🏆 VK не принимает обновление виджета «Топ участников» "
+                        f"(ошибка {error_code}: {error_msg}).\n"
+                        f"Если не пройдёт и дальше — установите виджет заново: "
+                        f"{widget_install_hint()}",
+                    )
+                    return False, (f"VK отклонил токен виджета (ошибка {error_code}). "
+                                   "Нажмите «Установить виджет» заново")
 
                 return False, f"VK API: {error_msg}"
 
-            logger.info(f"Widget updated for group {group_id} ({len(rows)} users)")
-            return True, f"Обновлено ({len(rows)} участников)"
+            await set_setting(group_id, "widget_last_error", "")
+            await set_setting(group_id, "widget_alerted", "")
+            logger.info(f"Widget updated for group {group_id} ({shown} users)")
+            return True, f"Обновлено ({shown} {_plural(shown, 'участник', 'участника', 'участников')})"
 
     except Exception as e:
         logger.error(f"Widget update failed for group {group_id}: {e}")
