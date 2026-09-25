@@ -2,6 +2,7 @@
 
 import json
 import logging
+import time
 from html import escape
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -1402,6 +1403,70 @@ async def miniapp_onboarding(request: Request):
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 
+def _admin_key_card(token: str) -> str:
+    """Кнопка «🔑 Личный ключ»: VKWebAppGetAuthToken c wall/photos/groups.
+
+    Здесь, на стартовой, потому что её VK открывает сам — Bridge работает и на
+    Android (остальные страницы мини-аппа там уходят во внешний браузер)."""
+    app_id = settings.VK_MINIAPP_ID or 0
+    return f"""
+    <div class="card">
+        <div class="card-title">🔑 Личный ключ админа</div>
+        <p style="font-size:0.8rem;color:#888;margin-bottom:10px;">
+            Чтобы бот сам загружал фото к постам, удалял нарушения, банил и закреплял —
+            этого ключ сообщества VK не умеет.
+        </p>
+        <button class="btn" onclick="connectAdminKey()">Подключить</button>
+        <p id="akey-status" style="font-size:0.8rem;color:#888;margin-top:8px;"></p>
+    </div>
+    <script>
+    function connectAdminKey() {{
+        var st = document.getElementById('akey-status');
+        if (typeof vkBridge === 'undefined' || !vkBridge.isEmbedded()) {{
+            st.textContent = 'Откройте приложение внутри ВКонтакте: https://vk.com/app{app_id}';
+            return;
+        }}
+        st.textContent = 'Запрос прав у ВКонтакте...';
+        Promise.race([
+            vkBridge.send('VKWebAppGetAuthToken', {{app_id: {app_id}, scope: 'wall,photos,groups'}}),
+            new Promise(function(_, reject) {{
+                setTimeout(function() {{ reject(new Error('VK не ответил за 30 с')); }}, 30000);
+            }})
+        ])
+        .then(function(r) {{
+            st.textContent = 'Проверка ключа...';
+            var fd = new FormData();
+            fd.append('access_token', r.access_token || '');
+            fd.append('scope', r.scope || '');
+            if (r.expires) fd.append('expires', r.expires);
+            return fetch('/miniapp/admin-key?token={token}', {{
+                method: 'POST', body: fd,
+                headers: {{'X-Requested-With': 'XMLHttpRequest'}}
+            }}).then(function(x) {{ return x.json(); }});
+        }})
+        .then(function(d) {{
+            if (d.ok) {{
+                st.textContent = '✓ Подключён для: ' + d.groups.join(', ')
+                    + (d.missing && d.missing.length ? ' (VK не дал: ' + d.missing.join(', ') + ')' : '');
+                showToast('Личный ключ подключён');
+            }} else {{
+                st.textContent = 'Не подключён: ' + (d.error || 'неизвестная ошибка');
+            }}
+        }})
+        .catch(function(e) {{
+            if (e && e.error_data && e.error_data.error_code === 4) {{
+                st.textContent = 'Отменено';
+            }} else {{
+                st.textContent = 'Ошибка: ' + (e && e.error_data
+                    ? (e.error_data.error_reason || JSON.stringify(e.error_data))
+                    : ((e && e.message) || 'неизвестная'));
+            }}
+        }});
+    }}
+    </script>
+    """
+
+
 def _widget_install_script(token: str) -> str:
     """JS установки виджета через VK Bridge — общий для стартовой страницы и ⚙️.
 
@@ -1590,6 +1655,7 @@ async def miniapp_entry(request: Request):
         <p style="opacity: 0.85; font-size: 0.85rem;">AI-администратор ваших групп</p>
     </div>
     {groups_html}
+    {_admin_key_card(token)}
     {_widget_install_script(token)}
     """
     return HTMLResponse(_miniapp_html("VKAdmin", content, token))
@@ -2097,6 +2163,54 @@ async def miniapp_widget_save_token(request: Request, group_id: int):
     await set_setting(group_id, "widget_token", widget_token)
     logger.info(f"Widget token saved for group {group_id}")
     return JSONResponse({"ok": True})
+
+
+@router.post("/miniapp/admin-key")
+async def miniapp_admin_key(request: Request):
+    """Личный ключ админа из VKWebAppGetAuthToken (кнопка на первом экране).
+
+    VK ID нашему приложению выдаёт только базовые права (vkid.personal_info),
+    а мини-приложение просит у VK ключ пользователя сразу с wall/photos/groups.
+    Ключ приходит из браузера — поэтому проверяем: он того, кто вошёл, VK
+    подтверждает его админство, нужные права действительно выданы."""
+    from core import admin_key
+
+    auth = _get_auth(request)
+    if not auth:
+        return JSONResponse({"error": "Сессия истекла"}, status_code=401)
+    uid = int(auth["uid"])
+    if not await get_groups_by_admin(uid):
+        return JSONResponse({"error": "Нет доступа"}, status_code=403)
+
+    form = await request.form()
+    token = str(form.get("access_token", "")).strip()
+    scope = str(form.get("scope", "")).strip()
+    raw_expires = str(form.get("expires", "") or "0")
+    logger.info(f"Admin key via Mini App: user={uid} scope={scope!r} expires={raw_expires!r} "
+                f"fields={sorted(form.keys())}")
+    if not token:
+        return JSONResponse({"error": "VK не передал ключ"}, status_code=400)
+    missing = admin_key.missing_rights(scope)
+    if len(missing) == len(admin_key.REQUIRED_RIGHTS):
+        return JSONResponse({"error": f"VK не выдал нужные права ({', '.join(missing)}). "
+                                      "Нажмите ещё раз и разрешите доступ."}, status_code=400)
+
+    try:
+        expires = int(float(raw_expires))
+    except ValueError:
+        expires = 0
+    if expires > 1_000_000_000:  # пришло время истечения, а не срок
+        expires -= int(time.time())
+    tokens = admin_key.TokenSet(
+        access_token=token, refresh_token="", device_id="",
+        expires_in=expires if expires > 0 else admin_key.NO_EXPIRY, user_id=uid, scope=scope,
+    )
+    try:
+        connected = await admin_key.connect_admin_key(tokens, expected_user_id=uid)
+    except admin_key.AdminKeyError as e:
+        logger.warning(f"Admin key via Mini App not connected: {e}")
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return JSONResponse({"ok": True, "groups": [name for _, name in connected], "missing": missing})
 
 
 @router.post("/miniapp/group/{group_id}/widget/client-log")

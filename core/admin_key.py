@@ -17,6 +17,7 @@ wall.deleteComment, groups.ban/unban, wall.pin/unpin (err 27, проверено
 
 import asyncio
 import logging
+import re
 import secrets
 import time
 from dataclasses import dataclass
@@ -175,9 +176,23 @@ async def _probe(token: str) -> str:
     return " ".join(results)
 
 
-async def connect_admin_key(tokens: TokenSet) -> list[tuple[int, str]]:
+REQUIRED_RIGHTS = {"wall": "Стена", "photos": "Фотографии", "groups": "Сообщества"}
+NO_EXPIRY = 10 * 365 * 24 * 3600  # ключ без срока (мини-приложение): живёт, пока VK не скажет «5»
+
+
+def missing_rights(scope: str) -> list[str]:
+    """Названия нужных прав, которых нет в выданном scope ("" — VK не сказал,
+    не проверяем). VK ID пишет scope через пробел, VK Bridge — через запятую."""
+    if not scope.strip():
+        return []
+    granted = set(re.split(r"[\s,]+", scope.strip()))
+    return [name for key, name in REQUIRED_RIGHTS.items() if key not in granted]
+
+
+async def connect_admin_key(tokens: TokenSet, expected_user_id: int | None = None) -> list[tuple[int, str]]:
     """Сохранить ключ для наших групп, где VK подтверждает админство владельца
-    ключа. Возвращает [(group_id, name)]; ни одной — AdminKeyError."""
+    ключа. Возвращает [(group_id, name)]; ни одной — AdminKeyError.
+    expected_user_id — кто вошёл (мини-приложение): чужой ключ не принимаем."""
     method = "users.get"
     try:
         users = await _vk(tokens.access_token, method)  # владелец ключа, а не чей-то id из URL
@@ -191,6 +206,9 @@ async def connect_admin_key(tokens: TokenSet) -> list[tuple[int, str]]:
         raise AdminKeyError("VK не вернул данные аккаунта. Нажмите «Подключить» ещё раз.")
     user = users[0]
     user_id = int(user.get("id") or tokens.user_id)
+    if expected_user_id and user_id != expected_user_id:
+        raise AdminKeyError(f"Ключ выдан другому аккаунту VK (id{user_id}), а в приложение вошли вы "
+                            f"(id{expected_user_id}). Войдите в VK своим аккаунтом и повторите.")
 
     ours = [g for g in await get_all_active_groups() if g.group_id in admin_of]
     if not ours:

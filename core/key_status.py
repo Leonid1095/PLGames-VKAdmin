@@ -154,13 +154,14 @@ async def _check_admin_key(group_id: int) -> KeyStatus:
         state="off",
         detail="не подключён — ключ сообщества VK эти действия не пускает, "
                "бот присылает админу ссылку",
-        where="кнопка «Подключить» — VK спросит разрешение у аккаунта админа группы",
+        where=(f"мини-приложение ВКонтакте https://vk.com/app{settings.VK_MINIAPP_ID} → "
+               "«🔑 Личный ключ админа» → «Подключить» (с компьютера или телефона)"),
     )
     token = await admin_key.admin_token(group_id)
     if not token:
         return status
-    status.where = ("переподключить — «Подключить»; полностью отозвать доступ — "
-                    "VK: Настройки → Приложения")
+    status.where = (f"переподключить — https://vk.com/app{settings.VK_MINIAPP_ID} → «🔑» → «Подключить»; "
+                    "полностью отозвать доступ — VK: Настройки → Приложения")
     error = await get_setting(group_id, admin_key.ERROR_KEY, "")
     if error:
         status.state, status.detail = "fail", f"не работает: {error}"

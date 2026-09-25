@@ -12,6 +12,7 @@ from core.auth import (
     login_retry_after, record_login_failure, record_login_success,
 )
 from core.admin_key import disconnect_admin_key
+from core.config import settings as app_config  # «settings» здесь — схема настроек групп
 from core.key_status import check_group_keys
 from database.service import (
     get_all_active_groups, get_group, get_setting, set_setting,
@@ -511,6 +512,12 @@ def _admin_key_actions(group_id: int, state: str, csrf: str) -> str:
             f'</form>'
         )
     label = "Подключить заново" if state == "fail" else "Подключить"
+    # VK ID нашему приложению даёт только базовые права (25.09.2026) — ключ
+    # с wall/photos/groups выдаёт мини-приложение (кнопка «🔑» на первом экране).
+    if app_config.VK_MINIAPP_ID:
+        href = f"https://vk.com/app{app_config.VK_MINIAPP_ID}"
+        return (f'<div style="margin-top:6px;"><a href="{href}" target="_blank" rel="noopener" '
+                f'class="btn btn-sm">{label} в мини-приложении</a></div>')
     return (f'<div style="margin-top:6px;"><a href="/api/vk/admin-oauth" class="btn btn-sm">'
             f'{label}</a></div>')
 

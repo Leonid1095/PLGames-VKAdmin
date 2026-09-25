@@ -8,6 +8,7 @@
 import httpx
 
 from core import key_status, vk_read
+from core.config import settings
 from core.crypto import encrypt_token
 from database.service import create_group, set_setting
 from tests.test_dashboard_stats import _client as dashboard_client
@@ -140,7 +141,8 @@ async def test_no_admin_key_offers_connect_button(db, monkeypatch):
     row = await _admin_row(monkeypatch)
 
     assert 'data-state="off"' in row
-    assert 'href="/api/vk/admin-oauth"' in row
+    # VK ID даёт только базовые права — подключаем в мини-приложении
+    assert f'href="https://vk.com/app{settings.VK_MINIAPP_ID}"' in row
 
 
 async def test_connected_admin_key_is_checked_live_and_can_be_disconnected(db, monkeypatch):
@@ -164,7 +166,8 @@ async def test_dead_admin_key_is_flagged_with_reconnect(db, monkeypatch):
 
     assert 'data-state="fail"' in row
     assert "User authorization failed" in row
-    assert 'href="/api/vk/admin-oauth"' in row
+    # VK ID даёт только базовые права — подключаем в мини-приложении
+    assert f'href="https://vk.com/app{settings.VK_MINIAPP_ID}"' in row
 
 
 async def test_disconnect_requires_csrf(db):
