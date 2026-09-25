@@ -347,22 +347,36 @@ async def oauth_callback(request: Request, code: str = "", error: str = "", erro
         <html><head><meta charset="utf-8"><title>VKAdmin — Авторизация</title>
         <script>
             // VK Standalone apps return token in URL fragment (#access_token=...)
-            if (window.location.hash) {
+            document.addEventListener('DOMContentLoaded', function() {
+                var msg = document.getElementById('msg');
+                if (!window.location.hash) {
+                    msg.textContent = 'Код авторизации не получен. Параметры: ' + window.location.search;
+                    return;
+                }
                 var params = new URLSearchParams(window.location.hash.substring(1));
-                var code = params.get('code');
-                var accessToken = params.get('access_token');
-                if (code) {
+                if (params.get('code')) {
                     // Весь fragment целиком: вместе с code должен уйти state.
                     window.location.href = '/api/vk/callback?' + window.location.hash.substring(1);
-                } else if (accessToken) {
-                    // Redirect with token directly
-                    window.location.href = '/api/vk/callback/token?' + window.location.hash.substring(1);
+                } else if (params.get('access_token')) {
+                    // Ключ — в теле POST, не в адресе: адрес оседает в логах
+                    // nginx/uvicorn, истории браузера и Referer.
+                    history.replaceState(null, '', window.location.pathname);
+                    var form = document.createElement('form');
+                    form.method = 'POST';
+                    form.action = '/api/vk/callback/token';
+                    params.forEach(function(value, key) {
+                        var input = document.createElement('input');
+                        input.type = 'hidden';
+                        input.name = key;
+                        input.value = value;
+                        form.appendChild(input);
+                    });
+                    document.body.appendChild(form);
+                    form.submit();
                 } else {
-                    document.getElementById('msg').textContent = 'Параметры: ' + window.location.hash;
+                    msg.textContent = 'Параметры: ' + window.location.hash;
                 }
-            } else {
-                document.getElementById('msg').textContent = 'Код авторизации не получен. Параметры: ' + window.location.search;
-            }
+            });
         </script></head>
         <body style="font-family: sans-serif; max-width: 600px; margin: 50px auto; padding: 20px;">
             <h2>Обработка авторизации...</h2>
@@ -374,8 +388,17 @@ async def oauth_callback(request: Request, code: str = "", error: str = "", erro
     if _is_admin_flow(request, state):
         if not is_authenticated(request):
             return RedirectResponse("/dashboard/login", status_code=303)
-        data = await _exchange_code(code)
-        if "error" in data:
+        try:
+            data = await _exchange_code(code)
+        except (httpx.HTTPError, ValueError) as e:
+            logger.error(f"Admin key OAuth: code exchange failed: {e!r}")
+            return _admin_page(
+                "Личный ключ не подключён",
+                "<p>VK не ответил при обмене кода. Нажмите «Подключить» ещё раз.</p>",
+                400,
+            )
+        if not isinstance(data, dict) or "error" in data:
+            data = data if isinstance(data, dict) else {"error": "неожиданный ответ VK"}
             from html import escape
             logger.error(f"Admin key OAuth error: {data.get('error')}")
             return _admin_page(
@@ -545,7 +568,7 @@ def _success_html(groups_html: str) -> HTMLResponse:
     """)
 
 
-@router.get("/api/vk/callback/token")
+@router.api_route("/api/vk/callback/token", methods=["GET", "POST"], include_in_schema=False)
 async def oauth_token_callback(request: Request):
     """
     Handle Standalone-app flow where VK returns tokens in URL fragment.
@@ -557,12 +580,13 @@ async def oauth_token_callback(request: Request):
     # токен и админа любой группы своими.
     if not is_authenticated(request):
         return RedirectResponse("/dashboard/login", status_code=303)
-    state = request.query_params.get("state", "")
+    # JS-извлекатель шлёт ключ POST-формой (не в адресе); GET — для старых ссылок.
+    params = dict(request.query_params)
+    if request.method == "POST":
+        params.update({k: str(v) for k, v in (await request.form()).items()})
+    state = params.get("state", "")
     if _is_admin_flow(request, state):
-        return await _finish_admin_oauth(
-            request.query_params.get("access_token", ""),
-            _int(request.query_params.get("user_id")),
-        )
+        return await _finish_admin_oauth(params.get("access_token", ""), _int(params.get("user_id")))
     cookie_state = request.cookies.get("vkadmin_oauth_state", "")
     if not cookie_state or not secrets.compare_digest(cookie_state, state):
         logger.warning("Token callback without matching OAuth state — possible CSRF")
@@ -572,7 +596,6 @@ async def oauth_token_callback(request: Request):
             status_code=403,
         )
 
-    params = dict(request.query_params)
     logger.info(f"Token callback params: {list(params.keys())}")
 
     groups_connected = []

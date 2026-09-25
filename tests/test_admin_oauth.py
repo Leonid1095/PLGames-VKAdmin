@@ -162,3 +162,91 @@ async def test_key_in_fragment_connects_admin_key(db, monkeypatch):
 
     assert r.status_code == 200
     assert await _key() == "user-token"
+
+
+# ─── VK ответил не так, как ждали: страница с причиной, а не голая 500 ───────
+
+def _vk_raw(monkeypatch, oauth_handler, api_handler):
+    monkeypatch.setattr(
+        oauth.httpx, "AsyncClient",
+        lambda *a, **kw: _RealAsyncClient(transport=httpx.MockTransport(oauth_handler)),
+    )
+    monkeypatch.setattr(
+        admin_key, "_client",
+        lambda: _RealAsyncClient(transport=httpx.MockTransport(api_handler)),
+    )
+
+
+def _exchange_ok(request):
+    return httpx.Response(200, json={"access_token": "user-token", "expires_in": 0, "user_id": ADMIN})
+
+
+async def _connect_via_code() -> httpx.Response:
+    async with _client(_owner(vkadmin_admin_oauth_state=STATE)) as c:
+        return await c.get(f"/api/vk/callback?code=c0de&state={STATE}")
+
+
+async def test_empty_users_get_shows_page_not_500(db, monkeypatch):
+    await create_group(GID, "WOW", encrypt_token("group-token"), ADMIN)
+
+    def api(request):
+        if request.url.path.endswith("/groups.get"):
+            return httpx.Response(200, json={"response": {"count": 1, "items": [GID]}})
+        return httpx.Response(200, json={"response": []})
+
+    _vk_raw(monkeypatch, _exchange_ok, api)
+
+    r = await _connect_via_code()
+
+    assert r.status_code == 400
+    assert "панель" in r.text  # ссылка назад, а не Internal Server Error
+    assert await _key() == ""
+
+
+async def test_vk_api_answering_html_shows_page_not_500(db, monkeypatch):
+    await create_group(GID, "WOW", encrypt_token("group-token"), ADMIN)
+    _vk_raw(monkeypatch, _exchange_ok,
+            lambda request: httpx.Response(502, text="<html>Bad Gateway</html>"))
+
+    r = await _connect_via_code()
+
+    assert r.status_code == 400
+    assert await _key() == ""
+
+
+async def test_oauth_timeout_shows_page_not_500(db, monkeypatch):
+    await create_group(GID, "WOW", encrypt_token("group-token"), ADMIN)
+
+    def timeout(request):
+        raise httpx.ConnectTimeout("VK не ответил")
+
+    _vk_raw(monkeypatch, timeout, timeout)
+
+    r = await _connect_via_code()
+
+    assert r.status_code == 400
+    assert await _key() == ""
+
+
+# ─── Ключ из #фрагмента не должен попадать в адрес (логи nginx/uvicorn, история) ──
+
+async def test_fragment_extractor_sends_token_in_post_body():
+    async with _client({}) as c:
+        html = (await c.get("/api/vk/callback")).text
+
+    assert "'/api/vk/callback/token?'" not in html  # раньше: GET с ключом в адресе
+    assert "form.method = 'POST'" in html
+    assert "history.replaceState" in html
+
+
+async def test_fragment_token_posted_in_body_connects_admin_key(db, monkeypatch):
+    await create_group(GID, "WOW", encrypt_token("group-token"), ADMIN)
+    _vk(monkeypatch)
+
+    async with _client(_owner(vkadmin_admin_oauth_state=STATE)) as c:
+        r = await c.post("/api/vk/callback/token", data={
+            "access_token": "user-token", "user_id": str(ADMIN), "state": STATE,
+        })
+
+    assert r.status_code == 200
+    assert await _key() == "user-token"

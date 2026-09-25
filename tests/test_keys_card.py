@@ -179,3 +179,27 @@ async def test_disconnect_requires_csrf(db):
     async with dashboard_client() as c:
         await c.post(f"/dashboard/group/{GID}/admin-key/disconnect", data={"_csrf": "csrf-x"})
     assert await admin_token(GID) == ""
+
+
+async def test_rendered_disconnect_form_actually_disconnects(db, monkeypatch):
+    """Кнопка из настоящей страницы, а не рукописный токен: раньше форма
+    заворачивала готовое поле _csrf во второе, и «Отключить» молча не работало."""
+    import html as html_lib
+    import re
+
+    from core.admin_key import admin_token
+
+    await create_group(GID, "WOW", encrypt_token("group-token"), 1)
+    await _with_admin_key()
+    _mock_vk(monkeypatch, {**_BASE_KEYS, "admin-token": _OWNER})
+
+    async with dashboard_client() as c:
+        row = _row((await c.get(f"/dashboard/group/{GID}")).text, "admin")
+        form = re.search(r'<form[^>]*admin-key/disconnect.*?</form>', row, re.S).group(0)
+        fields = {
+            m.group(1): html_lib.unescape(m.group(2))
+            for m in re.finditer(r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"', form)
+        }
+        await c.post(f"/dashboard/group/{GID}/admin-key/disconnect", data=fields)
+
+    assert await admin_token(GID) == ""

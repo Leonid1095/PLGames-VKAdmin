@@ -500,12 +500,13 @@ async def group_settings_page(request: Request, group_id: int):
 
 
 def _admin_key_actions(group_id: int, state: str, csrf: str) -> str:
-    """Личный ключ подключается кнопкой (VK OAuth), а не через консоль."""
+    """Личный ключ подключается кнопкой (VK OAuth), а не через консоль.
+    csrf — готовое скрытое поле из _csrf_field, вставляется как есть."""
     if state == "ok":
         return (
             f'<form method="POST" action="/dashboard/group/{group_id}/admin-key/disconnect" '
             f'style="margin-top:6px;">'
-            f'<input type="hidden" name="_csrf" value="{escape(csrf)}">'
+            f'{csrf}'
             f'<button type="submit" class="btn btn-sm" style="background:#c62828;">Отключить</button>'
             f'</form>'
         )

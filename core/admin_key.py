@@ -40,15 +40,24 @@ def _client() -> httpx.AsyncClient:
 
 
 async def _vk(token: str, method: str, **params):
-    async with _client() as client:
-        resp = await client.post(
-            f"{vk_read.VK_API}/{method}",
-            data={**params, "access_token": token, "v": vk_read.VK_API_VERSION},
-        )
-    data = resp.json()
+    """Вызов VK; любой сбой — сеть, не-JSON, чужой формат — это VKReadError,
+    чтобы подключение ключа показало владельцу причину, а не 500."""
+    try:
+        async with _client() as client:
+            resp = await client.post(
+                f"{vk_read.VK_API}/{method}",
+                data={**params, "access_token": token, "v": vk_read.VK_API_VERSION},
+            )
+        data = resp.json()
+    except (httpx.HTTPError, ValueError) as e:
+        raise vk_read.VKReadError(0, f"VK не ответил на {method}: {e!r}") from e
+    if not isinstance(data, dict):
+        raise vk_read.VKReadError(0, f"неожиданный ответ VK на {method}")
     if "error" in data:
         err = data["error"]
         raise vk_read.VKReadError(int(err.get("error_code", 0)), str(err.get("error_msg", "")))
+    if "response" not in data:
+        raise vk_read.VKReadError(0, f"неожиданный ответ VK на {method}")
     return data["response"]
 
 
@@ -62,9 +71,12 @@ async def connect_admin_key(token: str, user_id: int) -> list[tuple[int, str]]:
     ключа. Возвращает [(group_id, name)]; ни одной — AdminKeyError."""
     try:
         admin_of = set((await _vk(token, "groups.get", filter="admin")).get("items", []))
-        user = (await _vk(token, "users.get", user_ids=user_id))[0]
+        users = await _vk(token, "users.get", user_ids=user_id)
     except vk_read.VKReadError as e:
         raise AdminKeyError(f"VK не принял ключ: ошибка {e.code} ({e.message})") from e
+    if not users:
+        raise AdminKeyError("VK не вернул данные аккаунта. Нажмите «Подключить» ещё раз.")
+    user = users[0]
 
     ours = [g for g in await get_all_active_groups() if g.group_id in admin_of]
     if not ours:
