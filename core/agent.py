@@ -456,20 +456,26 @@ def _is_group_auth_denied(e: Exception) -> bool:
 async def _exec_ban_user(ctx: GroupContext, args: dict) -> str:
     from database.service import create_ban_record
 
+    from core import admin_key
+
     uid = args["user_id"]
     reason = args.get("reason", "Нарушение правил")
+    admin = await admin_key.get_admin_api(ctx.group_id)
     try:
-        await ctx.api.groups.ban(
+        await (admin or ctx.api).groups.ban(
             group_id=ctx.group_id, owner_id=uid,
             reason=0, comment=reason, comment_visible=1,
         )
         await create_ban_record(ctx.group_id, uid, ctx.admin_vk_id, reason)
         return f"Пользователь {uid} забанен. Причина: {reason}"
     except Exception as e:
+        if admin:
+            await admin_key.report_admin_key_failure(ctx.group_id, e)
         if _is_group_auth_denied(e):
             return (
                 "VK не даёт боту банить: это право есть только у личного аккаунта админа. "
-                f"Заблокируйте вручную: Управление → Участники → Чёрный список, vk.com/id{uid}."
+                f"Заблокируйте вручную: Управление → Участники → Чёрный список, vk.com/id{uid}. "
+                f"Чтобы бот банил сам, {admin_key.ADMIN_KEY_HINT}."
             )
         return f"Ошибка бана: {e}"
 
@@ -477,16 +483,22 @@ async def _exec_ban_user(ctx: GroupContext, args: dict) -> str:
 async def _exec_unban_user(ctx: GroupContext, args: dict) -> str:
     from database.service import remove_ban_record
 
+    from core import admin_key
+
     uid = args["user_id"]
+    admin = await admin_key.get_admin_api(ctx.group_id)
     try:
-        await ctx.api.groups.unban(group_id=ctx.group_id, owner_id=uid)
+        await (admin or ctx.api).groups.unban(group_id=ctx.group_id, owner_id=uid)
         await remove_ban_record(ctx.group_id, uid)
         return f"Пользователь {uid} разбанен."
     except Exception as e:
+        if admin:
+            await admin_key.report_admin_key_failure(ctx.group_id, e)
         if _is_group_auth_denied(e):
             return (
                 "VK не даёт боту разбанивать: это право есть только у личного аккаунта админа. "
-                f"Снимите блокировку вручную: Управление → Участники → Чёрный список, vk.com/id{uid}."
+                f"Снимите блокировку вручную: Управление → Участники → Чёрный список, vk.com/id{uid}. "
+                f"Чтобы бот делал это сам, {admin_key.ADMIN_KEY_HINT}."
             )
         return f"Ошибка разбана: {e}"
 
@@ -786,15 +798,21 @@ async def _exec_toggle_gamification(ctx: GroupContext, args: dict) -> str:
 
 
 async def _exec_pin_post(ctx: GroupContext, args: dict) -> str:
+    from core import admin_key
+
     post_id = args["post_id"]
+    admin = await admin_key.get_admin_api(ctx.group_id)
     try:
-        await ctx.api.wall.pin(owner_id=-ctx.group_id, post_id=post_id)
+        await (admin or ctx.api).wall.pin(owner_id=-ctx.group_id, post_id=post_id)
         return f"Пост {post_id} закреплён."
     except Exception as e:
+        if admin:
+            await admin_key.report_admin_key_failure(ctx.group_id, e)
         if _is_group_auth_denied(e):
             return (
                 "VK не даёт боту закреплять посты — только личному аккаунту админа. "
-                f"Закрепите вручную: откройте https://vk.com/wall-{ctx.group_id}_{post_id} → «…» → «Закрепить»."
+                f"Закрепите вручную: откройте https://vk.com/wall-{ctx.group_id}_{post_id} → «…» → «Закрепить». "
+                f"Чтобы бот закреплял сам, {admin_key.ADMIN_KEY_HINT}."
             )
         return f"Ошибка: {e}"
 

@@ -167,13 +167,19 @@ async def _moderate(
     поэтому провал здесь — штатная ситуация, а не повод молча писать в лог:
     админ получает ссылку на комментарий и делает руками.
     """
+    from core import admin_key
+
     logger.info(f"[MODERATE] Deleting comment {comment_id} from {from_id}")
+    admin = await admin_key.get_admin_api(ctx.group_id)  # личный ключ — может всё
+    api = admin or ctx.api
     deleted = False
     try:
-        await ctx.api.wall.delete_comment(owner_id=owner_id, comment_id=comment_id)
+        await api.wall.delete_comment(owner_id=owner_id, comment_id=comment_id)
         deleted = True
     except Exception as e:
         logger.warning(f"[MODERATE] Can't delete comment {comment_id}: {e}")
+        if admin:
+            await admin_key.report_admin_key_failure(ctx.group_id, e)
 
     ban_failed = False
     strikes = 0
@@ -183,7 +189,7 @@ async def _moderate(
             if strikes >= 3:
                 logger.info(f"[BAN] User {from_id} reached {strikes} strikes. Banning.")
                 try:
-                    await ctx.api.groups.ban(
+                    await api.groups.ban(
                         group_id=abs(owner_id),
                         owner_id=from_id,
                         reason=0,
@@ -194,6 +200,8 @@ async def _moderate(
                 except Exception as e:
                     ban_failed = True
                     logger.warning(f"[BAN] Can't ban {from_id}: {e}")
+                    if admin:
+                        await admin_key.report_admin_key_failure(ctx.group_id, e)
         except Exception as e:
             logger.error(f"Failed to issue warning for {from_id}: {e}")
 
@@ -204,12 +212,15 @@ async def _moderate(
     lines = ["🛡 Модерация: нужна ваша рука"]
     if not deleted:
         lines.append("Бот счёл комментарий нарушением, но удалить не смог — "
-                     "VK не даёт ключу сообщества удалять комментарии.")
+                     + ("VK отказал и личному ключу админа." if admin else
+                        "VK не даёт ключу сообщества удалять комментарии."))
     lines += [
         f"Автор: vk.com/id{from_id}" if from_id > 0 else f"Автор: vk.com/club{-from_id}",
         f"Текст: «{text[:300]}»",
         f"Комментарий: {link}",
     ]
+    if not admin:
+        lines.append(f"Чтобы бот удалял и банил сам, {admin_key.ADMIN_KEY_HINT}.")
     if ban_failed:
         lines.append(f"У автора {strikes} нарушений — стоит заблокировать его "
                      "вручную (Управление → Участники → Чёрный список).")

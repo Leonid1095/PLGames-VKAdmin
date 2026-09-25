@@ -113,9 +113,13 @@ async def upload_photo_to_vk(api, group_id: int, image_bytes: bytes) -> str | No
     2. Upload photo to server
     3. Save wall photo
     """
+    # Ключ сообщества VK сюда не пускает (err 27) — нужен личный ключ админа.
+    from core import admin_key
+    admin = await admin_key.get_admin_api(group_id)
+    uploader = admin or api
     try:
         # Step 1: Get upload URL
-        upload_server = await api.photos.get_wall_upload_server(group_id=group_id)
+        upload_server = await uploader.photos.get_wall_upload_server(group_id=group_id)
         upload_url = upload_server.upload_url
 
         # Step 2: Upload image
@@ -129,7 +133,7 @@ async def upload_photo_to_vk(api, group_id: int, image_bytes: bytes) -> str | No
             return None
 
         # Step 3: Save wall photo
-        saved = await api.photos.save_wall_photo(
+        saved = await uploader.photos.save_wall_photo(
             group_id=group_id,
             photo=upload_data["photo"],
             server=upload_data["server"],
@@ -143,7 +147,10 @@ async def upload_photo_to_vk(api, group_id: int, image_bytes: bytes) -> str | No
         return None
 
     except Exception as e:
-        logger.error(f"VK photo upload failed for group {group_id}: {e}")
+        if admin:
+            await admin_key.report_admin_key_failure(group_id, e)
+        hint = "" if admin else " (личный ключ админа не подключён)"
+        logger.error(f"VK photo upload failed for group {group_id}: {e}{hint}")
         return None
 
 
