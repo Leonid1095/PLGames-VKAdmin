@@ -33,6 +33,17 @@ async def _get_manager_ids(ctx: GroupContext) -> list[int]:
     return manager_ids
 
 
+async def notify_group_admins(group_id: int, text: str) -> bool:
+    """ЛС менеджерам группы от её имени, когда GroupContext на руках нет
+    (фоновые задачи). True — хоть кому-то доставлено."""
+    from web.vk_callback import _build_context
+
+    ctx = await _build_context(group_id)
+    if not ctx:
+        return False
+    return await notify_managers(ctx, text) > 0
+
+
 async def notify_managers(ctx: GroupContext, note: str) -> int:
     """ЛС всем менеджерам группы + опционально Telegram. Возвращает, скольким
     каналам удалось доставить (0 — никто не узнал)."""

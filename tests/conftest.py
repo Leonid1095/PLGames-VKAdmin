@@ -31,7 +31,7 @@ def _no_vk_network(monkeypatch):
 
     Ответ, а не обрыв соединения — иначе http_retry ждёт бэкофф на каждом вызове.
     Тесты, которым нужен VK, подменяют _client сами (их setattr — позже)."""
-    from core import key_status, vk_read, widgets
+    from core import admin_key, key_status, vk_read, widgets
 
     def offline(request):
         return httpx.Response(200, json={
@@ -39,7 +39,7 @@ def _no_vk_network(monkeypatch):
         })
 
     factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(offline))  # noqa: E731
-    for module in (key_status, vk_read, widgets):
+    for module in (admin_key, key_status, vk_read, widgets):
         monkeypatch.setattr(module, "_client", factory)
 
 

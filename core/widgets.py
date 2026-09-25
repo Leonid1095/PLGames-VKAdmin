@@ -21,13 +21,8 @@ def _client() -> httpx.AsyncClient:
 
 async def _notify_admin(group_id: int, text: str) -> bool:
     """ЛС менеджерам группы от её имени. True — хоть кому-то доставлено."""
-    from core.escalation import notify_managers
-    from web.vk_callback import _build_context
-
-    ctx = await _build_context(group_id)
-    if not ctx:
-        return False
-    return await notify_managers(ctx, text) > 0
+    from core.escalation import notify_group_admins
+    return await notify_group_admins(group_id, text)
 
 
 def widget_install_hint() -> str:
