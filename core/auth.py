@@ -119,10 +119,15 @@ def record_login_success(request: Request) -> None:
 # ─── CSRF protection ─────────────────────────────────────────────────────────
 
 def get_csrf_token(request: Request) -> str:
-    """Get or generate a CSRF token, stored in a cookie."""
-    token = request.cookies.get(CSRF_COOKIE_NAME, "")
+    """Get or generate a CSRF token, stored in a cookie.
+
+    Новый токен — один на запрос: страница зовёт эту функцию и для формы, и
+    для куки, и без запоминания при первом визите (куки ещё нет) в форму и
+    куку уходили разные токены — первый вход в панель всегда падал."""
+    token = request.cookies.get(CSRF_COOKIE_NAME, "") or getattr(request.state, "csrf_token", "")
     if not token:
         token = secrets.token_hex(32)
+        request.state.csrf_token = token
     return token
 
 
