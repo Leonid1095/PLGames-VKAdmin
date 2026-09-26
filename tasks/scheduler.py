@@ -232,6 +232,17 @@ async def _widget_refresh_job():
     await update_all_widgets()
 
 
+# ─── Job 6b: Admin key reminder ───────────────────────────────────────────
+# Личный ключ из мини-приложения VK выдаёт на сутки и не продлевает —
+# за 3 часа до конца владельцу ключа уходит одно ЛС со ссылкой.
+
+async def _admin_key_reminder_job():
+    from core.admin_key import remind_expiring_keys
+    sent = await remind_expiring_keys()
+    if sent:
+        logger.info(f"Admin key reminders sent: {sent}")
+
+
 # ─── Job 7: Daily proactive summary (digest + public welcome + milestones) ──
 #
 # This is the job that makes the bot feel *alive* instead of purely reactive:
@@ -455,6 +466,13 @@ async def start_scheduler():
         id="widget_refresh", replace_existing=True,
     )
 
+    # Admin key reminder: hourly (ключ из мини-приложения живёт сутки)
+    scheduler.add_job(
+        _admin_key_reminder_job,
+        trigger=IntervalTrigger(hours=1),
+        id="admin_key_reminder", replace_existing=True,
+    )
+
     # Daily proactive summary: trigger hourly, but each group acts once/~day
     # (digest to admin + public welcome + membership milestones).
     scheduler.add_job(
@@ -466,6 +484,6 @@ async def start_scheduler():
     scheduler.start()
     logger.info(
         "Scheduler started: autopost(1h), scheduled_posts(5m), "
-        "content_tasks(30m), analytics(1h), widgets(1h), "
+        "content_tasks(30m), analytics(1h), widgets(1h), admin_key_reminder(1h), "
         "daily_summary(1h/once-a-day from 10:00 MSK)"
     )

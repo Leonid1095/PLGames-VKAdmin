@@ -283,3 +283,59 @@ async def test_rejected_key_names_failing_method_and_logs_probe(db, monkeypatch,
     assert "photos.getWallUploadServer=1051" in caplog.text
     assert "wall photos groups" in caplog.text  # какие права выдал VK ID
     assert "secret-acc" not in caplog.text
+
+
+# ─── Ключ из мини-приложения живёт сутки: напомнить до истечения ─────────────
+
+@pytest.fixture
+def dms(monkeypatch):
+    sent = []
+
+    async def fake_dm(group_id, user_id, text):
+        sent.append((group_id, user_id, text))
+        return True
+
+    monkeypatch.setattr(admin_key, "_send_dm", fake_dm)
+    return sent
+
+
+def _miniapp_tokens(expires_in):
+    return admin_key.TokenSet(access_token="acc", refresh_token="", device_id="",
+                              expires_in=expires_in, user_id=ADMIN, scope="wall,photos,groups")
+
+
+async def test_expiring_miniapp_key_reminds_owner_once(db, monkeypatch, dms):
+    await _two_groups()
+    _VK(monkeypatch, admin_of=[GID, GID2])
+    await admin_key.connect_admin_key(_miniapp_tokens(2 * 3600))
+
+    assert await admin_key.remind_expiring_keys() == 1
+    assert await admin_key.remind_expiring_keys() == 0  # следующий час — без повтора
+
+    assert len(dms) == 1  # один владелец — одно ЛС на обе группы
+    _, user_id, text = dms[0]
+    assert user_id == ADMIN
+    assert f"vk.com/app{admin_key.settings.VK_MINIAPP_ID}" in text
+
+
+async def test_fresh_or_self_refreshing_keys_are_not_reminded(db, monkeypatch, dms):
+    await _two_groups()
+    _VK(monkeypatch, admin_of=[GID])
+    await admin_key.connect_admin_key(_miniapp_tokens(20 * 3600))  # ещё долго
+    assert await admin_key.remind_expiring_keys() == 0
+
+    await admin_key.connect_admin_key(_tokens(expires_in=3600))  # VK ID: продлевается сам
+    assert await admin_key.remind_expiring_keys() == 0
+    assert dms == []
+
+
+async def test_renewed_key_gets_its_own_reminder(db, monkeypatch, dms):
+    await _two_groups()
+    _VK(monkeypatch, admin_of=[GID])
+    await admin_key.connect_admin_key(_miniapp_tokens(2 * 3600))
+    await admin_key.remind_expiring_keys()
+
+    await admin_key.connect_admin_key(_miniapp_tokens(3600))  # продлили, и снова подходит к концу
+
+    assert await admin_key.remind_expiring_keys() == 1
+    assert len(dms) == 2

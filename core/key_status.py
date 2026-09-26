@@ -170,8 +170,13 @@ async def _check_admin_key(group_id: int) -> KeyStatus:
     if not token:
         error = await get_setting(group_id, admin_key.ERROR_KEY, "")
         status.state = "fail"
-        status.detail = (f"не работает: {error}" if error else
-                         "ключ истёк, а VK ID сейчас не продлил — обновите страницу позже")
+        if error:
+            status.detail = f"не работает: {error}"
+        elif await admin_key.self_refreshing(group_id):
+            status.detail = "ключ истёк, а VK ID сейчас не продлил — обновите страницу позже"
+        else:
+            status.detail = (f"срок истёк (VK выдаёт ключ из мини-приложения на сутки) — откройте "
+                             f"мини-приложение {admin_key.MINIAPP_URL}, оно продлит ключ само")
         return status
     try:
         name = await _owner_of(token)

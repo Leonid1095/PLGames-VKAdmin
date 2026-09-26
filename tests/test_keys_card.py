@@ -225,3 +225,13 @@ async def test_expired_key_that_vk_id_cannot_refresh_now_is_not_killed(db, monke
     assert "истёк" in row
     assert await get_setting(GID, "admin_key_error") == ""
     assert await admin_token(GID) == "admin-token"
+
+
+async def test_expired_miniapp_key_says_open_miniapp_to_renew(db, monkeypatch):
+    await create_group(GID, "WOW", encrypt_token("group-token"), 1)
+    await _with_admin_key(admin_token_expires_at="0")  # без refresh — ключ из мини-приложения
+
+    row = await _admin_row(monkeypatch)
+
+    assert 'data-state="fail"' in row
+    assert "мини-приложение" in row and "продл" in row

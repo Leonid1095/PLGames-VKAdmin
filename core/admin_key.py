@@ -40,11 +40,13 @@ USER_ID_KEY = "admin_user_id"
 NAME_KEY = "admin_user_name"
 ERROR_KEY = "admin_key_error"
 ALERTED_KEY = "admin_key_alerted"
+REMINDED_KEY = "admin_key_reminded"  # срок ключа, о котором уже напомнили
 _ALL_KEYS = (TOKEN_KEY, REFRESH_KEY, DEVICE_KEY, EXPIRES_KEY, USER_ID_KEY,
-             NAME_KEY, ERROR_KEY, ALERTED_KEY)
+             NAME_KEY, ERROR_KEY, ALERTED_KEY, REMINDED_KEY)
 
 VKID_TOKEN_URL = "https://id.vk.ru/oauth2/auth"
-ADMIN_KEY_HINT = "подключите личный ключ в панели: «Ключи и доступы» → «Подключить»"
+MINIAPP_URL = f"https://vk.com/app{settings.VK_MINIAPP_ID}"
+ADMIN_KEY_HINT = f"подключите личный ключ: {MINIAPP_URL} → «🔑 Личный ключ админа» → «Подключить»"
 _AUTH_FAILED = 5  # VK: User authorization failed — ключ отозван или истёк
 _REFRESH_MARGIN = 300  # продлеваем за 5 минут до конца часа
 _DEAD_REFRESH = {"invalid_grant", "invalid_token", "access_denied", "invalid_client"}
@@ -335,7 +337,7 @@ async def _alert_dead(group_id: int) -> None:
         "🔑 Личный ключ админа больше не работает (VK: авторизация не прошла — "
         "сменили пароль или отозвали доступ). Фото к постам, удаление нарушений "
         "и баны снова только вручную.\n"
-        "Чтобы вернуть: дашборд → группа → «Ключи и доступы» → «Подключить».",
+        f"Чтобы вернуть: {MINIAPP_URL} → «🔑 Личный ключ админа» → «Подключить».",
     )
     if delivered:
         await set_setting(group_id, ALERTED_KEY, "1")
@@ -349,3 +351,81 @@ async def report_admin_key_failure(group_id: int, e: Exception) -> None:
     await set_setting(group_id, ERROR_KEY, str(e)[:300])
     logger.warning(f"Admin key for group {group_id} is dead: {e}")
     await _alert_dead(group_id)
+
+
+# ─── Ключ из мини-приложения: сутки без продления ────────────────────────────
+#
+# VKWebAppGetAuthToken выдаёт ключ на 24 часа и refresh-токена не даёт.
+# Поэтому: стартовая мини-аппа сама берёт новый, если осталось меньше
+# RENEW_WITHIN (см. needs_renewal), а за REMIND_BEFORE до конца владельцу
+# ключа приходит одно ЛС со ссылкой.
+
+RENEW_WITHIN = 12 * 3600
+REMIND_BEFORE = 3 * 3600
+
+
+async def self_refreshing(group_id: int) -> bool:
+    """Ключ VK ID с refresh-токеном продлевается сам; из мини-приложения — нет."""
+    return bool(await _decrypted(group_id, REFRESH_KEY))
+
+
+async def _renewable_groups(user_id: int | None = None) -> list[tuple[int, str, float]]:
+    """(group_id, владелец, срок) ключей из мини-приложения (без refresh)."""
+    found = []
+    for g in await get_all_active_groups():
+        owner = await get_setting(g.group_id, USER_ID_KEY, "")
+        if not owner or (user_id and owner != str(user_id)):
+            continue
+        if not await get_setting(g.group_id, TOKEN_KEY, "") or await self_refreshing(g.group_id):
+            continue
+        found.append((g.group_id, owner, await _expires_at(g.group_id)))
+    return found
+
+
+async def needs_renewal(user_id: int) -> bool:
+    """Пора ли стартовой мини-аппа тихо взять новый ключ у этого админа."""
+    for gid, _, expires_at in await _renewable_groups(user_id):
+        if expires_at - time.time() < RENEW_WITHIN or await get_setting(gid, ERROR_KEY, ""):
+            return True
+    return False
+
+
+async def _send_dm(group_id: int, user_id: int, text: str) -> bool:
+    """ЛС от имени группы одному человеку — владельцу ключа."""
+    from web.vk_callback import _build_context
+
+    ctx = await _build_context(group_id)
+    if not ctx:
+        return False
+    try:
+        await ctx.api.messages.send(user_id=user_id, message=text, random_id=0)
+        return True
+    except Exception as e:
+        logger.warning(f"Admin key reminder to {user_id} via group {group_id} failed: {e}")
+        return False
+
+
+async def remind_expiring_keys() -> int:
+    """Одно ЛС владельцу ключа, который скоро истечёт (или истёк). Сколько отправлено."""
+    now = time.time()
+    due: dict[str, list[tuple[int, float]]] = {}
+    for gid, owner, expires_at in await _renewable_groups():
+        if expires_at - now > REMIND_BEFORE or await get_setting(gid, ERROR_KEY, ""):
+            continue
+        if await get_setting(gid, REMINDED_KEY, "") == str(int(expires_at)):
+            continue
+        due.setdefault(owner, []).append((gid, expires_at))
+
+    sent = 0
+    for owner, items in due.items():
+        expires_at = min(e for _, e in items)
+        when = time.strftime("%d.%m %H:%M", time.gmtime(expires_at + 3 * 3600))  # МСК
+        state = "истёк" if expires_at <= now else f"истекает {when} (МСК)"
+        text = (f"🔑 Личный ключ админа {state}: VK выдаёт его на сутки. "
+                f"Откройте {MINIAPP_URL} — бот продлит его сам (или нажмите «🔑 → Подключить»). "
+                "Без ключа фото к постам, удаление нарушений и баны — снова вручную.")
+        if await _send_dm(items[0][0], int(owner), text):
+            for gid, e in items:
+                await set_setting(gid, REMINDED_KEY, str(int(e)))
+            sent += 1
+    return sent

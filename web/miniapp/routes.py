@@ -1403,7 +1403,7 @@ async def miniapp_onboarding(request: Request):
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 
-def _admin_key_card(token: str) -> str:
+def _admin_key_card(token: str, auto_renew: bool = False) -> str:
     """Кнопка «🔑 Личный ключ»: VKWebAppGetAuthToken c wall/photos/groups.
 
     Здесь, на стартовой, потому что её VK открывает сам — Bridge работает и на
@@ -1416,17 +1416,17 @@ def _admin_key_card(token: str) -> str:
             Чтобы бот сам загружал фото к постам, удалял нарушения, банил и закреплял —
             этого ключ сообщества VK не умеет.
         </p>
-        <button class="btn" onclick="connectAdminKey()">Подключить</button>
+        <button class="btn" onclick="connectAdminKey(false)">Подключить</button>
         <p id="akey-status" style="font-size:0.8rem;color:#888;margin-top:8px;"></p>
     </div>
     <script>
-    function connectAdminKey() {{
+    function connectAdminKey(renew) {{
         var st = document.getElementById('akey-status');
         if (typeof vkBridge === 'undefined' || !vkBridge.isEmbedded()) {{
             st.textContent = 'Откройте приложение внутри ВКонтакте: https://vk.com/app{app_id}';
             return;
         }}
-        st.textContent = 'Запрос прав у ВКонтакте...';
+        st.textContent = renew ? 'Продлеваю личный ключ (VK выдаёт его на сутки)...' : 'Запрос прав у ВКонтакте...';
         Promise.race([
             vkBridge.send('VKWebAppGetAuthToken', {{app_id: {app_id}, scope: 'wall,photos,groups'}}),
             new Promise(function(_, reject) {{
@@ -1463,6 +1463,7 @@ def _admin_key_card(token: str) -> str:
             }}
         }});
     }}
+    {"document.addEventListener('DOMContentLoaded', function() { connectAdminKey(true); });" if auto_renew else ""}
     </script>
     """
 
@@ -1615,14 +1616,19 @@ async def miniapp_entry(request: Request):
 
     # Otherwise show all groups this admin manages
     groups = await get_groups_by_admin(vk_user_id)
+    from core.admin_key import needs_renewal
+    key_card = _admin_key_card(token, auto_renew=await needs_renewal(vk_user_id))
 
     if not groups:
+        # Админ группы, которую подключал кто-то другой, тоже может дать боту
+        # свой личный ключ — поэтому карточка «🔑» есть и здесь.
         content = f"""
         <div class="card" style="text-align:center; padding:32px;">
             <p style="font-size:1.1rem; font-weight:600; margin-bottom:8px;">Нет подключённых групп</p>
             <p style="color:#888; margin-bottom:16px;">Подключите группу через панель управления</p>
             <a href="/api/vk/oauth" target="_blank" class="btn">Подключить группу</a>
         </div>
+        {key_card}
         """
         return HTMLResponse(_miniapp_html("VKAdmin", content, token))
 
@@ -1655,7 +1661,7 @@ async def miniapp_entry(request: Request):
         <p style="opacity: 0.85; font-size: 0.85rem;">AI-администратор ваших групп</p>
     </div>
     {groups_html}
-    {_admin_key_card(token)}
+    {key_card}
     {_widget_install_script(token)}
     """
     return HTMLResponse(_miniapp_html("VKAdmin", content, token))
@@ -2178,9 +2184,9 @@ async def miniapp_admin_key(request: Request):
     auth = _get_auth(request)
     if not auth:
         return JSONResponse({"error": "Сессия истекла"}, status_code=401)
+    # Не только тот, кто подключал группу: любой её админ, которого подтвердит
+    # VK (connect_admin_key сверяет владельца ключа и groups.get filter=admin).
     uid = int(auth["uid"])
-    if not await get_groups_by_admin(uid):
-        return JSONResponse({"error": "Нет доступа"}, status_code=403)
 
     form = await request.form()
     token = str(form.get("access_token", "")).strip()
