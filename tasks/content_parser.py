@@ -196,8 +196,10 @@ async def parse_api(url: str) -> list[dict]:
                 or entry.get("date") or entry.get("pubDate")
             )
             if title or text:
+                # 4000 — предел поста ВК. Было 500: дословный пост (content_verbatim)
+                # обрывался на полуслове. Хэш берёт первые 200 знаков — не меняется.
                 items.append({
-                    "title": title, "text": text[:500],
+                    "title": title, "text": text[:4000],
                     "link": link, "image_url": image_url, "date": date,
                 })
         return items
@@ -295,35 +297,42 @@ async def fetch_and_schedule(group_id: int) -> int:
         link = chosen.get("link", "")
         image_url = chosen.get("image_url", "")
 
-        if link and len(source_text) < 300:
-            try:
-                full_content = await read_url(link)
-                if not full_content.startswith("Ошибка") and len(full_content) > len(source_text):
-                    source_text = full_content[:4000]
-            except Exception:
-                pass
+        # Свои новости продукта (лента PLGamesBot) — дословно: пересказ моделью
+        # 03.10 приписал новости то, чего в ней нет. Тексты продукта пишутся и
+        # сверяются с кодом там, где этот код живёт.
+        verbatim = (await get_setting(group_id, "content_verbatim", "false")).lower() == "true"
+        if verbatim:
+            post_text = "\n\n".join(p for p in (title, source_text.strip(), link) if p)
+        else:
+            if link and len(source_text) < 300:
+                try:
+                    full_content = await read_url(link)
+                    if not full_content.startswith("Ошибка") and len(full_content) > len(source_text):
+                        source_text = full_content[:4000]
+                except Exception:
+                    pass
 
-        # Build full material for the writer
-        material = ""
-        if title:
-            material += f"Заголовок: {title}\n\n"
-        material += source_text
-        if link:
-            material += f"\n\nИсточник: {link}"
+            # Build full material for the writer
+            material = ""
+            if title:
+                material += f"Заголовок: {title}\n\n"
+            material += source_text
+            if link:
+                material += f"\n\nИсточник: {link}"
 
-        if len(material.strip()) < 100:
-            continue
+            if len(material.strip()) < 100:
+                continue
 
-        # Write a real post using the content writer
-        post_text = await write_from_source(
-            group_id=group_id,
-            source_material=material,
-            instruction=(
-                "Напиши пост для группы ВКонтакте на основе этого материала. "
-                "Используй ТОЛЬКО факты из исходного материала — не придумывай ничего от себя. "
-                "Перескажи своими словами, выдели самое интересное и полезное."
-            ),
-        )
+            # Write a real post using the content writer
+            post_text = await write_from_source(
+                group_id=group_id,
+                source_material=material,
+                instruction=(
+                    "Напиши пост для группы ВКонтакте на основе этого материала. "
+                    "Используй ТОЛЬКО факты из исходного материала — не придумывай ничего от себя. "
+                    "Перескажи своими словами, выдели самое интересное и полезное."
+                ),
+            )
 
         if not is_publishable(post_text):
             continue
