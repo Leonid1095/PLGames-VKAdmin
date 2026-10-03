@@ -49,7 +49,9 @@ async def _autopost_job():
                 try:
                     last_post_time = datetime.fromisoformat(last_post_str)
                     elapsed = (datetime.now(timezone.utc) - last_post_time).total_seconds() / 3600
-                    if elapsed < interval_hours:
+                    # _last_autopost пишется в конце сбора, на секунды позже
+                    # часовой проверки: без запаса интервал 6 ч выходил в 7
+                    if elapsed < interval_hours - 0.25:
                         continue
                 except ValueError:
                     pass
