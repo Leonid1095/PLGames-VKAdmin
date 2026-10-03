@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     # Image search (free, 200 req/hr)
     PEXELS_API_KEY: str = ""
 
+    # Свои сайты на этом же сервере: сервер за NAT, и локальный DNS отдаёт на их
+    # имена адрес в LAN — SSRF-защита считала их внутренними и не читала ленту
+    # новостей PLGamesBot (03.10.2026). Через запятую, только точные имена.
+    OWN_HOSTS: str = "plgamesbot.ru"
+
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )

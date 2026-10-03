@@ -62,3 +62,34 @@ async def test_image_download_is_guarded(monkeypatch):
     seen = _mock(monkeypatch, lambda r: httpx.Response(302, headers={"location": "http://10.0.0.5/x.jpg"}))
     assert await download_image_from_url(f"{PUBLIC}/pic.jpg") is None
     assert seen == [f"{PUBLIC}/pic.jpg"]
+
+
+# ── Свои сайты на этом же сервере (03.10.2026) ──────────────────────────────
+#
+# plgamesbot.ru живёт на этом сервере, а сервер — за NAT: локальный DNS отдаёт
+# на его имя адрес в LAN (192.168.1.143). Защита считала его внутренним, и
+# источник новостей PLGamesBot для группы vk.com/plgames_bot не читался вовсе.
+
+def _resolve_to(monkeypatch, ip):
+    monkeypatch.setattr(web_reader.socket, "getaddrinfo",
+                        lambda host, port, *a, **k: [(2, 1, 6, "", (ip, 0))])
+
+
+def test_own_host_on_lan_is_allowed(monkeypatch):
+    _resolve_to(monkeypatch, "192.168.1.143")
+    assert web_reader.is_safe_public_url("https://plgamesbot.ru/api/news")
+    assert web_reader.is_safe_public_url("https://PLGamesBot.ru/og/news/1.png")
+
+
+def test_other_host_on_lan_is_still_blocked(monkeypatch):
+    _resolve_to(monkeypatch, "192.168.1.143")
+    assert not web_reader.is_safe_public_url("https://evil.example/feed")
+    assert not web_reader.is_safe_public_url("https://plgamesbot.ru.evil.example/feed")
+
+
+async def test_redirect_from_own_host_to_loopback_is_blocked(monkeypatch):
+    _resolve_to(monkeypatch, "192.168.1.143")
+    seen = _mock(monkeypatch, lambda r: httpx.Response(302, headers={"location": "http://127.0.0.1:8091/admin"}))
+    with pytest.raises(UnsafeURLError):
+        await safe_get("https://plgamesbot.ru/api/news")
+    assert seen == ["https://plgamesbot.ru/api/news"]

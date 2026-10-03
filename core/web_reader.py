@@ -31,6 +31,11 @@ def is_safe_public_url(url: str) -> bool:
         return False
     if p.scheme not in ("http", "https") or not p.hostname:
         return False
+    # Свой сайт на этом сервере резолвится в LAN — это не внутренний сервис.
+    # Только точное имя: редирект с него проверяется заново (safe_get).
+    own = {h.strip().lower() for h in settings.OWN_HOSTS.split(",") if h.strip()}
+    if p.hostname.lower() in own:
+        return True
     try:
         infos = socket.getaddrinfo(p.hostname, None)
     except Exception:
