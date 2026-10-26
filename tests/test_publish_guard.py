@@ -101,3 +101,37 @@ def test_daily_summary_runs_once_per_moscow_day_after_10():
     assert _daily_summary_due(utc(22, 7).isoformat(), utc(23, 12))
     # Мусор в настройке не блокирует дайджест навсегда
     assert _daily_summary_due("not-a-date", utc(23, 8))
+
+
+async def test_daily_summary_never_greets_newcomers_on_wall(db, monkeypatch):
+    """Пост «Рады новым участникам! [id…|Имя]» на стене — спам и непрошеное
+    уведомление человеку (группа 240061584, 26.10). Вступление видно только админу."""
+    import tasks.scheduler as sched
+    from database.service import record_member_join, set_setting
+
+    await create_group(GID, "WOW", encrypt_token("t"), 1)
+    await set_setting(GID, "welcome_ai", "true")
+    await record_member_join(GID)
+
+    posted, dms = [], []
+
+    async def wall_post(**kw):
+        posted.append(kw["message"])
+
+    async def send(**kw):
+        dms.append(kw["message"])
+
+    async def get_members(**kw):
+        return SimpleNamespace(count=10)
+
+    monkeypatch.setattr(sched, "API", lambda token: SimpleNamespace(
+        wall=SimpleNamespace(post=wall_post),
+        messages=SimpleNamespace(send=send),
+        groups=SimpleNamespace(get_members=get_members),
+    ))
+    monkeypatch.setattr(sched, "_daily_summary_due", lambda last, now: True)
+
+    await sched._daily_summary_job()
+
+    assert posted == []
+    assert len(dms) == 1 and "Новых участников: +1" in dms[0]

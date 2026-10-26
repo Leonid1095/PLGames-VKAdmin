@@ -228,12 +228,10 @@ async def _process_group_join(ctx: GroupContext, obj: dict):
         first_name = "друг"
         last_name = ""
 
-    # Record the join so the daily proactive job can greet newcomers publicly
-    # (group→user DMs below are best-effort; VK blocks them for most non-openers).
-    # Учитываем ВСЕГДА — от этого зависят дайджест и публичное приветствие,
-    # а не только ЛС-приветствие ниже.
+    # Учитываем вступление ВСЕГДА — по счётчику строится дайджест админу,
+    # а ЛС-приветствие ниже — по возможности (VK режет его большинству).
     try:
-        await record_member_join(ctx.group_id, user_id, first_name)
+        await record_member_join(ctx.group_id)
     except Exception as e:
         logger.warning(f"Failed to record join for {user_id} in group {ctx.group_id}: {e}")
 

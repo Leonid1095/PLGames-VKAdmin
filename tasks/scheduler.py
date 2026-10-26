@@ -245,12 +245,12 @@ async def _admin_key_reminder_job():
         logger.info(f"Admin key reminders sent: {sent}")
 
 
-# ─── Job 7: Daily proactive summary (digest + public welcome + milestones) ──
+# ─── Job 7: Daily proactive summary (digest + milestones) ───────────────────
 #
 # This is the job that makes the bot feel *alive* instead of purely reactive:
-# once a day it greets new members publicly (DMs are blocked by VK), DMs the
-# admin a digest built from collected analytics, and celebrates membership
-# milestones on the wall.
+# once a day it DMs the admin a digest built from collected analytics and
+# celebrates membership milestones on the wall. Newcomers are NOT greeted on
+# the wall: a post tagging a stranger is spam and an unasked notification.
 
 _MILESTONES = [50, 100, 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000]
 
@@ -270,43 +270,6 @@ async def _get_member_count(api, group_id: int) -> int | None:
     except Exception as e:
         logger.warning(f"member count fetch failed for group {group_id}: {e}")
         return None
-
-
-async def _public_welcome(api, group_id: int, welcomes: list[dict]) -> None:
-    """Post ONE public wall post greeting newcomers (avoids per-user DM spam and
-    works around VK blocking group→user DMs for non-openers)."""
-    if not welcomes:
-        return
-    enabled = (
-        (await get_setting(group_id, "welcome_ai", "false")).lower() == "true"
-        or bool(await get_setting(group_id, "welcome_message", ""))
-    )
-    if not enabled:
-        return
-
-    mentions = ", ".join(f"[id{w['id']}|{w.get('name') or 'друг'}]" for w in welcomes[:30])
-    intro = "Рады новым участникам! 👋"
-    try:
-        from core.ai_brain import generate_response, _get_group_ai_context
-        ai_ctx = await _get_group_ai_context(group_id)
-        sys = (ai_ctx.get("ai_system_prompt") or
-               "Ты дружелюбный администратор группы ВКонтакте.")
-        text = await generate_response(
-            prompt="Напиши короткое (1-2 предложения) тёплое публичное приветствие "
-                   "для новых участников группы. Без обращения по имени — имена допишутся отдельно.",
-            system_prompt=sys, group_id=group_id,
-        )
-        if not is_llm_failure(text):
-            intro = text.strip()
-    except Exception as e:
-        logger.warning(f"AI welcome generation failed for group {group_id}: {e}")
-
-    message = f"{intro}\n\n{mentions}"
-    try:
-        await api.wall.post(owner_id=-group_id, message=message)
-        logger.info(f"Public welcome posted for {len(welcomes)} newcomers in group {group_id}")
-    except Exception as e:
-        logger.warning(f"Public welcome post failed for group {group_id}: {e}")
 
 
 async def _admin_digest(api, group_id: int, admin_vk_id: int, joins: int, leaves: int) -> None:
@@ -411,7 +374,6 @@ async def _daily_summary_job():
             api = API(token=token)
 
             state = await take_daily_membership_state(group.group_id)
-            await _public_welcome(api, group.group_id, state["welcomes"])
             await _admin_digest(
                 api, group.group_id, group.admin_vk_id,
                 state["joins"], state["leaves"],
@@ -476,7 +438,7 @@ async def start_scheduler():
     )
 
     # Daily proactive summary: trigger hourly, but each group acts once/~day
-    # (digest to admin + public welcome + membership milestones).
+    # (digest to admin + membership milestones).
     scheduler.add_job(
         _daily_summary_job,
         trigger=IntervalTrigger(hours=1),

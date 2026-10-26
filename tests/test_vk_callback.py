@@ -35,15 +35,14 @@ class FakeAPI:
 
 
 async def test_join_is_counted_even_when_welcome_is_off(db):
-    """Дайджест и публичное приветствие опираются на учёт вступлений —
-    раньше он шёл только при включённом приветствии (у живой группы — «+0»)."""
+    """Дайджест опирается на учёт вступлений — раньше он шёл только
+    при включённом приветствии (у живой группы — «+0»)."""
     await create_group(GID, "WOW", encrypt_token("t"), 1)
     ctx = GroupContext(GID, FakeAPI(), 1)
 
     await cb._process_group_join(ctx, {"user_id": 777, "join_type": "join"})
 
     assert await get_setting(GID, "_joins_since_digest", "0") == "1"
-    assert "777" in await get_setting(GID, "_pending_welcome", "[]")
 
 
 async def test_join_request_is_not_a_join(db):
